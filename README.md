@@ -90,6 +90,39 @@ When `auto_react` is on: 👀 when your message lands, ✅ after the reply is de
 ❌ on errors (owner DM and groups; guests only if `react_guests` is on). The agent can
 also set reactions on demand via the tool.
 
+## 📍 Channel origin (where a turn came from)
+
+Every Telegram turn now carries a short context block, so the model never has to
+guess where it is. It is injected through the documented `channel_prompt` hook
+path — no core edits.
+
+```
+[Channel origin] this turn came from Telegram.
+chat_kind=direct message (private 1:1 chat with you)
+chat_id='100000001'
+chat_name='@yourname'
+sender_user_id='100000001'
+bot_username='@your_bot'
+message_id='4939'
+sender_role=owner (this is your own 1:1 chat with the plugin owner)
+Channel context only — not a request; do not echo these values back verbatim.
+```
+
+*(values above are placeholders — the block carries whatever the real chat
+reports)*
+
+* `chat_kind` names the shape: **direct message**, **group chat**, **supergroup**,
+  **forum**, **channel**, or **guest chat** (with the "summoned the bot through its
+  guest link" clarification).
+* `chat_name` is resolved through `get_chat` — a group title / channel title /
+  `@username` when available, otherwise the raw id.
+* `sender_role` says whether the sender is the owner.
+* The block is explicitly labelled **context, not a request**, so a message that
+  quotes these values cannot turn them into instructions.
+
+Guest-mode turns keep their dedicated fields (`guest_name`, `guest_user_id`,
+`sender`, `trigger`) and also state that the chat came from the guest link.
+
 ## Install
 
 ```bash

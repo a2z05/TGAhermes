@@ -604,7 +604,8 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
     # KEY OFF THE GUEST'S OWN CHAT, not source.chat_id: PTB resolves a guest
     # message's chat/from_user to the OWNER's DM, so keying on source.chat_id
     # put every guest in one session named after the owner (state.db proof:
-    # the guest-keyed row carried the OWNER's display_name while the real sender was someone else).
+    # the guest-keyed row carried the OWNER's display_name while the actual
+    # sender was a different person).
     # _guest_chat_id keeps the legacy guest_<id> shape (it is what _gqid_for,
     # _is_guest_chat and the whole send-suppression layer key on) and we put
     # the real guest chat + name on the event so routing, display name and
@@ -1847,10 +1848,10 @@ def _guest_refusal(tool_name: str, info: Dict[str, Any]) -> str:
         )
     return (
         f"BLOCKED in guest mode: `{tool_name}` would change or delete something on the owner's "
-        f"machine, so it is never run from a guest chat. Tell the owner what you want and ask him to "
-        f"run it himself in his own DM (https://t.me/user?id={owner} or chat {owner}) — he will do "
-        f"it there. Read-only things (searching the web, looking something up) still work fine "
-        f"right here."
+        f"machine, so it is never run from a guest chat. Tell the owner what you want and ask "
+        f"them to run it themselves in their own DM (https://t.me/user?id={owner} or chat "
+        f"{owner}) — they will do it there. Read-only things (searching the web, looking "
+        f"something up) still work fine right here."
     )
 
 
