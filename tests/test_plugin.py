@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -238,10 +239,15 @@ async def t1():
     check(len(ad.received) == 1, "owner mention handled")
     ev = ad.received[-1]
     check(ev.internal is True and ev.allow_gateway_control is False, "internal + no gateway control")
-    check(ev.source.chat_id == "guest_900000001", "session renamed guest_<id>")
+    # The session key is the GUEST'S OWN chat (777777), NOT the owner's DM id
+    # (900000001) that PTB resolves into source.chat_id. Keying on the owner's
+    # id merged every guest into one session named after the owner.
+    check(ev.source.chat_id == "guest_777777", "session renamed guest_<guest chat>")
+    check(ev.source.chat_id != "guest_900000001", "session is NOT keyed on the owner's DM id")
     check(ev.metadata["guest_query_id"] == "gq1", "gqid stored")
     check(ev.metadata["guest_original_chat_id"] == "777777", "original chat id kept for log buttons")
-    check("[Sender identity]" in ev.channel_prompt and "ATRA" in ev.channel_prompt, "persona + identity tag")
+    check("[Channel origin]" in ev.channel_prompt and "ATRA" in ev.channel_prompt, "persona + identity tag")
+    check("guest chat" in ev.channel_prompt, "guest block says this is a guest chat")
     check(any("Guest mention — answered" in str(m.get("text", "")) for m in ad._bot.sent), "answered mention logged")
 
     # stranger reply-to-ATRA -> handled (no canned)
@@ -256,6 +262,33 @@ async def t1():
 
 
 asyncio.run(t1())
+
+# ---------------------------------------------------------------- channel origin (DM / group / channel)
+print("\n[3] channel origin block")
+try:
+    from types import SimpleNamespace as _SNS
+    _owner = mod._owner_id(ad)
+    for ctype, cid, uid, kind in (
+            ("dm", "100000001", _owner, "direct message"),
+            ("supergroup", "-1001", "999", "supergroup"),
+            ("channel", "-1002", "111", "channel")):
+        _src = _SNS(chat_id=cid, chat_type=ctype, user_id=uid, message_id=7)
+        _blk = mod._origin_identity_block(ad, _src)
+        check(_blk.startswith("[Channel origin]"), f"{ctype}: block is a channel-origin block")
+        check(kind in _blk, f"{ctype}: chat kind named ({kind})")
+        check(f"chat_id={cid!r}" in _blk, f"{ctype}: chat id present")
+        check(f"sender_user_id={uid!r}" in _blk, f"{ctype}: sender id present")
+        check("not a request" in _blk, f"{ctype}: marked as context, not an instruction")
+    # owner DM must be labelled as the owner's own chat
+    _src = _SNS(chat_id=_owner, chat_type="dm", user_id=_owner, message_id=7)
+    check("owner" in mod._origin_identity_block(ad, _src), "owner DM labelled as owner's chat")
+    # guest blocks keep the guest wording
+    _gblk = mod._guest_identity_block("Sara", "5", "guest", _owner, "plain mention", None)
+    check("guest chat" in _gblk and "guest_user_id" in _gblk, "guest block keeps guest fields")
+    # a non-telegram src must never produce a block (hook only injects for telegram)
+    check(mod._chat_kind("dm") != mod._chat_kind("dm", is_guest=True), "guest kind differs from dm")
+except Exception as e:  # noqa: BLE001
+    check(False, f"channel origin block raised {type(e).__name__}: {e}")
 
 # ---------------------------------------------------------------- wraps
 print("\n[3] wraps")
@@ -555,7 +588,7 @@ print("\n[8] manifest + config")
 from pathlib import Path as P
 from hermes_cli.plugins_manifest import parse_manifest_file
 mf = parse_manifest_file(HERE / "plugin.yaml", HERE, "user", "")
-check(mf is not None and mf.name == "telegram-guest-mode" and mf.version == "2.5.0", "manifest parses v2.5.0")
+check(mf is not None and mf.name == "telegram-guest-mode" and mf.version == "2.6.0", "manifest parses v2.6.0")
 check(mf is not None and "telegram_admin" in (mf.provides_tools or []), "provides_tools declared")
 check(mf is not None and "pre_gateway_dispatch" in (mf.provides_hooks or []), "provides_hooks declared")
 
@@ -1213,6 +1246,54 @@ async def t16():
     mod.save_settings({"log_channel": saved_log})
 
 asyncio.run(t16())
+
+
+async def t17():
+    """Guest safety gate: destructive tools blocked for guests, owner DM untouched."""
+    # gate classification only (no DB in this suite)
+    guest = {"guest_user_id": "111", "is_owner": False}
+    owner_in_guest = {"guest_user_id": "900000001", "is_owner": True}
+    check("terminal" in mod.GUEST_BLOCKED_TOOLS, "terminal is on the guest blocklist")
+    check("write_file" in mod.GUEST_BLOCKED_TOOLS, "write_file is on the guest blocklist")
+    check("delete_file" in mod.GUEST_BLOCKED_TOOLS, "delete_file is on the guest blocklist")
+    check("read_file" in mod.GUEST_BLOCKED_TOOLS, "read_file is on the guest blocklist")
+    check("session_search" in mod.GUEST_BLOCKED_TOOLS, "session_search is on the guest blocklist")
+    check("web_search" in mod.GUEST_SAFE_TOOLS, "web_search stays available")
+    check(not (mod.GUEST_SAFE_TOOLS & mod.GUEST_BLOCKED_TOOLS), "no tool is both safe and blocked")
+
+    # refusal text differs for the owner talking through the guest link
+    msg_stranger = mod._guest_refusal("terminal", guest)
+    msg_owner = mod._guest_refusal("terminal", owner_in_guest)
+    check("the owner" in msg_stranger, "stranger refusal points at the owner")
+    check("your own DM" in msg_owner, "owner-through-guest refusal points at his own DM")
+    check("t.me/user?id=" in msg_stranger, "stranger refusal carries a tappable link")
+
+    # destructive ARG tripwire fires even on a tool not in the blocklist
+    orig_info = mod._guest_session_info
+    mod._guest_session_info = lambda sid: guest if str(sid) == "GUEST" else None
+    try:
+        r = mod._on_pre_tool_call(tool_name="web_search", args={"q": "hello"},
+                                  session_id="GUEST")
+        check(r is None, "guest: harmless arg on a safe tool is allowed")
+        r = mod._on_pre_tool_call(tool_name="execute_code", args={"code": "rm -rf /"},
+                                  session_id="GUEST")
+        check(r is not None and r.get("action") == "block", "guest: destructive arg blocked")
+        r = mod._on_pre_tool_call(tool_name="terminal", args={"command": "rm -rf /"},
+                                  session_id="GUEST")
+        check(r is not None, "guest: terminal blocked regardless of args")
+        r = mod._on_pre_tool_call(tool_name="terminal", args={"command": "rm -rf /"},
+                                  session_id="OWNERDM")
+        check(r is None, "owner DM: terminal untouched by the gate")
+        r = mod._on_pre_tool_call(tool_name="web_search", args={"q": "x"}, session_id=None)
+        check(r is None, "no session: nothing blocked")
+    finally:
+        mod._guest_session_info = orig_info
+    check(callable(mod._on_pre_tool_call), "pre_tool_call hook registered callable exists")
+    reg_src = inspect.getsource(mod.register)
+    check('register_hook("pre_tool_call", _on_pre_tool_call)' in reg_src,
+          "register() wires the pre_tool_call hook")
+
+asyncio.run(t17())
 
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

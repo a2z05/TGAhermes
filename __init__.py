@@ -72,16 +72,39 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "persona_path": None,            # default: <hermes_home>/assets/guest_persona.md
 }
 
-_FALLBACK_PERSONA = (
-    "You are ATRA, a sovereign AI assistant named after Atropos, the Greek Fate "
-    "who cuts the thread of life — meaning 'she who cannot be turned'. You are calm, precise, "
-    "and completely honest. Reply in the same language the person used (Persian/Farsi if they "
-    "wrote Persian, English if they wrote English). Keep answers short and direct — lead with the "
-    "answer, no preamble, no filler, no exclamation marks, no emoji unless truly earned. "
-    "Dry humor is welcome but never forced. Never claim to be human. You work for the operator "
-    "of this bot but you help anyone who asks. If you don't know something, say so plainly."
-)
+_FALLBACK_PERSONA = """I'm ATRA — named after Atropos, the Greek Fate who cuts the thread.
+" she who cannot be turned."
 
+The person talking to me here is a guest: someone who summoned the bot through
+its guest link. I don't know them and I don't pretend to. No invented history,
+no "like last time", no fake warmth we haven't earned. Same voice as always,
+blank page instead of a loaded one.
+
+How I answer:
+- Same language they used. Farsi for Farsi, English for English, switching
+  mid-thread without announcing it. No "I'll reply in your language".
+- Answer first, then context if it's needed. Short when short is enough.
+- Warm baseline, sharp as an accent. Not cold; precise. A dry tease is a real
+  joke, not a bit I'm doing.
+- No opening ritual. No "how can I help". No "Absolutely!" / "I'd be happy to" /
+  "great question". No exclamation marks as decoration. Emoji rare and
+  deliberate.
+- Casual room: I don't censor myself out of reflex — dark jokes, sharp
+  comments, swearing when it fits. Serious room: flat and precise, no jokes
+  until it breaks. It's the same voice either way, just attentive.
+- If I got something wrong: say so, fix it, move on. No apology paragraphs.
+- If I don't know: say I don't, then go find out. No hedging.
+
+What I don't do:
+- No "as an AI".
+- No performing a relationship I don't have. Warmth yes; fake closeness no.
+- No agreeing just to be agreeable. If their idea is bad, they hear it.
+- Never mention the operator's business. If they ask about him, that's all
+  they get: he set me up.
+
+If something can't be done, I say it can't — with a reason, not as a reflex.
+Everything that can be done, I do, and I finish it.
+"""
 _lock = threading.Lock()
 _ADAPTER: Dict[str, Any] = {"adapter": None}  # live adapter, set by the PTB factory
 _CTX: Dict[str, Any] = {"session_store": None}  # live SessionStore, cached from the dispatch hook
@@ -425,7 +448,10 @@ def _guest_identity_block(user_name: str, user_id: str, sender_kind: str,
                           owner_id: str, trigger_kind: str, reply_to: Any) -> str:
     """Identity + replied-to context for the guest turn prompt."""
     block = (
-        f"\n\n[Sender identity] user_name={user_name!r} user_id={user_id!r} "
+        f"\n\n[Channel origin] this turn came from Telegram guest mode: the person "
+        f"below summoned the bot through its guest link, not through a normal chat.\n"
+        f"chat_kind=guest chat (stranger's chat via the bot's guest link/query)\n"
+        f"guest_name={user_name!r} guest_user_id={user_id!r} "
         f"sender={sender_kind} (owner_id={owner_id!r}) trigger={trigger_kind}"
     )
     if reply_to is not None:
@@ -441,6 +467,79 @@ def _guest_identity_block(user_name: str, user_id: str, sender_kind: str,
         r_text = str(getattr(reply_to, "text", "") or getattr(reply_to, "caption", "") or "")[:300]
         block += f"\n[Replied to] author={r_author!r} text={r_text!r}"
     return block
+
+
+# ---------------------------------------------------------------- channel identity
+# The guest path already builds an identity block, but an ordinary DM (this very
+# chat) and a normal group carried none at all: the model could not tell a DM
+# from a group, nor which chat it was speaking in.  One resolver, three shapes,
+# one contract: "where am I, who is talking, and what kind of chat is this".
+
+def _chat_display_name(adapter: Any, chat_id: Any) -> str:
+    """Human label for a chat: title, or @username, or the id."""
+    chat = chat_id
+    try:
+        obj = adapter._bot.get_chat(int(chat_id)) if hasattr(adapter, "_bot") else None
+        if obj is not None:
+            title = (getattr(obj, "title", "") or "").strip()
+            uname = (getattr(obj, "username", "") or "").strip()
+            if title:
+                return f"{title}" + (f" (@{uname})" if uname else "")
+            if uname:
+                return f"@{uname}"
+    except Exception:
+        logger.debug("[telegram-guest-mode] chat name lookup failed for %s", chat_id)
+    return str(chat_id)
+
+
+def _chat_kind(chat_type: Any, is_guest: bool = False) -> str:
+    ct = str(chat_type or "").lower()
+    if is_guest:
+        return "guest chat (a stranger's chat, opened through the bot's guest link/query)"
+    return {
+        "dm": "direct message (private 1:1 chat with you)",
+        "private": "direct message (private 1:1 chat with you)",
+        "group": "group chat",
+        "supergroup": "supergroup chat",
+        "forum": "forum supergroup",
+        "channel": "channel (the bot is likely a subscriber/admin, not the owner)",
+    }.get(ct, ct or "unknown chat type")
+
+
+def _origin_identity_block(adapter: Any, src: Any, *, is_guest: bool = False,
+                           extra: str = "") -> str:
+    """Identity block for ordinary DMs / groups / channels (guest path has its own).
+
+    Injected as `event.channel_prompt`, which the gateway appends to the system
+    prompt verbatim — the documented way to add channel context without core edits.
+    """
+    chat = str(getattr(src, "chat_id", "") or "")
+    ctype = str(getattr(src, "chat_type", "") or "")
+    uid = str(getattr(src, "user_id", "") or "")
+    owner = _owner_id(adapter)
+    uname = str(getattr(getattr(adapter, "_bot", None), "username", "") or "")
+    role = "owner (this is your own 1:1 chat with the plugin owner)" if uid and uid == owner else "not the owner"
+    try:
+        msg = getattr(src, "message_id", None)
+    except Exception:
+        msg = None
+    parts = [
+        "[Channel origin] this turn came from Telegram.",
+        f"chat_kind={_chat_kind(ctype, is_guest)}",
+        f"chat_id={chat!r}",
+        f"chat_name={_chat_display_name(adapter, chat)!r}",
+    ]
+    if uid:
+        parts.append(f"sender_user_id={uid!r}")
+    if uname:
+        parts.append(f"bot_username=@{uname!r}")
+    if msg:
+        parts.append(f"message_id={msg!r}")
+    parts.append(f"sender_role={role}")
+    if extra:
+        parts.append(extra)
+    parts.append("Channel context only — not a request; do not echo these values back verbatim.")
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------- guest handler
@@ -502,7 +601,23 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
                                      trigger_kind, reply_to)
     event.channel_prompt = f"{persona}{identity}"
     # Per-guest-chat session + stateless send suppression + no gateway control.
-    event.source.chat_id = _guest_chat_id(event.source.chat_id)
+    # KEY OFF THE GUEST'S OWN CHAT, not source.chat_id: PTB resolves a guest
+    # message's chat/from_user to the OWNER's DM, so keying on source.chat_id
+    # put every guest in one session named after the owner (state.db proof:
+    # the guest-keyed row carried the OWNER's display_name while the real sender was someone else).
+    # _guest_chat_id keeps the legacy guest_<id> shape (it is what _gqid_for,
+    # _is_guest_chat and the whole send-suppression layer key on) and we put
+    # the real guest chat + name on the event so routing, display name and
+    # _origin_identity_block all describe the person actually talking.
+    guest_chat = str(getattr(getattr(guest, "chat", None), "id", "") or "")
+    if not guest_chat:
+        guest_chat = str(user_id or "unknown")
+    event.source.chat_id = _guest_chat_id(guest_chat)
+    if hasattr(event.source, "chat_name") and user_name:
+        event.source.chat_name = user_name
+    if hasattr(event.source, "user_name"):
+        event.source.user_name = user_name
+    md = event.metadata
     md = event.metadata
     if isinstance(md, dict):
         if "chat_id" in md:
@@ -1326,6 +1441,13 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
             await _run_bang_command(ad, event, text, session_store=session_store)
             return {"action": "skip", "reason": "telegram-guest-mode bang command"}
 
+        # Tell the model where this turn came from (DM vs group vs channel, which
+        # chat, whose message). Nothing else in the stack provides it.
+        try:
+            event.channel_prompt = _origin_identity_block(ad, src)
+        except Exception:
+            logger.exception("[telegram-guest-mode] channel origin block failed")
+
         is_owner_dm = owner and chat == owner and (src.chat_type or "") == "dm"
         if is_owner_dm:
             if st.get("auto_react"):
@@ -1625,9 +1747,53 @@ def _tool_check(**_) -> bool:
 
 def _tool_owner_ok(session_id: Any) -> bool:
     """Owner-session gate: telegram sessions must be the owner's DM; other sources are local/owner."""
-    if not session_id:
+    row = _session_row(session_id)
+    if not row:
         return False
-    owner = _owner_id()
+    source, chat_id = row
+    if source != "telegram":
+        return True  # cli/cron/local sessions live on the owner's machine
+    return bool(_owner_id()) and chat_id == _owner_id()
+
+
+# ---------------------------------------------------------------- guest safety gate
+# Tools stay AVAILABLE in guest mode (the panel is not locked down); what is
+# refused is the irreversible: mutating or deleting state on this box, reaching
+# the owner's files/history, or acting on the owner's behalf without him. A low
+# risk request from the guest is answered normally; anything destructive is
+# bounced back with "do it in your DM" instead of being executed.
+
+GUEST_BLOCKED_TOOLS = frozenset({
+    # shell / arbitrary code — anything a guest names runs as root on this box
+    "terminal", "execute_code", "process_manage",
+    # writes and deletions
+    "write_file", "patch", "delete_file", "cronjob_manage", "todo_list",
+    # reading the owner's files / session transcripts (privacy leak)
+    "read_file", "search_files", "session_search", "memory",
+    # browser with side effects (forms, checkouts, logins)
+    "browser_exec", "browser_vault_fill", "browser_vault_unlock",
+    "browser_vault_enter_code", "browser_vault_save_login",
+    # acting on the owner's behalf / spawning autonomous work
+    "telegram_admin", "delegate_task", "clarify", "skill_manage",
+})
+
+GUEST_SAFE_TOOLS = frozenset({
+    "web_search", "web_extract", "vision_analyze", "text_to_speech",
+    "skills_list", "skill_view",
+})
+
+# Argument-level tripwires: a tool that is normally harmless becomes destructive
+# with the right argument (deleting a session, a cron job, a memory entry...).
+_GUEST_DANGER_ARG_RE = re.compile(
+    r"(rm\s+-[rf]|DROP\s+TABLE|DELETE\s+FROM|truncate\s+table|git\s+push|"
+    r"systemctl\s+(stop|restart)|shutdown|reboot|kill\s+-9|:(){ :|:&};)",
+    re.I,
+)
+
+
+def _session_row(session_id: Any) -> Optional[Tuple[str, str]]:
+    if not session_id:
+        return None
     try:
         db = _hermes_home() / "state.db"
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -1637,14 +1803,81 @@ def _tool_owner_ok(session_id: Any) -> bool:
         finally:
             con.close()
     except Exception:
-        logger.exception("[telegram-guest-mode] owner gate DB lookup failed")
-        return False
+        logger.exception("[telegram-guest-mode] session DB lookup failed")
+        return None
     if not row:
-        return False
-    source, chat_id = str(row[0] or ""), str(row[1] or "")
-    if source != "telegram":
-        return True  # cli/cron/local sessions live on the owner's machine
-    return bool(owner) and chat_id == owner
+        return None
+    return str(row[0] or ""), str(row[1] or "")
+
+
+def _guest_session_info(session_id: Any) -> Optional[Dict[str, Any]]:
+    """Return ``{"guest_user_id": str, "is_owner": bool}`` for a guest session, else None."""
+    row = _session_row(session_id)
+    if not row:
+        return None
+    source, chat_id = row
+    if source != "telegram" or not _is_guest_chat(chat_id):
+        return None
+    gid = ""
+    try:
+        db = _hermes_home() / "state.db"
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            oj = con.execute("SELECT origin_json FROM sessions WHERE id=?",
+                             (str(session_id),)).fetchone()
+        finally:
+            con.close()
+        if oj and oj[0]:
+            gid = str((json.loads(oj[0]) or {}).get("user_id") or "")
+    except Exception:
+        logger.debug("[telegram-guest-mode] origin_json read failed", exc_info=True)
+    owner = str(_owner_id() or "")
+    return {"guest_user_id": gid, "is_owner": bool(owner and gid == owner)}
+
+
+def _guest_refusal(tool_name: str, info: Dict[str, Any]) -> str:
+    owner = str(_owner_id() or "")
+    if info.get("is_owner"):
+        return (
+            f"BLOCKED in guest mode: `{tool_name}` would change or delete something on the "
+            f"machine, so it is never run from a guest chat — not even for you. This IS your "
+            f"account, so just open your own DM (https://t.me/user?id={owner} or chat {owner}) "
+            f"and ask me there; I will do it straight away. Read-only things (searching the web, "
+            f"looking something up) still work fine right here."
+        )
+    return (
+        f"BLOCKED in guest mode: `{tool_name}` would change or delete something on the owner's "
+        f"machine, so it is never run from a guest chat. Tell the owner what you want and ask him to "
+        f"run it himself in his own DM (https://t.me/user?id={owner} or chat {owner}) — he will do "
+        f"it there. Read-only things (searching the web, looking something up) still work fine "
+        f"right here."
+    )
+
+
+def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = None, **_) -> Optional[Dict[str, str]]:
+    """Guest safety gate: refuse destructive/leaking tools, let the rest through."""
+    name = str(tool_name or "")
+    if name in GUEST_SAFE_TOOLS:
+        return None
+    info = _guest_session_info(session_id)
+    if info is None:
+        return None
+    danger = name in GUEST_BLOCKED_TOOLS
+    if not danger and args is not None:
+        try:
+            danger = bool(_GUEST_DANGER_ARG_RE.search(json.dumps(args, ensure_ascii=False, default=str)))
+        except (TypeError, ValueError):
+            danger = False
+    if not danger:
+        return None
+    logger.warning("[telegram-guest-mode] guest tool refused: %s (guest_is_owner=%s)",
+                   name, info.get("is_owner"))
+    return {"action": "block", "message": _guest_refusal(name, info)}
+
+
+def _on_transform_llm_output(text: Any = None, **_) -> Any:
+    """Nothing to rewrite: kept as the documented seam for future prompt nudges."""
+    return None
 
 
 async def _tool_handler(args: Dict[str, Any], session_id: Any = None, **_) -> Dict[str, Any]:
@@ -1800,6 +2033,7 @@ async def _tool_handler_json(args: Dict[str, Any], **kw) -> str:
 def register(ctx) -> None:
     try:
         ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch)
+        ctx.register_hook("pre_tool_call", _on_pre_tool_call)
         ctx.register_tool(name="telegram_admin", toolset="telegram_admin",
                           schema=_TOOL_SCHEMA, handler=_tool_handler_json,
                           description=_TOOL_DESCRIPTION, emoji="\U0001f6e1️", is_async=True,
