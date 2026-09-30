@@ -5,6 +5,7 @@ import asyncio
 import importlib.util
 import inspect
 import json
+import sqlite3
 import os
 import sys
 import time
@@ -589,7 +590,7 @@ print("\n[8] manifest + config")
 from pathlib import Path as P
 from hermes_cli.plugins_manifest import parse_manifest_file
 mf = parse_manifest_file(HERE / "plugin.yaml", HERE, "user", "")
-check(mf is not None and mf.name == "telegram-guest-mode" and mf.version == "2.7.0", "manifest parses v2.7.0")
+check(mf is not None and mf.name == "telegram-guest-mode" and mf.version == "2.8.0", "manifest parses v2.8.0")
 check(mf is not None and "telegram_admin" in (mf.provides_tools or []), "provides_tools declared")
 check(mf is not None and "pre_gateway_dispatch" in (mf.provides_hooks or []), "provides_hooks declared")
 
@@ -1257,8 +1258,9 @@ async def t17():
     check("terminal" in mod.GUEST_BLOCKED_TOOLS, "terminal is on the guest blocklist")
     check("write_file" in mod.GUEST_BLOCKED_TOOLS, "write_file is on the guest blocklist")
     check("delete_file" in mod.GUEST_BLOCKED_TOOLS, "delete_file is on the guest blocklist")
-    check("read_file" in mod.GUEST_BLOCKED_TOOLS, "read_file is on the guest blocklist")
-    check("session_search" in mod.GUEST_BLOCKED_TOOLS, "session_search is on the guest blocklist")
+    check("read_file" in mod.GUEST_READ_TOOLS, "read_file is classed as read-only")
+    check("session_search" in mod.GUEST_READ_TOOLS, "session_search is classed as read-only")
+    check("telegram_admin" in mod.GUEST_NEVER_TOOLS, "telegram_admin is never allowed")
     check("web_search" in mod.GUEST_SAFE_TOOLS, "web_search stays available")
     check(not (mod.GUEST_SAFE_TOOLS & mod.GUEST_BLOCKED_TOOLS), "no tool is both safe and blocked")
 
@@ -1300,6 +1302,8 @@ async def t18():
     mod._GUEST_BLOCK_COUNTS.clear()
     mod._GUEST_BLOCK_LAST.clear()
     sess = "20260930_162658_5a05bae5"
+    # strict mode so the gate is at its most closed
+    mod.save_settings({"guest_tool_mode": "strict", "guest_owner_full_access": False})
     first = mod._on_pre_tool_call(tool_name="read_file", session_id=sess,
                                   arguments={"path": "/host/home/anything"})
     second = mod._on_pre_tool_call(tool_name="execute_code", session_id=sess,
@@ -1330,6 +1334,7 @@ async def t18():
     check("NOW" not in again["message"], "new turn no longer uses urgent wording")
     mod._GUEST_BLOCK_COUNTS.clear()
     mod._GUEST_BLOCK_LAST.clear()
+    mod.save_settings({"guest_tool_mode": "balanced", "guest_owner_full_access": True})
 
 
 asyncio.run(t17())
@@ -1375,7 +1380,197 @@ async def t19():
 
 
 asyncio.run(t18())
+
+async def t20():
+    """Guest gate modes: strict / balanced / open, and the owner is not trapped."""
+    guest = {"guest_user_id": "111", "is_owner": False}
+    owner = {"guest_user_id": "900000001", "is_owner": True}
+    orig = mod._guest_session_info
+    mod._guest_session_info = lambda sid: guest if str(sid) == "G" else (
+        owner if str(sid) == "O" else None)
+    try:
+        def blocked(sid, tool, args=None):
+            return mod._on_pre_tool_call(tool_name=tool, args=args or {}, session_id=sid)
+
+        # strict: nothing for a guest
+        mod.save_settings({"guest_tool_mode": "strict", "guest_owner_full_access": False})
+        check(blocked("G", "read_file") is not None, "strict: guest cannot read")
+        check(blocked("G", "web_search") is None, "strict: guest can still search the web")
+        check(blocked("G", "terminal") is not None, "strict: guest has no terminal")
+
+        # balanced: reads open, writes shut
+        mod.save_settings({"guest_tool_mode": "balanced"})
+        check(blocked("G", "read_file") is None, "balanced: guest may read a file")
+        check(blocked("G", "search_files") is None, "balanced: guest may search files")
+        check(blocked("G", "session_search") is None, "balanced: guest may search past chats")
+        check(blocked("G", "write_file") is not None, "balanced: writes stay closed")
+        check(blocked("G", "terminal") is not None, "balanced: no terminal")
+        check(blocked("G", "execute_code") is not None, "balanced: no arbitrary code")
+
+        # open: same tools as any chat
+        mod.save_settings({"guest_tool_mode": "open"})
+        check(blocked("G", "terminal") is None, "open: guest gets a terminal")
+        check(blocked("G", "write_file") is None, "open: guest may write")
+        check(blocked("G", "telegram_admin") is not None,
+              "open still refuses telegram_admin (never list)")
+
+        # owner in their own guest chat is not blocked (the bug that was fixed)
+        mod.save_settings({"guest_tool_mode": "balanced", "guest_owner_full_access": True})
+        check(blocked("O", "terminal") is None, "owner in guest chat: terminal works")
+        check(blocked("O", "read_file") is None, "owner in guest chat: reading works")
+        mod.save_settings({"guest_owner_full_access": False})
+        check(blocked("O", "terminal") is not None,
+              "owner can opt back into being blocked")
+
+        # per-tool overrides
+        mod.save_settings({"guest_owner_full_access": True, "guest_deny_tools": ["read_file"]})
+        check(blocked("G", "read_file") is not None, "guest_deny_tools re-closes a read tool")
+        mod.save_settings({"guest_deny_tools": []})
+        # guest_allow_tools only widens a guest's reach; it must not re-open a
+        # mode-level ban, so strict stays closed even with the tool named.
+        mod.save_settings({"guest_tool_mode": "strict",
+                           "guest_allow_tools": ["read_file"]})
+        check(blocked("G", "read_file") is not None,
+              "guest_allow_tools cannot re-open a mode-level ban")
+
+        # the mode is read from settings each call, so the panel switch is instant
+        mod.save_settings({"guest_tool_mode": "balanced"})
+        check(blocked("G", "read_file") is None, "switching mode takes effect immediately")
+        mod.save_settings({"guest_tool_mode": "strict"})
+        check(blocked("G", "read_file") is not None, "and again on the next message")
+
+        # the panel exposes it
+        body = mod._gate_view(mod.settings())
+        check("Guest tool gate" in body, "gate view renders")
+        check("balanced" in body or "strict" in body, "gate view names the mode")
+        kb = mod._help_keyboard("system", mod.settings())
+        check(any("Guest mode" in b.text for row in kb for b in row),
+              "system tab has a guest-mode button")
+        check("gate" in mod._CB_PREFIX + "panel:gate", "gate callback path is namespaced")
+    finally:
+        mod._guest_session_info = orig
+        mod.save_settings({"guest_tool_mode": "balanced", "guest_owner_full_access": True,
+                           "guest_allow_tools": [], "guest_deny_tools": []})
+
+
+def _set_guest(mod, db, sid, uid):
+    """Point a test session row at a given real guest id."""
+    con = sqlite3.connect(db)
+    try:
+        con.execute("UPDATE sessions SET user_id=?, origin_json=? WHERE id=?",
+                    (uid, json.dumps({"user_id": uid}), sid))
+        con.commit()
+    finally:
+        con.close()
+
+
+async def t21():
+    """A guest must never inherit the owner's rights from the owner id.
+
+    Telegram resolves a guest message's from_user to the OWNER's user, so the
+    user_id stored on every guest session IS the owner's id. The gate compared
+    that field against the owner id, which made every stranger the owner.
+    """
+    import sqlite3 as _sq
+    sid = "T21GUESTSESSION"
+    chat = "guest_424242"
+    db = mod._hermes_home() / "state.db"
+    con = _sq.connect(db)
+    try:
+        con.execute("INSERT OR REPLACE INTO sessions "
+                    "(id, source, user_id, session_key, chat_id, chat_type, "
+                    "origin_json, started_at, last_activity_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (sid, "telegram", str(mod._owner_id()), sid, chat, "private",
+                     json.dumps({"user_id": str(mod._owner_id()),
+                                 "guest_original_chat_id": chat}),
+                     9999999999, 9999999999))
+        con.commit()
+    finally:
+        con.close()
+    try:
+        info = mod._guest_session_info(sid)
+        check(info is not None, "guest session is recognised")
+        # The real guest id is written onto the event now, so a session whose
+        # stored id is the owner belongs to the owner. A stranger's id does not
+        # match and must not be treated as the owner.
+        check(info["is_owner"],
+              "a guest session carrying the owner's id is recognised as the owner")
+
+        # A stranger in the same shape is NOT the owner.
+        con = _sq.connect(db)
+        try:
+            con.execute("UPDATE sessions SET user_id=?, origin_json=? WHERE id=?",
+                        ("900000002",
+                         json.dumps({"user_id": "900000002"}), sid))
+            con.commit()
+        finally:
+            con.close()
+        check(not mod._guest_session_info(sid)["is_owner"],
+              "a stranger's guest session is not the owner")
+        con = _sq.connect(db)
+        try:
+            con.execute("UPDATE sessions SET user_id=?, origin_json=? WHERE id=?",
+                        (str(mod._owner_id()),
+                         json.dumps({"user_id": str(mod._owner_id())}), sid))
+            con.commit()
+        finally:
+            con.close()
+
+        # Back to the stranger for the gate checks: a guest gets guest rules.
+        _set_guest(mod, db, sid, "900000002")
+        mod.save_settings({"guest_tool_mode": "open", "guest_owner_full_access": True,
+                           "guest_owner_chats": []})
+        check(mod._on_pre_tool_call(tool_name="telegram_admin", args={},
+                                    session_id=sid) is not None,
+              "a stranger never reaches telegram_admin, even in open mode")
+
+        # balanced blocks terminal for a guest.
+        mod.save_settings({"guest_tool_mode": "balanced"})
+        check(mod._on_pre_tool_call(tool_name="terminal", args={},
+                                    session_id=sid) is not None,
+              "a stranger has no terminal in balanced mode")
+        check(mod._on_pre_tool_call(tool_name="read_file", args={},
+                                    session_id=sid) is None,
+              "a stranger may still read in balanced mode")
+
+        # Now the owner, in their own guest chat, is not trapped.
+        _set_guest(mod, db, sid, str(mod._owner_id()))
+        mod.save_settings({"guest_owner_full_access": True})
+        check(mod._on_pre_tool_call(tool_name="terminal", args={},
+                                    session_id=sid) is None,
+              "the owner in their own guest chat gets a terminal")
+        mod.save_settings({"guest_owner_full_access": False})
+        check(mod._on_pre_tool_call(tool_name="terminal", args={},
+                                    session_id=sid) is not None,
+              "and can opt back into being blocked")
+
+        # The explicit per-chat unlock is the fallback for when the id cannot
+        # be trusted (an old session, or a rewrite that lost it).
+        mod.save_settings({"guest_owner_full_access": True, "guest_owner_chats": [chat]})
+        _set_guest(mod, db, sid, "900000002")
+        check(mod._on_pre_tool_call(tool_name="terminal", args={},
+                                    session_id=sid) is None,
+              "an explicitly unlocked chat is not gated")
+        mod.save_settings({"guest_owner_chats": []})
+        check(mod._on_pre_tool_call(tool_name="terminal", args={},
+                                    session_id=sid) is not None,
+              "revoking the unlock takes the access away")
+    finally:
+        con = _sq.connect(db)
+        try:
+            con.execute("DELETE FROM sessions WHERE id=?", (sid,))
+            con.commit()
+        finally:
+            con.close()
+        mod.save_settings({"guest_tool_mode": "balanced", "guest_owner_full_access": False,
+                           "guest_owner_chats": [], "guest_allow_tools": [],
+                           "guest_deny_tools": []})
+
+
 asyncio.run(t19())
+asyncio.run(t20())
+asyncio.run(t21())
 
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

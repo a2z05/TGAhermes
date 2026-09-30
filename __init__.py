@@ -83,6 +83,29 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "log_group_mentions": True,      # log @bot mentions from groups/channels the bot is in
     "tool_enabled": True,            # telegram_admin agent tool
     "persona_path": None,            # default: <hermes_home>/assets/guest_persona.md
+    # --- guest tool gate -------------------------------------------------
+    # "strict"   : guests get no shell, no file access at all
+    # "balanced" : guests may READ but never write (default)
+    # "open"     : guests get the same tools as any other chat (only if you
+    #              accept that a stranger can act on this machine)
+    "guest_tool_mode": "balanced",
+    # Owner's own guest chat: the gate cannot protect anything here, because
+    # the owner already has full access in their own DM. Set false to be
+    # blocked too (stricter, but then the owner cannot work from the guest
+    # link at all).
+    "guest_owner_full_access": False,
+    # Extra tools guests may use on top of the mode's default set. Additive
+    # only: it can widen what a guest may do, never narrow the write ban.
+    "guest_allow_tools": [],
+    # Tools that stay blocked whatever the mode says. Use this to re-close a
+    # tool you opened by accident.
+    "guest_deny_tools": [],
+    # Guest chats (the guest_ chat id) you have personally unlocked, e.g.
+    # ["guest_0000"]. Only used when guest_owner_full_access is on.
+    # Telegram does not tell a bot who sent a guest message, so this list is
+    # the ONLY reliable way to give yourself access from a guest chat: it is
+    # explicit, per chat, and revocable from the panel.
+    "guest_owner_chats": [],
     # !update — pull a newer version of this plugin from git
     "update_enabled": True,          # set False to lock the plugin version
     "update_repo": None,             # git URL; None = use the plugin's own origin
@@ -632,6 +655,17 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
     if not guest_chat:
         guest_chat = str(user_id or "unknown")
     event.source.chat_id = _guest_chat_id(guest_chat)
+    # Same reason, for the sender id. The event was built from the bot's
+    # FORWARDED copy of the message, so source.user_id came back as the OWNER's
+    # id for every guest — which is what got stamped into state.db and made the
+    # gate unable to tell the owner from a stranger. The raw guest message's
+    # from_user IS the real person (state.json records distinct ids per guest),
+    # so put that on the event too and the session carries the truth.
+    if user_id:
+        try:
+            event.source.user_id = user_id
+        except Exception:
+            logger.debug("[telegram-guest-mode] could not set source.user_id", exc_info=True)
     if hasattr(event.source, "chat_name") and user_name:
         event.source.chat_name = user_name
     if hasattr(event.source, "user_name"):
@@ -1077,6 +1111,44 @@ def _system_view(st: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _gate_view(st: Dict[str, Any]) -> str:
+    """Show exactly what a guest can and cannot do, per mode."""
+    mode = str(st.get("guest_tool_mode") or "balanced")
+    denied = _guest_allowed(frozenset())
+    blocked = sorted(denied)
+    never = sorted(GUEST_NEVER_TOOLS)
+    lines = [
+        f"<b>🛡 Guest tool gate</b> — mode: <b>{_MODE_LABEL.get(mode, mode)}</b>",
+        "",
+        "<b>strict</b> · no shell, no files, nothing",
+        "<b>balanced</b> · may read files and past chats, writes closed",
+        "<b>open</b> · same tools as any chat (a stranger can act on this box)",
+        "",
+        f"<b>Owner in own guest chat:</b> "
+        f"{'full access' if st.get('guest_owner_full_access', False) else 'blocked too'}",
+        "",
+        f"<b>Blocked for guests ({len(blocked)}):</b>",
+        _esc(", ".join(blocked)) if blocked else "nothing",
+        "",
+        f"<b>Never allowed, even in open:</b> {_esc(', '.join(never))}",
+        "",
+        f"<b>Extra tools you opened:</b> "
+        f"{_esc(', '.join(str(t) for t in (st.get('guest_allow_tools') or []))) or 'none'}",
+        "",
+        f"<b>Guest chats you unlocked for yourself:</b> "
+        f"{_esc(', '.join(str(c) for c in (st.get('guest_owner_chats') or []))) or 'none'}",
+        "",
+        "Telegram never tells a bot who sent a guest message, so the plugin "
+        "cannot recognise you in a guest chat on its own. Unlocking a chat "
+        "below is the deliberate, revocable way to do it.",
+        "",
+        "Change the mode with the button above. Per-tool lists live in "
+        "<code>settings.json</code>: <code>guest_allow_tools</code> and "
+        "<code>guest_deny_tools</code>. Takes effect on the next message.",
+    ]
+    return "\n".join(lines)
+
+
 def _update_note(report: Dict[str, Any]) -> str:
     """One-line result for the panel, or a readable error block."""
     if report.get("error"):
@@ -1207,6 +1279,9 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
             (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:toggle:mirror"))
         add(("\u2699\ufe0f Settings", "panel:out:settings"), ("\U0001f4cb Users", "panel:out:users"))
     elif view == "system":
+        add((f"🛡 Guest mode: {_MODE_LABEL.get(str(st.get('guest_tool_mode') or 'balanced'), 'balanced')}",
+             "panel:gate"))
+        add(("⬇️ Guest tool rules", "panel:gate:list"))
         if st.get("update_enabled", True):
             add(("🔍 Check for update", "panel:upd:check"))
             add(("⬆️ Install update", "panel:upd:apply"))
@@ -1231,6 +1306,8 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         add(("\U0001f9f9 Wipe this chat", f"wipe:{chat_id}"))
     return rows
 
+
+_MODE_LABEL = {"strict": "🔒 strict", "balanced": "⚖️ balanced", "open": "🔓 open"}
 
 _VIEW_LABEL = {"full": "📜 Full help", "panel": "🧩 Console", "out": "📋 Output",
                "status": "ℹ️ Status", "log": "📡 Log", "access": "🛡 Access",
@@ -1418,6 +1495,41 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
             reply = f"cooldown → {int(arg.strip())}s"
         except Exception:
             reply = f"cooldown = {st.get('unauthorized_cooldown_s')}s"
+    elif cmd in ("!guestlock", "!guestgate"):
+        # Lets the owner unlock THIS guest chat from inside it, which is the
+        # only way to do it: Telegram does not tell the bot who sent a guest
+        # message, so the plugin cannot recognise the owner on its own.
+        want = (arg.strip().lower() or "toggle")
+        if not _is_guest_chat(chat_id):
+            reply = ("This is not a guest chat. Use the 🔒 Owner access button in "
+                     "<code>!panel</code> → 🔧 System instead.")
+        elif want in ("on", "grant", "unlock"):
+            cur = [str(c) for c in (settings().get("guest_owner_chats") or [])]
+            if chat_id not in cur:
+                cur.append(chat_id)
+            save_settings({"guest_owner_chats": cur, "guest_owner_full_access": True})
+            reply = (f"🔓 <b>Unlocked</b> <code>{_esc(chat_id)}</code> for your account.\n"
+                     "Turn it off any time with <code>!guestlock off</code>.")
+            await _log("🛡 Guest chat unlocked", f"Owner unlocked guest chat: {chat_id}")
+        elif want in ("off", "revoke", "lock"):
+            cur = [str(c) for c in (settings().get("guest_owner_chats") or [])
+                   if str(c) != chat_id]
+            save_settings({"guest_owner_chats": cur})
+            reply = f"🔒 <b>Locked</b> <code>{_esc(chat_id)}</code> — back to guest rules."
+            await _log("🛡 Guest chat locked", f"Owner locked guest chat: {chat_id}")
+        elif want == "toggle":
+            cur = [str(c) for c in (settings().get("guest_owner_chats") or [])]
+            if chat_id in cur:
+                save_settings({"guest_owner_chats": [c for c in cur if str(c) != chat_id]})
+                reply = f"🔒 <b>Locked</b> <code>{_esc(chat_id)}</code>."
+                await _log("🛡 Guest chat locked", f"Owner locked guest chat: {chat_id}")
+            else:
+                cur.append(chat_id)
+                save_settings({"guest_owner_chats": cur, "guest_owner_full_access": True})
+                reply = (f"🔓 <b>Unlocked</b> <code>{_esc(chat_id)}</code> for your account.")
+                await _log("🛡 Guest chat unlocked", f"Owner unlocked guest chat: {chat_id}")
+        else:
+            reply = "Usage: <code>!guestlock on</code> · <code>!guestlock off</code> · <code>!guestlock</code>"
     elif cmd == "!wipe":
         target = arg.strip()
         if not target:
@@ -1629,6 +1741,51 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     body = (f"<b>⏱ Cooldown</b> — how long a stranger waits before the "
                             f"canned reply may repeat\ncurrent: <b>{st.get('unauthorized_cooldown_s')}s</b>\n"
                             "Tap a preset, or type <code>!setcooldown &lt;seconds&gt;</code>")
+            elif action == "gate":
+                if sub == "list":
+                    view, body = "system", _gate_view(st)
+                elif sub == "mode":
+                    order = ["strict", "balanced", "open"]
+                    cur = str(st.get("guest_tool_mode") or "balanced")
+                    nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "balanced"
+                    save_settings({"guest_tool_mode": nxt})
+                    st = settings()
+                    note = f"🛡 guest mode → <b>{_MODE_LABEL.get(nxt, nxt)}</b>"
+                    body = _gate_view(st)
+                    view = "system"
+                    await _log("🛡 Guest tool mode",
+                               f"Mode set to <b>{nxt}</b> (owner {_esc(str(_owner_id()))})")
+                elif sub == "owner":
+                    on = not bool(st.get("guest_owner_full_access", False))
+                    save_settings({"guest_owner_full_access": on})
+                    st = settings()
+                    note = ("🔓 owner access ON in unlocked guest chats" if on
+                            else "🔒 owner access OFF — everyone is gated here, you included")
+                    body = _gate_view(st)
+                    view = "system"
+                    await _log("🛡 Guest owner access",
+                               f"{'enabled' if on else 'disabled'} for unlocked guest chats")
+                elif sub and sub.startswith("grant:"):
+                    chat_key = sub.split(":", 1)[1].strip()
+                    cur_list = [str(c) for c in (st.get("guest_owner_chats") or [])]
+                    if chat_key and chat_key not in cur_list:
+                        cur_list.append(chat_key)
+                        save_settings({"guest_owner_chats": cur_list})
+                    st = settings()
+                    note = f"➕ unlocked <code>{_esc(chat_key)}</code> for your account"
+                    body = _gate_view(st)
+                    view = "system"
+                    await _log("🛡 Guest chat unlocked", f"Unlocked for owner: {chat_key}")
+                elif sub and sub.startswith("revoke:"):
+                    chat_key = sub.split(":", 1)[1].strip()
+                    cur_list = [str(c) for c in (st.get("guest_owner_chats") or [])
+                                if str(c) != chat_key]
+                    save_settings({"guest_owner_chats": cur_list})
+                    st = settings()
+                    note = f"➖ revoked <code>{_esc(chat_key)}</code>"
+                    body = _gate_view(st)
+                    view = "system"
+                    await _log("🛡 Guest chat locked", f"Revoked owner unlock: {chat_key}")
             elif action == "upd":
                 # Runs git + the test suite, so hand control back to the user
                 # with a "working" toast before it blocks.
@@ -1868,6 +2025,45 @@ GUEST_SAFE_TOOLS = frozenset({
     "skills_list", "skill_view",
 })
 
+# Read-only tools: they can read THIS box's data, so "strict" keeps them shut.
+# "balanced" opens them because answering a question about a file or a past
+# conversation is what a guest actually wants, and reading alone changes
+# nothing. Writes stay closed in every mode except "open".
+GUEST_READ_TOOLS = frozenset({
+    "read_file", "search_files", "session_search",
+})
+
+# Never in any mode below "open": these act on the owner's behalf, spawn
+# autonomous work, or touch credentials.
+GUEST_NEVER_TOOLS = frozenset({
+    "telegram_admin", "browser_vault_fill", "browser_vault_unlock",
+    "browser_vault_enter_code", "browser_vault_save_login",
+    "memory", "skill_manage",
+})
+
+
+def _guest_allowed(deny: frozenset) -> frozenset:
+    """Blocked set for the configured mode, plus the owner's own overrides.
+
+    Reading the mode from settings on every call (rather than at import) is
+    deliberate: it means changing guest_tool_mode in the panel takes effect on
+    the next message, with no reload and no restart.
+    """
+    st = settings()
+    mode = str(st.get("guest_tool_mode") or "balanced").strip().lower()
+    base = set(GUEST_BLOCKED_TOOLS)
+    if mode == "open":
+        base = set()
+    elif mode in ("balanced", "read"):
+        base = set(GUEST_BLOCKED_TOOLS) - set(GUEST_READ_TOOLS)
+    # "strict" and anything unrecognised keep the full default block list.
+    base |= set(GUEST_NEVER_TOOLS)
+    base |= {str(t).strip() for t in (st.get("guest_deny_tools") or []) if str(t).strip()}
+    # The owner's own guest chat is NOT handled here. The hook returns early for
+    # the owner before consulting this set; doing it in both places is what
+    # widened the read tools for strangers too.
+    return frozenset(base)
+
 # Argument-level tripwires: a tool that is normally harmless becomes destructive
 # with the right argument (deleting a session, a cron job, a memory entry...).
 _GUEST_DANGER_ARG_RE = re.compile(
@@ -1896,6 +2092,31 @@ def _session_row(session_id: Any) -> Optional[Tuple[str, str]]:
     return str(row[0] or ""), str(row[1] or "")
 
 
+def _current_guest_chat() -> Optional[str]:
+    """The guest_ chat id of the newest guest session, or None.
+
+    Used by the panel to offer "unlock THIS chat" instead of making the owner
+    copy an id out of a chat message.
+    """
+    db = _hermes_home() / "state.db"
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT chat_id FROM sessions WHERE chat_id LIKE ? "
+                "ORDER BY last_activity_at DESC LIMIT 1",
+                (GUEST_CHAT_PREFIX + "%",),
+            ).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        logger.debug("[telegram-guest-mode] current guest chat lookup failed", exc_info=True)
+        return None
+    return str(row[0]) if row and row[0] else None
+
+
 def _guest_session_info(session_id: Any) -> Optional[Dict[str, Any]]:
     """Return ``{"guest_user_id": str, "is_owner": bool}`` for a guest session, else None."""
     row = _session_row(session_id)
@@ -1914,11 +2135,23 @@ def _guest_session_info(session_id: Any) -> Optional[Dict[str, Any]]:
         finally:
             con.close()
         if oj and oj[0]:
-            gid = str((json.loads(oj[0]) or {}).get("user_id") or "")
+            origin = json.loads(oj[0]) or {}
+            gid = str(origin.get("guest_sender_id") or origin.get("user_id") or "")
     except Exception:
         logger.debug("[telegram-guest-mode] origin_json read failed", exc_info=True)
     owner = str(_owner_id() or "")
-    return {"guest_user_id": gid, "is_owner": bool(owner and gid == owner)}
+    # The event now carries the real guest id, so this comparison is sound.
+    # Sessions written before the fix still hold the forwarded message's id;
+    # those simply do not match, which is the safe direction to fail.
+    is_owner = bool(owner and gid and gid == owner)
+    # Explicit unlock: you added this exact guest chat to guest_owner_chats.
+    # Keyed on the guest's own chat id, not on an id Telegram fills with the
+    # owner's, so this is the trustworthy path.
+    chat_key = str(chat_id or "")
+    unlocked = {str(c).strip() for c in (settings().get("guest_owner_chats") or []) if str(c).strip()}
+    if chat_key and chat_key in unlocked:
+        is_owner = True
+    return {"guest_user_id": gid, "is_owner": is_owner, "guest_chat": chat_key}
 
 
 def _guest_refusal(tool_name: str, info: Dict[str, Any], repeats: int = 0) -> str:
@@ -1970,7 +2203,15 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
     info = _guest_session_info(session_id)
     if info is None:
         return None
-    danger = name in GUEST_BLOCKED_TOOLS
+    st = settings()
+    # The owner already has full access in their own DM, so gating them in
+    # their guest chat protects nothing and only breaks the guest link for
+    # the one person entitled to use it. This was the real bug: the owner was
+    # blocked in their own guest chat, with no way to lift it.
+    if info.get("is_owner") and st.get("guest_owner_full_access", True):
+        return None
+    denied = _guest_allowed(frozenset())
+    danger = name in denied
     if not danger and args is not None:
         try:
             danger = bool(_GUEST_DANGER_ARG_RE.search(json.dumps(args, ensure_ascii=False, default=str)))
