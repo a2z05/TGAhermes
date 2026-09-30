@@ -161,7 +161,17 @@ def check_update(target: Path, repo_url: str, branch: str,
         code, out = _sh(["git", "clone", "--depth", "1", "--branch", branch,
                          repo_url, str(tmp / "r")], timeout=timeout)
         if code != 0:
-            info["error"] = f"clone failed: {out[:200]}"
+            low = out.lower()
+            if "authentication failed" in low or "invalid username or token" in low:
+                # A dead token or a private remote. Say so plainly: the bare
+                # git error is easy to misread as a network problem.
+                info["error"] = ("GitHub rejected the credentials. If the repo is "
+                                 "private, the stored token is dead or lacks access. "
+                                 f"git said: {out.strip()[:200]}")
+            elif "not found" in low or "repository not found" in low:
+                info["error"] = f"Repo not found or not public: {repo_url}"
+            else:
+                info["error"] = f"clone failed: {out[:200]}"
             return info
         repo = tmp / "r"
         info["remote_version"] = read_version(repo / "plugin.yaml")

@@ -98,8 +98,32 @@ def main() -> int:
     err = su.format_report({"error": "boom <script>"})
     check("&lt;script&gt;" in err, "report escapes html in errors")
 
+    t_auth_error_is_legible()
+
     print(f"\n=== {PASS} passed, {FAIL} failed ===")
     return 1 if FAIL else 0
+
+
+def t_auth_error_is_legible():
+    """A dead token must not read as a network problem."""
+    import tempfile
+    from pathlib import Path as _P
+    real = su._sh
+    def fake(args, timeout=300, cwd=None):
+        if args and args[0] == "git" and "clone" in args:
+            return 128, ("remote: Invalid username or token. Password "
+                         "authentication is not supported for Git operations.")
+        return real(args, timeout=timeout, cwd=cwd)
+    su._sh = fake
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            r = su.check_update(_P(td), "https://github.com/a2z05/x.git", "master", timeout=5)
+    finally:
+        su._sh = real
+    err = r.get("error", "")
+    check("credential" in err.lower(),
+          "auth failure is named as a credential problem, not a network one")
+    check("token" in err.lower(), "the message says the token is the thing to fix")
 
 
 if __name__ == "__main__":
