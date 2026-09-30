@@ -26,9 +26,11 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-from pathlib import Path
 
-SELF = Path(__file__).resolve()
+# Repo-relative names of the files that legitimately contain the patterns
+# (this audit's own source). Compared as plain strings: git always reports
+# repo-relative paths, so a resolved absolute Path never matches.
+SELF_RELPATHS = {"scripts/pre-push-audit.py", "scripts/install-audit-hook.sh"}
 
 OWNER_ID = "583" + "817" + "5445"
 GUEST_IDS = ("679" + "498" + "5749", "689" + "497" + "6376")
@@ -67,7 +69,7 @@ def scan(label: str, rev: str | None) -> list[str]:
     files = git("ls-tree", "-r", "--name-only", rev) if rev else git("ls-files")
     for path in files.splitlines():
         path = path.strip()
-        if not path or (not rev and Path(path).resolve() == SELF):
+        if not path or path in SELF_RELPATHS:
             continue
         blob = git("cat-file", "blob", f"{rev}:{path}" if rev else f":{path}")
         if not blob:
