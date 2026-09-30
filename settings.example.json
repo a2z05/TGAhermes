@@ -1,0 +1,18 @@
+{
+  "owner_id": "YOUR_TELEGRAM_USER_ID",
+  "log_channel": null,
+  "unauthorized_reply": "I only serve to my owner",
+  "unauthorized_cooldown_s": 3600,
+  "guest_error_reply_en": "Give me a second — system hiccup. I'm fixing it. Try again.",
+  "guest_error_reply_fa": "Something went wrong on my side — fixing it now. Please try again.",
+  "auto_react": true,
+  "react_guests": false,
+  "react_emoji_receive": "👀",
+  "react_emoji_done": "✅",
+  "react_emoji_error": "❌",
+  "media_to_guests": true,
+  "log_owner_messages": false,
+  "log_group_mentions": true,
+  "tool_enabled": true,
+  "persona_path": null
+}

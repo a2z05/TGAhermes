@@ -1,0 +1,1218 @@
+"""Offline tests for telegram-guest-mode v2 (no live sends; hermes tree on sys.path)."""
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import types
+from pathlib import Path
+
+def _first_existing(*paths):
+    return next((p for p in paths if p and os.path.isdir(p)), "")
+
+
+HERMES_SRC = os.environ.get("HERMES_SRC") or _first_existing("/opt/hermes", "/usr/local/hermes")
+HERMES_HOME = os.environ.get("HERMES_HOME") or _first_existing(
+    "/host/home", os.path.expanduser("~/.hermes")) or tempfile.mkdtemp(prefix="tgm-home-")
+os.environ.setdefault("HERMES_HOME", HERMES_HOME)
+sys.path.insert(0, HERMES_SRC)
+STATE_DB = os.environ.get("TGM_STATE_DB", os.path.join(HERMES_HOME, "state.db"))
+CONFIG_YAML = os.environ.get("TGM_CONFIG", os.path.join(HERMES_HOME, "config.yaml"))
+# host data (live sessions / installed config) only exists on the author's box
+HAVE_HOST = os.path.exists(STATE_DB) and os.path.exists(CONFIG_YAML)
+
+PASS = 0
+FAIL = 0
+
+
+def check(cond, label):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  ok   {label}")
+    else:
+        FAIL += 1
+        print(f"  FAIL {label}")
+
+
+HERE = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location("tg_guest_mode", HERE / "__init__.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+print("module loaded")
+
+TMP = Path(tempfile.mkdtemp(prefix="tgm_test_"))
+mod.SETTINGS_PATH = TMP / "settings.json"
+mod.STATE_PATH = TMP / "state.json"
+PERSONA = TMP / "persona.md"
+PERSONA.write_text("# ATRA — test persona\n", encoding="utf-8")
+
+
+class NS(types.SimpleNamespace):
+    pass
+
+
+class FakeSource:
+    def __init__(self, chat_id, chat_type="dm", user_id="900000001", message_id="1"):
+        self.chat_id = str(chat_id)
+        self.chat_type = chat_type
+        self.user_id = str(user_id)
+        self.message_id = str(message_id)
+        self.platform = "telegram"
+
+
+class FakeEvent:
+    def __init__(self, text="", source=None, internal=False):
+        self.text = text
+        self.source = source or FakeSource("900000001")
+        self.metadata = {}
+        self.channel_prompt = None
+        self.allow_gateway_control = True
+        self.internal = internal
+        self.message_type = None
+        self.platform = "telegram"
+        self.raw_message = None
+
+
+class FakeBot:
+    def __init__(self):
+        self.username = "example_bot"
+        self.answers = []      # (gqid, result)
+        self.sent = []         # send_message kwargs
+        self.banned = []
+        self.deleted = []
+
+    async def answer_guest_query(self, guest_query_id=None, result=None):
+        self.answers.append((guest_query_id, result))
+
+    async def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+
+    async def edit_message_text(self, **kwargs):
+        self.sent.append({"_edited": True, **kwargs})
+        return NS(message_id=555)
+
+    async def ban_chat_member(self, **kwargs):
+        self.banned.append(kwargs)
+
+    async def delete_message(self, **kwargs):
+        self.deleted.append(kwargs)
+
+
+class FakeAdapter:
+    name = "telegram"
+
+    def __init__(self):
+        self.config = NS(extra={"allow_from": 900000001})
+        self._bot = FakeBot()
+        self._message_handler = lambda e: None
+        self.received = []
+        self.calls = []
+        self.reactions = []
+        self.delegated = []
+        self.release_marker_calls = 0
+
+    def _build_message_event(self, message, msg_type, update_id=None):
+        ev = FakeEvent(text=message.text)
+        ev.platform_update_id = update_id
+        return ev
+
+    def _clean_bot_trigger_text(self, text):
+        return (text or "").replace("@example_bot", "").strip()
+
+    async def handle_message(self, event):
+        self.received.append(event)
+
+    async def _release_turn_marker(self, event):
+        self.release_marker_calls += 1
+
+    async def _handle_command(self, update, context):
+        self.delegated.append("command")
+
+    async def _handle_text_message(self, update, context):
+        self.delegated.append("text")
+
+    async def _set_reaction(self, chat_id, message_id, emoji):
+        self.reactions.append((str(chat_id), str(message_id), emoji))
+        return True
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.calls.append(("send", str(chat_id), content))
+        return NS(success=True, message_id="m1")
+
+    async def send_final_ledgered(self, event, session_key, text_content, metadata, *,
+                                  reply_to, is_ephemeral_response=False):
+        self.calls.append(("sfl", event.source.chat_id, text_content))
+        return NS(success=True, message_id="m2"), self
+
+    async def send_clarify(self, chat_id, question, choices, clarify_id, session_key, metadata=None):
+        self.calls.append(("clarify", chat_id, question))
+        return NS(success=True, message_id="m3")
+
+    async def _send_prompt(self, what, chat_id, metadata, build, *, parse_mode=None,
+                           thread_id=None, reply_to_mode=None):
+        self.calls.append(("prompt", chat_id, what))
+        return NS(success=True, message_id="m4")
+
+    async def _notify_turn_error(self, event, e):
+        self.calls.append(("nte", type(e).__name__))
+        return None
+
+    async def send_typing(self, chat_id, metadata=None):
+        self.calls.append(("typing", str(chat_id)))
+
+    async def send_image(self, chat_id, image_url, caption=None, reply_to=None, metadata=None):
+        self.calls.append(("image", str(chat_id), image_url))
+        return NS(success=True, message_id="m5")
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None,
+                            reply_to=None, metadata=None, **kw):
+        self.calls.append(("doc", str(chat_id), file_path))
+        return NS(success=True, message_id="m6")
+
+
+def make_update(text="hi", gqid="gq1", user_id=900000001, reply=None, first="Owner",
+                chat_id=777777, message_id=9):
+    guest = NS(
+        guest_query_id=gqid, text=text,
+        from_user=NS(id=user_id, first_name=first, last_name="", username="u"),
+        reply_to_message=reply, chat=NS(id=chat_id, title=None), message_id=message_id)
+    return NS(guest_message=guest, update_id=4242)
+
+
+def answers_of(bot, gqid=None):
+    out = []
+    for g, r in bot.answers:
+        if gqid is None or g == gqid:
+            try:
+                out.append(r.input_message_content.message_text)
+            except AttributeError:
+                out.append(r)
+    return out
+
+
+# ---------------------------------------------------------------- settings
+print("\n[1] settings")
+s = mod.settings()
+check(s["unauthorized_reply"] == "I only serve to my owner", "default unauthorized reply")
+mod.save_settings({"unauthorized_reply": "custom text", "log_channel": "-10042", "owner_id": "999"})
+s = mod.settings()
+check(s["unauthorized_reply"] == "custom text" and s["log_channel"] == "-10042", "settings roundtrip")
+check(mod._owner_id() == "999", "owner_id override wins")
+mod.save_settings({"owner_id": None})
+try:
+    from hermes_cli.config import load_config_readonly
+    _raw = (load_config_readonly().get("telegram", {}).get("extra", {}) or {}).get("allow_from")
+except Exception:
+    _raw = None
+if isinstance(_raw, (list, tuple)):
+    _raw = _raw[0] if _raw else ""
+_cfg_owner = str(_raw or "")
+check(mod._owner_id() == _cfg_owner and (_cfg_owner != "" or not HAVE_HOST), "falls back to config allow_from")
+check(PERSONA.exists() and mod._load_persona().startswith("# ATRA"), "persona from persona_path")
+mod.save_settings({"persona_path": str(PERSONA)})
+
+# ---------------------------------------------------------------- guest handler
+print("\n[2] guest handler")
+mod.save_settings({"unauthorized_reply": "I only serve to my owner"})  # section 1 changed it
+ad = FakeAdapter()
+mod._ADAPTER["adapter"] = ad
+
+
+async def t1():
+    # unauthorized stranger plain mention -> canned reply + cooldown + log
+    await mod._handle_guest_message(ad, make_update(user_id=111, first="Wz"))
+    check(len(ad._bot.answers) == 1, "canned answer sent for stranger mention")
+    check("I only serve to my owner" in answers_of(ad._bot)[0], "canned text is the configured reply")
+    check(any("Unauthorized guest mention" in str(m.get("text", "")) for m in ad._bot.sent), "logged to log channel")
+    await mod._handle_guest_message(ad, make_update(user_id=111, first="Wz", gqid="gq2"))
+    check(len(ad._bot.answers) == 1, "cooldown suppresses second canned reply")
+    st = json.loads(mod.STATE_PATH.read_text())
+    check("111" in st.get("users", {}), "stranger recorded in state")
+
+    # owner plain mention -> handled
+    await mod._handle_guest_message(ad, make_update())
+    check(len(ad.received) == 1, "owner mention handled")
+    ev = ad.received[-1]
+    check(ev.internal is True and ev.allow_gateway_control is False, "internal + no gateway control")
+    check(ev.source.chat_id == "guest_900000001", "session renamed guest_<id>")
+    check(ev.metadata["guest_query_id"] == "gq1", "gqid stored")
+    check(ev.metadata["guest_original_chat_id"] == "777777", "original chat id kept for log buttons")
+    check("[Sender identity]" in ev.channel_prompt and "ATRA" in ev.channel_prompt, "persona + identity tag")
+    check(any("Guest mention — answered" in str(m.get("text", "")) for m in ad._bot.sent), "answered mention logged")
+
+    # stranger reply-to-ATRA -> handled (no canned)
+    n = len(ad._bot.answers)
+    await mod._handle_guest_message(ad, make_update(user_id=111, first="Wz", reply=NS(x=1), gqid="gq3"))
+    check(len(ad.received) == 2 and len(ad._bot.answers) == n, "reply-to handled without canned reply")
+
+    # empty text / no gqid -> dropped
+    await mod._handle_guest_message(ad, make_update(text="", gqid="gq4"))
+    await mod._handle_guest_message(ad, make_update(gqid=None))
+    check(len(ad.received) == 2, "empty/no-gqid dropped")
+
+
+asyncio.run(t1())
+
+# ---------------------------------------------------------------- wraps
+print("\n[3] wraps")
+ad2 = FakeAdapter()
+mod._ADAPTER["adapter"] = ad2  # _log/_react resolve the adapter via this ref
+mod._install_wraps(ad2)
+mod._install_wraps(ad2)
+check(getattr(ad2, "_guest_wraps_installed", False), "wraps idempotent")
+ad2._guest_gqids = {"guest_999": "gqX"}
+
+
+async def t2():
+    from gateway.platforms.base import SendResult
+
+    r = await ad2.send("guest_999", "status")
+    check(isinstance(r, SendResult) and r.success and r.message_id is None, "guest send suppressed")
+    r = await ad2.send("900000001", "owner text")
+    check(r.message_id == "m1", "owner send passthrough")
+
+    gev = FakeEvent(text="hi", source=FakeSource("guest_999"))
+    gev.metadata = {"guest_query_id": "gqX"}
+    r, who = await ad2.send_final_ledgered(gev, "k", "Final answer.", {}, reply_to=None)
+    check(who is ad2 and answers_of(ad2._bot, "gqX")[-1] == "Final answer.", "guest final via gqid")
+    check(ad2.release_marker_calls == 1, "turn marker released")
+
+    # owner final -> passthrough + ✅ reaction (spawned)
+    oev = FakeEvent(text="hi", source=FakeSource("900000001", message_id="4572"))
+    r, who = await ad2.send_final_ledgered(oev, "k", "text", {}, reply_to=None)
+    await asyncio.sleep(0.05)
+    check(any(c[0] == "sfl" for c in ad2.calls), "owner final passthrough")
+    check(("900000001", "4572", "✅") in ad2.reactions, "✅ reacted after owner final")
+
+    # clarify guest
+    from tools import clarify_gateway as _cg
+    _cg._entries["cl1"] = NS(multi_select=False, awaiting_text=False)
+    rr = await ad2.send_clarify("guest_999", "Pick?", ["A", "B"], "cl1", "k")
+    check(rr.success and "  1. A" in answers_of(ad2._bot, "gqX")[-1], "guest clarify answered")
+    check(_cg._entries["cl1"].awaiting_text is True, "text-intercept armed")
+
+    # prompt guest
+    called = []
+    rr = await ad2._send_prompt("x", "guest_999", {}, lambda: ("Prompt!", "KB", lambda m: called.append(m)))
+    check(rr.success and answers_of(ad2._bot, "gqX")[-1] == "Prompt!" and not called, "guest prompt answered, on_sent skipped")
+
+    # guest error -> log channel + EN canned (log channel configured!)
+    nlog = len(ad2._bot.sent)
+    await ad2._notify_turn_error(gev, RuntimeError("boom"))
+    check(len(ad2._bot.sent) > nlog, "guest error posted to log channel")
+    check("Guest mode error" in str(ad2._bot.sent[-1].get("text", "")), "error title")
+    check("boom" in str(ad2._bot.sent[-1].get("text", "")), "raw error in log")
+    check("hiccup" in answers_of(ad2._bot, "gqX")[-1], "EN pre-made guest error text sent")
+
+    # Persian variant
+    gev.text = "\u0633\u0644\u0627\u0645 \u0645\u0634\u06a9\u0644\u06cc \u0647\u0633\u062a"
+    await ad2._notify_turn_error(gev, RuntimeError("x"))
+    check(mod.settings().get("guest_error_reply_fa") in answers_of(ad2._bot, "gqX")[-1],
+          "FA pre-made guest error text sent")
+
+    # owner error -> passthrough + ❌
+    oev = FakeEvent(text="hi", source=FakeSource("900000001", message_id="77"))
+    await ad2._notify_turn_error(oev, RuntimeError("boom"))
+    await asyncio.sleep(0.05)
+    check(("nte", "RuntimeError") in ad2.calls, "owner error passthrough")
+    check(("900000001", "77", "❌") in ad2.reactions, "❌ reacted on owner error")
+
+    # typing
+    await ad2.send_typing("guest_999")
+    await ad2.send_typing("900000001")
+    check(("typing", "guest_999") not in ad2.calls and ("typing", "900000001") in ad2.calls, "typing suppressed for guest")
+
+    # media: http photo -> InlineQueryResultPhoto
+    r = await ad2.send_image("guest_999", "https://x.test/p.png", caption="cap")
+    last = ad2._bot.answers[-1][1]
+    check(type(last).__name__ == "InlineQueryResultPhoto", f"http image -> photo result (got {type(last).__name__})")
+    check(getattr(last, "caption", None) == "cap", "caption carried")
+    check(getattr(last, "thumbnail_url", None) == "https://x.test/p.png", "thumbnail_url required by PTB")
+
+    # local path -> article fallback
+    r = await ad2.send_document("guest_999", "/data/workspace/file.pdf", caption="doc", file_name="file.pdf")
+    last = ad2._bot.answers[-1][1]
+    check(type(last).__name__ == "InlineQueryResultArticle", "local file -> article fallback")
+
+    # media_to_guests off -> suppressed (no new answer)
+    mod.save_settings({"media_to_guests": False})
+    n = len(ad2._bot.answers)
+    await ad2.send_image("guest_999", "https://x.test/p2.png")
+    check(len(ad2._bot.answers) == n, "media off = suppressed")
+    mod.save_settings({"media_to_guests": True})
+
+    # non-guest media passthrough
+    n = len(ad2.calls)
+    await ad2.send_image("900000001", "https://x.test/p3.png")
+    check(len(ad2.calls) > n, "owner media passthrough")
+
+
+asyncio.run(t2())
+
+# ---------------------------------------------------------------- hook + bang console
+print("\n[4] hook / bang console")
+ad3 = FakeAdapter()
+mod._ADAPTER["adapter"] = ad3
+ad3._guest_gqids = {}
+
+
+async def t3():
+    # bang in owner DM executes + skips
+    ev = FakeEvent(text="!setunauthorized hey there", source=FakeSource("900000001"))
+    res = await mod._pre_gateway_dispatch(event=ev)
+    check(res == {"action": "skip", "reason": "telegram-guest-mode bang command"}, "bang returns skip")
+    check(mod.settings()["unauthorized_reply"] == "hey there", "!setunauthorized applied")
+    _sent = [str(m.get("text", "")) for m in ad3._bot.sent]
+    check(any(_sent), "console reply sent")
+    check(all(m.get("parse_mode") == "HTML" for m in ad3._bot.sent), "console reply sent as HTML")
+
+    # !setlog
+    ev = FakeEvent(text="!setlog -100777", source=FakeSource("900000001"))
+    await mod._pre_gateway_dispatch(event=ev)
+    check(mod.settings()["log_channel"] == "-100777", "!setlog applied")
+
+    # !settings / !help / !users produce replies
+    for cmd in ("!settings", "!help", "!users"):
+        ev = FakeEvent(text=cmd, source=FakeSource("900000001"))
+        res = await mod._pre_gateway_dispatch(event=ev)
+        check(res is not None and res.get("action") == "skip", f"{cmd} handled+skipped")
+    check(any("Recorded users" in str(m.get("text", "")) for m in ad3._bot.sent),
+          "!users replied with registry")
+
+    # unknown bang -> hint reply
+    ev = FakeEvent(text="!frobnicate", source=FakeSource("900000001"))
+    await mod._pre_gateway_dispatch(event=ev)
+    check(any("Unknown command" in str(m.get("text", "")) for m in ad3._bot.sent), "unknown bang hint")
+
+    # non-bang owner message -> None + 👀 react
+    ev = FakeEvent(text="hello", source=FakeSource("900000001", message_id="909"))
+    res = await mod._pre_gateway_dispatch(event=ev)
+    await asyncio.sleep(0.05)
+    check(res is None, "plain owner msg passes")
+    check(("900000001", "909", "👀") in ad3.reactions, "👀 reacted on receive")
+
+    # group mention logged
+    nlog = len(ad3._bot.sent)
+    ev = FakeEvent(text="hey @example_bot what up", source=FakeSource("-100123", chat_type="group",
+                                                                        user_id="4242", message_id="55"))
+    res = await mod._pre_gateway_dispatch(event=ev)
+    check(res is None, "group msg passes")
+    await asyncio.sleep(0.05)
+    check(len(ad3._bot.sent) > nlog and "Group mention" in str(ad3._bot.sent[-1].get("text", "")), "group mention logged")
+
+    # non-owner bang in group -> passes (not swallowed)
+    ev = FakeEvent(text="!hack", source=FakeSource("-100123", chat_type="group", user_id="4242"))
+    res = await mod._pre_gateway_dispatch(event=ev)
+    check(res is None, "non-owner bang not intercepted")
+
+    # internal events ignored
+    ev = FakeEvent(text="!setreact off", source=FakeSource("900000001"), internal=True)
+    res = await mod._pre_gateway_dispatch(event=ev)
+    check(res is None, "internal events ignored by hook")
+
+
+asyncio.run(t3())
+
+# ---------------------------------------------------------------- stranger DM handler
+print("\n[5] stranger DM handler")
+mod.save_settings({"unauthorized_reply": "I only serve to my owner"})  # section 4's !setunauthorized overwrote it
+ad4 = FakeAdapter()
+mod._ADAPTER["adapter"] = ad4
+
+
+def dm_update(user_id, text, first="Wz"):
+    msg = NS(text=text, from_user=NS(id=user_id, first_name=first, last_name="", username="u"),
+             chat=NS(id=user_id))
+    return NS(effective_message=msg, message=msg)
+
+
+async def t4():
+    # stranger DM -> canned reply + logged
+    await mod._on_private_text(ad4, dm_update(555, "hello bot"))
+    check(any("hello bot" not in str(s.get("text", "")) and s.get("text", "").startswith("I only serve")
+              for s in ad4._bot.sent), "stranger DM got canned reply")
+    check(any("Stranger DM" in str(s.get("text", "")) for s in ad4._bot.sent), "stranger DM logged")
+    # cooldown
+    n = len([s for s in ad4._bot.sent if str(s.get("text", "")).startswith("I only serve")])
+    await mod._on_private_text(ad4, dm_update(555, "again"))
+    n2 = len([s for s in ad4._bot.sent if str(s.get("text", "")).startswith("I only serve")])
+    check(n2 == n, "cooldown blocks repeat canned reply")
+    st = json.loads(mod.STATE_PATH.read_text())
+    check(st["users"].get("555", {}).get("count", 0) >= 2, "stranger counted")
+
+    # owner text -> delegated to core
+    await mod._on_private_text(ad4, dm_update(900000001, "hi agent"))
+    check(ad4.delegated[-1] == "text", "owner text delegated")
+    await mod._on_private_text(ad4, dm_update(900000001, "/new"))
+    check(ad4.delegated[-1] == "command", "owner command delegated")
+
+
+asyncio.run(t4())
+
+# ---------------------------------------------------------------- callbacks
+print("\n[6] callbacks")
+ad5 = FakeAdapter()
+mod._ADAPTER["adapter"] = ad5
+
+
+async def t5():
+    answered = []
+
+    async def stranger_answer(*a, **kw):
+        answered.append((a, kw))
+
+    q = NS(from_user=NS(id=111), data="tgm:info:111", message=NS(chat=NS(id="-1001")),
+           answer=stranger_answer, reply_text=None)
+    await mod._on_callback(NS(callback_query=q))
+    check(any("Not for you" in str(a) for a in answered), "callback owner-gated")
+
+    answered.clear()
+
+    async def owner_answer(*a, **kw):
+        answered.append((a, kw))
+
+    async def reply_text(*a, **kw):
+        answered.append(("reply", a))
+
+    q = NS(from_user=NS(id=900000001), data="tgm:info:555",
+           message=NS(chat=NS(id="-1001"), reply_text=reply_text),
+           answer=owner_answer)
+    await mod._on_callback(NS(callback_query=q))
+    await asyncio.sleep(0.05)
+    check(any("User info" in str(s.get("text", "")) for s in ad5._bot.sent), "owner info answered with record")
+
+
+asyncio.run(t5())
+
+# ---------------------------------------------------------------- tool
+print("\n[7] telegram_admin tool")
+mod.save_settings({"owner_id": _cfg_owner})  # real owner id for the live-DB gate tests
+
+
+async def t6():
+    # visibility gate
+    check(mod._tool_check() is True, "tool enabled by default")
+    mod.save_settings({"tool_enabled": False})
+    check(mod._tool_check() is False, "tool_enabled=false hides tool")
+    mod.save_settings({"tool_enabled": True})
+
+    # owner gate via real sessions DB
+    import sqlite3
+    row = None
+    try:
+        con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
+        row = con.execute("SELECT id FROM sessions WHERE source='telegram' AND chat_id=? "
+                          "ORDER BY last_activity_at DESC LIMIT 1", (_cfg_owner,)).fetchone()
+        con.close()
+    except Exception:
+        row = None
+    if not HAVE_HOST:
+        print("  skip  owner session gate (no local Hermes data)")
+    check(row is not None or not HAVE_HOST, "owner session exists in DB")
+    if row:
+        check(mod._tool_owner_ok(row[0]) is True, "owner session allowed")
+    check(mod._tool_owner_ok(None) is False, "no session -> denied")
+    check(mod._tool_owner_ok("nonexistent_session") is False, "unknown session -> denied")
+
+    ad7 = FakeAdapter()
+    mod._ADAPTER["adapter"] = ad7
+
+    # denial without session
+    r = await mod._tool_handler({"action": "react", "chat_id": "1", "message_id": "2"}, session_id=None)
+    check(r["ok"] is False and "owner-only" in r["error"], "no session -> owner-only error")
+
+    if row:
+        # allowed: react
+        r = await mod._tool_handler({"action": "react", "chat_id": "900000001",
+                                     "message_id": "4572", "emoji": "🔥"}, session_id=row[0])
+        check(r["ok"] is True and ("900000001", "4572", "🔥") in ad7.reactions, "owner session react executed")
+        # ban
+        r = await mod._tool_handler({"action": "ban_user", "chat_id": "-100123", "user_id": "42"},
+                                    session_id=row[0])
+        check(r["ok"] is True and ad7._bot.banned, "owner session ban executed")
+        # logged to log channel (settings log_channel = -100777 from section 4)
+        check(any("telegram_admin" in str(s.get("text", "")) for s in ad7._bot.sent), "tool action logged")
+        # unknown action
+        r = await mod._tool_handler({"action": "explode"}, session_id=row[0])
+        check(r["ok"] is False and "unknown action" in r["error"], "unknown action rejected")
+
+    # disabled mid-flight
+    mod.save_settings({"tool_enabled": False})
+    if row:
+        r = await mod._tool_handler({"action": "react"}, session_id=row[0])
+        check(r["ok"] is False and "disabled" in r["error"], "disabled -> refused")
+    mod.save_settings({"tool_enabled": True, "owner_id": None})
+
+
+asyncio.run(t6())
+
+# ---------------------------------------------------------------- manifest + config
+print("\n[8] manifest + config")
+from pathlib import Path as P
+from hermes_cli.plugins_manifest import parse_manifest_file
+mf = parse_manifest_file(HERE / "plugin.yaml", HERE, "user", "")
+check(mf is not None and mf.name == "telegram-guest-mode" and mf.version == "2.5.0", "manifest parses v2.5.0")
+check(mf is not None and "telegram_admin" in (mf.provides_tools or []), "provides_tools declared")
+check(mf is not None and "pre_gateway_dispatch" in (mf.provides_hooks or []), "provides_hooks declared")
+
+import yaml
+cfg = yaml.safe_load(open(CONFIG_YAML)) if os.path.exists(CONFIG_YAML) else {}
+check(not HAVE_HOST or "telegram-guest-mode" in ((cfg.get("plugins") or {}).get("enabled") or []),
+      "still enabled in config")
+
+# ---------------------------------------------------------------- real MessageEvent shape (regression)
+# FakeEvent above carries a `.platform` attr that the REAL gateway MessageEvent does NOT have —
+# that mismatch let a broken platform gate pass every test while production silently no-opped
+# (bang commands fell through to the LLM). This section builds the production shape for real.
+print("\n[9] real MessageEvent shape (platform lives on event.source)")
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource
+from gateway.config import Platform
+
+ad9 = FakeAdapter()
+mod._ADAPTER["adapter"] = ad9
+mod.save_settings({"owner_id": "900000001", "log_channel": None})
+
+
+def _real_ev(text, platform=Platform.TELEGRAM, chat_type="dm",
+             chat_id="900000001", user_id="900000001"):
+    src = SessionSource(platform=platform, chat_id=str(chat_id),
+                        chat_type=chat_type, user_id=str(user_id))
+    return MessageEvent(text=text, source=src)
+
+
+ev9 = _real_ev("!help")
+check(not hasattr(ev9, "platform"), "real MessageEvent has no platform attr (the original bug)")
+check(getattr(ev9.source.platform, "value", None) == "telegram", "source.platform == Platform.TELEGRAM")
+res9 = asyncio.run(mod._pre_gateway_dispatch(event=ev9))
+check(res9 == {"action": "skip", "reason": "telegram-guest-mode bang command"},
+      "real-shape bang in owner DM intercepted + skipped")
+
+ev9b = _real_ev("!help", platform=Platform.DISCORD, chat_id="555", user_id="555")
+res9b = asyncio.run(mod._pre_gateway_dispatch(event=ev9b))
+check(res9b is None, "non-telegram platform passes through")
+
+mod.save_settings({"log_channel": "-100123"})
+ev9c = _real_ev("!setreact off", chat_type="channel", chat_id="-100123")
+res9c = asyncio.run(mod._pre_gateway_dispatch(event=ev9c))
+check(res9c is not None and res9c.get("action") == "skip", "real-shape bang in log channel intercepted")
+check(mod.settings().get("auto_react") is False, "!setreact applied via real shape")
+mod.save_settings({"auto_react": True, "log_channel": None, "owner_id": None})
+ad9.reset() if hasattr(ad9, "reset") else None
+
+# ---------------------------------------------------------------- console v2: help/wipe/whitelist/tool-bang
+print("\n[10] console v2: help, wipe, whitelist, callbacks, tool bang")
+mod.save_settings({"owner_id": "900000001", "log_channel": None})
+ad10 = FakeAdapter()
+mod._ADAPTER["adapter"] = ad10
+captured: dict = {"read": ["900000001"], "written": None}
+mod._read_allow_from = lambda: list(captured["read"])
+
+
+def _fake_write(ids):
+    captured["written"] = list(ids)
+    return True
+
+
+mod._write_allow_from = _fake_write
+
+# --- !help: grouped, covers the new commands
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!help"))
+check(r10 and "!whitelist" in r10 and "!wipe" in r10, "help lists whitelist + wipe")
+check(r10 and "Sessions" in r10 and "Whitelist" not in r10.split("Access")[0], "help grouped")
+check(r10 and "Unknown" not in r10, "help not unknown")
+
+# --- !wipe: session store scoping
+class FakeStore:
+    def __init__(self):
+        self._entries = {"telegram:dm:900000001": "a",
+                         "telegram:group:-100123:42": "b"}
+        self.reset = []
+
+    def reset_session(self, key, **kw):
+        self.reset.append(key)
+
+
+store10 = FakeStore()
+mod._CTX["session_store"] = store10
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!wipe", session_store=store10))
+check(store10.reset == [], "bare !wipe refuses — no implicit current-chat wipe")
+check("chat_id" in str(r10) and "Usage" in str(r10), "bare !wipe shows usage")
+store10.reset = []
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!wipe -100123", session_store=store10))
+check(store10.reset == ["telegram:group:-100123:42"], "!wipe <chat> resets that chat")
+store10.reset = []
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!wipe 999999", session_store=store10))
+check(store10.reset == [] and "Nothing to wipe" in str(r10), "unknown chat -> nothing to wipe")
+mod._CTX["session_store"] = None  # simulate: hook never cached a store
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!wipe 900000001", session_store=None))
+check("unavailable" in str(r10), "no store handled safely")
+# guest chat sessions: wipe by the guest's original chat id, and by guest_ prefix
+store10._entries["agent:main:telegram:dm:guest_777"] = "g"
+store10.reset = []
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!wipe 777", session_store=store10))
+check(store10.reset == ["agent:main:telegram:dm:guest_777"],
+      "guest chat wiped by original guest id")
+store10.reset = []
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!wipe guest_777", session_store=store10))
+check("agent:main:telegram:dm:guest_777" in store10.reset,
+      "guest chat wiped by guest_ chat id too")
+del store10._entries["agent:main:telegram:dm:guest_777"]
+store10.reset = []
+mod._CTX["session_store"] = store10
+
+# --- !whitelist
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!whitelist add 555"))
+check(captured["written"] == ["900000001", "555"], "whitelist add appends + writes config")
+captured["read"] = ["900000001", "555"]
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!whitelist remove 555"))
+check(captured["written"] == ["900000001"], "whitelist remove rewrites list")
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!whitelist remove 900000001"))
+check("Refusing" in str(r10), "owner protected from whitelist removal")
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!whitelist list"))
+check("900000001" in str(r10) and "owner" in str(r10), "whitelist list shows owner")
+r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!whitelist add @nobody"))
+check("resolve" in str(r10), "unresolvable @username -> id hint")
+
+# --- authorized-user routing (owner OR whitelist -> core; stranger -> canned)
+check(mod._is_authorized_user("900000001", "900000001") is True, "owner authorized")
+check(mod._is_authorized_user("555", "900000001") is True, "whitelisted friend authorized")
+check(mod._is_authorized_user("666", "900000001") is False, "stranger not authorized")
+
+# --- guest identity: replied-to context
+from types import SimpleNamespace as NS10
+bot_msg10 = NS10(text="hello there", caption=None,
+                 from_user=NS10(is_bot=True, first_name="ATRA", last_name="", username="example_bot"))
+blk = mod._guest_identity_block("Friend", "555", "guest", "900000001", "reply", bot_msg10)
+check("[Replied to]" in blk and "bot (ATRA)" in blk and "hello there" in blk,
+      "guest identity carries replied-to author+text")
+human_msg10 = NS10(text="nope", caption=None,
+                   from_user=NS10(is_bot=False, first_name="Zed", last_name="", username="zed"))
+blk = mod._guest_identity_block("Friend", "555", "guest", "900000001", "reply", human_msg10)
+check("author='Zed'" in blk and "the bot (ATRA)" not in blk, "replied-to human author named")
+blk = mod._guest_identity_block("Friend", "555", "guest", "900000001", "plain mention", None)
+check("[Replied to]" not in blk, "no reply block without reply_to")
+
+# --- wipe buttons (log channel): confirm prompt then reset
+async def _ans10(*a, **k):
+    cb10.append(("ans", a, k))
+
+
+async def _rt10(*a, **k):
+    cb10.append(("reply", a, k))
+
+
+cb10 = []
+q10 = NS(from_user=NS(id=900000001), data="tgm:wipe:-100123",
+         message=NS(chat=NS(id="-1001"), reply_text=_rt10), answer=_ans10)
+awaitable = mod._on_callback(NS(callback_query=q10))
+asyncio.run(awaitable)
+check(any(r[0] == "reply" and "Wipe the session" in str(r) for r in cb10), "wipe confirm prompt shown")
+cb10.clear()
+store10.reset = []
+q10 = NS(from_user=NS(id=900000001), data="tgm:wipe2:-100123",
+         message=NS(chat=NS(id="-1001"), reply_text=_rt10), answer=_ans10)
+asyncio.run(mod._on_callback(NS(callback_query=q10)))
+check(store10.reset == ["telegram:group:-100123:42"], "wipe button resets the session")
+check(any(r[0] == "ans" and "wiped" in str(r).lower() for r in cb10), "wipe button acknowledged")
+mod._CTX["session_store"] = None
+
+# --- tool action: bang (console parity for the agent)
+mod.save_settings({"owner_id": _cfg_owner})
+row10 = None
+try:
+    import sqlite3 as _sq10
+    with _sq10.connect(f"file:{mod._hermes_home() / 'state.db'}?mode=ro", uri=True) as _c10:
+        row10 = _c10.execute("SELECT id FROM sessions WHERE source='telegram' AND chat_id=? LIMIT 1",
+                             (_cfg_owner,)).fetchone()
+except Exception:
+    row10 = None
+check(row10 is not None or not HAVE_HOST, "owner session row exists for tool gate")
+r10 = asyncio.run(mod._tool_handler({"action": "bang", "text": "!setreact off"},
+                                    session_id=row10[0] if row10 else None))
+check((r10.get("ok") is True and mod.settings().get("auto_react") is False) or not HAVE_HOST,
+      "tool bang runs the console command")
+check(isinstance((r10.get("result") or {}).get("reply"), str), "tool bang returns reply text")
+r10 = asyncio.run(mod._tool_handler({"action": "bang", "text": "setreact on"},
+                                    session_id=row10[0] if row10 else None))
+check(r10.get("ok") is False, "tool bang rejects non-! text")
+mod.save_settings({"auto_react": True, "owner_id": None})
+
+
+# ---------------------------------------------------------------- panel, inline errors, reactions
+print("\n[11] glass panel + inline errors + reactions")
+mod.save_settings({"owner_id": "900000001", "log_channel": "-100777",
+                   "auto_react": True, "react_guests": True,
+                   "log_group_mentions": False})
+ad11 = FakeAdapter()
+mod._ADAPTER["adapter"] = ad11
+mod._CTX["gateway"] = None
+
+# --- !panel + keyboard --------------------------------------------------
+r11 = asyncio.run(mod._bang_execute(ad11, "900000001", "!panel"))
+check(r11 and "ATRA console" in r11 and "!panel" in r11, "!panel shows the panel help")
+kb = mod._help_keyboard("full")
+cbdatas = [b.callback_data for row in kb for b in row]
+check(len(kb) >= 3 and any("help:sessions" in d for d in cbdatas), "panel keyboard built")
+check(any("help:full" in d for d in [b.callback_data for row in mod._help_keyboard("sessions") for b in row]),
+      "section view offers full help back")
+
+
+async def t11():
+    # deliver !panel with its keyboard attached
+    ev = FakeEvent(text="!panel", source=FakeSource("900000001", message_id="40"))
+    await mod._run_bang_command(ad11, ev, "!panel")
+    await asyncio.sleep(0.05)
+    panel_msgs = [m for m in ad11._bot.sent if str(m.get("chat_id")) == "900000001"]
+    check(panel_msgs and panel_msgs[0].get("parse_mode") == "HTML"
+          and panel_msgs[0].get("reply_markup") is not None,
+          "!panel delivered as HTML with buttons")
+    check(any(("900000001", "40", "✅") in ad11.reactions for _ in [0]),
+          "console command acknowledged with ✅")
+
+    # panel navigation: tapping a section edits the message in place
+    edited, answered = [], []
+
+    async def _edit(text=None, **kw):
+        edited.append((text, kw))
+
+    async def _ans(*a, **kw):
+        answered.append(a)
+
+    q = NS(from_user=NS(id=900000001), data="tgm:help:sessions",
+           message=NS(chat=NS(id="900000001"), edit_text=_edit), answer=_ans)
+    await mod._on_callback(NS(callback_query=q))
+    await asyncio.sleep(0.02)
+    check(edited and "Sessions" in edited[0][0], "panel section edits in place")
+    check(edited and edited[0][1].get("parse_mode") == "HTML", "panel edit sent as HTML")
+
+    # --- inline error notice: owner DM yes, others -> log ----------------
+    ad11._bot.sent.clear()
+    await mod._error_notice("900000001", "telegram_admin failed", "<b>Action:</b> x")
+    await asyncio.sleep(0.02)
+    check(any(str(m.get("chat_id")) == "900000001" and "⚠️ telegram_admin failed" in str(m.get("text"))
+              and "<b>" not in str(m.get("text")) for m in ad11._bot.sent),
+          "owner-DM error shown here as a normal message")
+    n_before = len(ad11._bot.sent)
+    await mod._error_notice("-100999", "💥 Guest mode error", "<b>boom</b>")
+    await asyncio.sleep(0.02)
+    check(any(str(m.get("chat_id")) == "-100777" and "Guest mode error" in str(m.get("text"))
+              for m in ad11._bot.sent[n_before:]),
+          "non-owner error still goes to the log channel")
+
+    # --- group mention reacts 👀 even with mention-logging off ------------
+    ev = FakeEvent(text="@example_bot ping", source=FakeSource("-100123", chat_type="group",
+                                                                  user_id="555", message_id="55"))
+    res = await mod._pre_gateway_dispatch(event=ev)
+    await asyncio.sleep(0.05)
+    check(res is None and ("-100123", "55", "👀") in ad11.reactions,
+          "group mention acknowledged with 👀 (logging off)")
+
+    # --- tool handler returns a registry-legal JSON string ---------------
+    import sqlite3 as _sq11
+    mod.save_settings({"owner_id": _cfg_owner})
+    _row11 = None
+    try:
+        with _sq11.connect(f"file:{STATE_DB}?mode=ro", uri=True) as _c11:
+            _row11 = _c11.execute("SELECT id FROM sessions WHERE source='telegram' AND chat_id=? "
+                                  "ORDER BY last_activity_at DESC LIMIT 1", (_cfg_owner,)).fetchone()
+    except Exception:
+        _row11 = None
+    out = await mod._tool_handler_json({"action": "bang", "text": "!help"},
+                                       session_id=_row11[0] if _row11 else None)
+    check((isinstance(out, str) and json.loads(out).get("ok") is True) or not HAVE_HOST,
+          "telegram_admin returns a JSON string (registry contract)")
+    mod.save_settings({"owner_id": "900000001"})
+    out2 = await mod._tool_handler_json({"action": "nope"})
+    check(isinstance(out2, str) and json.loads(out2).get("ok") is False,
+          "tool errors also serialize")
+
+    mod.save_settings({"auto_react": True, "log_group_mentions": True,
+                       "log_channel": None, "owner_id": None})
+
+
+asyncio.run(t11())
+
+
+# ------------------------------------------------------- expanded glass panel (v2.3)
+print("\n[12] expanded panel dashboard")
+mod.save_settings({"owner_id": "900000001", "log_channel": "-100777", "auto_react": True})
+ad12 = FakeAdapter()
+mod._ADAPTER["adapter"] = ad12
+mod._CTX["gateway"] = None
+
+r12 = asyncio.run(mod._bang_execute(ad12, "900000001", "!panel"))
+check(r12 and "ATRA console" in r12 and "!panel" in r12, "!panel serves the dashboard")
+check(r12 and "reactions" in r12 and "whitelist" in r12 and "!wipe" in r12,
+      "dashboard carries live status + quick commands")
+
+kb = mod._help_keyboard("panel")
+datas = [b.callback_data for row in kb for b in row]
+check(any(d.endswith("panel:toggle:react") for d in datas), "panel has a reaction toggle")
+check(any(d.endswith("panel:out:settings") for d in datas), "panel has an output button")
+check(any(d.endswith("help:sessions") for d in datas), "panel keeps section buttons")
+check(not any(d.endswith("panel:back") for d in datas), "dashboard has no self-back button")
+check(any(d.endswith("panel:back") for d in
+          [b.callback_data for row in mod._help_keyboard("out") for b in row]),
+      "output view offers back to console")
+check(all(len(d.encode()) <= 64 for d in datas), "callback data inside Telegram's 64-byte cap")
+
+
+async def t12():
+    edited, answered = [], []
+
+    async def _edit(text=None, **kw):
+        edited.append((text, kw))
+
+    async def _ans(*a, **kw):
+        answered.append(a)
+
+    def _q(data):
+        return NS(from_user=NS(id=900000001), data=data,
+                  message=NS(chat=NS(id="900000001"), edit_text=_edit), answer=_ans)
+
+    # live toggle flips the real setting and re-renders the dashboard
+    before = bool(mod.settings().get("auto_react"))
+    await mod._on_callback(NS(callback_query=_q("tgm:panel:toggle:react")))
+    await asyncio.sleep(0.02)
+    check(bool(mod.settings().get("auto_react")) != before, "panel toggle flips the real setting")
+    check(edited and edited[0][1].get("parse_mode") == "HTML", "toggle re-render is HTML")
+    check(edited and "reactions" in edited[0][0], "toggle shows the dashboard back")
+    check(answered and "<b>" not in str(answered[-1][0]), "toast carries no raw markup")
+    mod.save_settings({"auto_react": before})
+
+    # output views open in place
+    edited.clear()
+    await mod._on_callback(NS(callback_query=_q("tgm:panel:out:settings")))
+    await asyncio.sleep(0.02)
+    check(edited and "auto_react" in edited[0][0], "settings output opens inside the panel")
+    edited.clear()
+    await mod._on_callback(NS(callback_query=_q("tgm:panel:out:whitelist")))
+    await asyncio.sleep(0.02)
+    check(edited and "Whitelist" in edited[0][0], "whitelist output opens inside the panel")
+
+    # regression: "Full help" used to overwrite the message with the literal key
+    edited.clear()
+    await mod._on_callback(NS(callback_query=_q("tgm:help:full")))
+    await asyncio.sleep(0.02)
+    check(edited and "ATRA console" in edited[0][0] and edited[0][0] != "full",
+          "help:full renders the real full help (was a literal 'full' bug)")
+
+    mod.save_settings({"log_channel": None, "owner_id": None})
+
+
+asyncio.run(t12())
+
+
+# ------------------------------------------- panel no-op tap = toast, not an error
+print("\n[13] panel no-op tap handling")
+mod.save_settings({"owner_id": "900000001", "log_channel": None})
+ad13 = FakeAdapter()
+mod._ADAPTER["adapter"] = ad13
+mod._CTX["gateway"] = None
+
+
+async def t13():
+    answered, edits = [], []
+
+    async def _ans(*a, **kw):
+        answered.append((a, kw))
+
+    async def _edit_boom(text=None, **kw):
+        raise Exception("Bad Request: message is not modified: specified new message content "
+                        "and reply_markup are exactly the same")
+
+    async def _edit_ok(text=None, **kw):
+        edits.append(text)
+
+    # identical content -> friendly toast, no scary error text
+    q = NS(from_user=NS(id=900000001), data="tgm:help:full",
+           message=NS(chat=NS(id="900000001"), edit_text=_edit_boom), answer=_ans)
+    await mod._on_callback(NS(callback_query=q))
+    await asyncio.sleep(0.02)
+    check(answered and "already showing" in str(answered[-1][0][0]), "no-op tap answers with a neutral toast")
+    check("Already open" not in str(answered), "old confusing toast is gone")
+
+    # real content change -> edits + generic toast
+    answered.clear()
+    q2 = NS(from_user=NS(id=900000001), data="tgm:help:status",
+            message=NS(chat=NS(id="900000001"), edit_text=_edit_ok), answer=_ans)
+    await mod._on_callback(NS(callback_query=q2))
+    await asyncio.sleep(0.02)
+    check(edits and "Status" in edits[0], "section tap still edits in place")
+
+    # a genuine edit failure surfaces as a visible alert, not silence
+    async def _edit_real_fail(text=None, **kw):
+        raise Exception("Bad Request: chat not found")
+
+    answered.clear()
+    q3 = NS(from_user=NS(id=900000001), data="tgm:panel:out:users",
+            message=NS(chat=NS(id="900000001"), edit_text=_edit_real_fail), answer=_ans)
+    await mod._on_callback(NS(callback_query=q3))
+    await asyncio.sleep(0.02)
+    check(answered and answered[-1][1].get("show_alert") is True
+          and "⚠️" in str(answered[-1][0][0]), "real edit failure raises a visible alert")
+
+
+asyncio.run(t13())
+mod.save_settings({"owner_id": None})
+
+
+# --------------------------------- edit fallback when the message has no edit helper
+print("\n[14] bot-level edit fallback")
+
+
+async def t14():
+    ad14 = FakeAdapter()
+    mod._ADAPTER["adapter"] = ad14
+    mod._CTX["gateway"] = None
+    mod.save_settings({"owner_id": "900000001"})
+
+    async def _ans(*a, **kw):
+        pass
+
+    class BareMsg:  # no edit_text / edit_message_text at all
+        chat_id = "900000001"
+        message_id = "77"
+
+    edited = []
+    orig = FakeBot.edit_message_text
+
+    async def _capture(self, **kwargs):
+        edited.append(kwargs)
+        await orig(self, **kwargs)
+
+    FakeBot.edit_message_text = _capture
+    try:
+        q = NS(from_user=NS(id=900000001), data="tgm:help:status",
+               message=BareMsg(), answer=_ans)
+        res = await mod._panel_edit(q, "<b>x</b>", "status", mod.settings())
+    finally:
+        FakeBot.edit_message_text = orig
+    check(res == "ok" and edited and edited[0].get("message_id") == "77"
+          and edited[0].get("parse_mode") == "HTML",
+          "falls back to Bot.edit_message_text when Message has no edit helper")
+    mod.save_settings({"owner_id": None})
+
+
+asyncio.run(t14())
+
+
+# ------------------------------------------------------ full console panel (v2.4)
+print("\n[15] complete panel")
+mod.save_settings({"owner_id": "900000001", "log_channel": "-100777",
+                   "auto_react": True, "react_guests": False, "tool_enabled": True,
+                   "log_owner_messages": False, "log_group_mentions": True,
+                   "unauthorized_cooldown_s": 3600})
+ad15 = FakeAdapter()
+mod._ADAPTER["adapter"] = ad15
+mod._CTX["gateway"] = None
+
+r15 = asyncio.run(mod._bang_execute(ad15, "900000001", "!panel"))
+check(r15 and "cooldown" in r15 and "None" not in r15, "dashboard reports the real cooldown value")
+check(r15 and "v" in r15.split("\n")[0] and "ATRA console" in r15, "dashboard carries the version")
+
+kb = mod._help_keyboard("panel", chat_id="-100777")
+datas = [b.callback_data for row in kb for b in row]
+for want in ("panel:toggle:greact", "panel:toggle:mirror", "panel:toggle:mentions",
+             "panel:toggle:tool", "panel:out:guests", "panel:cool", "help:guests",
+             "wipe:-100777"):
+    check(any(d.endswith(want) for d in datas), f"panel exposes {want}")
+check(not any(d.endswith("wipe:") for d in [b.callback_data for row in mod._help_keyboard("panel") for b in row]),
+      "no wipe button when the chat is unknown")
+check(any(b.callback_data.endswith("panel:cool:300") for b in mod._help_keyboard("cool")[-1]
+          if b.callback_data) or
+      any(b.callback_data.endswith("panel:cool:300") for row in mod._help_keyboard("cool") for b in row),
+      "cooldown view offers presets")
+
+help15 = asyncio.run(mod._bang_execute(ad15, "900000001", "!help"))
+check(help15 and "👾 Guests" in help15 and "guest_error_reply" not in help15,
+      "full help gained the Guests section")
+
+
+async def t15():
+    answered, edits = [], []
+
+    async def _ans(*a, **kw):
+        answered.append((a, kw))
+
+    async def _edit(text=None, **kw):
+        edits.append((text, kw))
+
+    def _q(data, chat="900000001"):
+        return NS(from_user=NS(id=900000001), data=data,
+                  message=NS(chat=NS(id=chat), chat_id=chat, edit_message_text=_edit,
+                             reply_text=None),
+                  answer=_ans)
+
+    # toggles beyond the original two
+    before_tool = bool(mod.settings().get("tool_enabled"))
+    await mod._on_callback(NS(callback_query=_q("tgm:panel:toggle:tool")))
+    await asyncio.sleep(0.02)
+    check(bool(mod.settings().get("tool_enabled")) != before_tool, "tool toggle flips tool_enabled")
+    mod.save_settings({"tool_enabled": before_tool})
+
+    before_g = bool(mod.settings().get("react_guests"))
+    await mod._on_callback(NS(callback_query=_q("tgm:panel:toggle:greact")))
+    await asyncio.sleep(0.02)
+    check(bool(mod.settings().get("react_guests")) != before_g, "guest-react toggle flips react_guests")
+    mod.save_settings({"react_guests": before_g})
+
+    # cooldown preset
+    edits.clear()
+    await mod._on_callback(NS(callback_query=_q("tgm:panel:cool:300")))
+    await asyncio.sleep(0.02)
+    check(mod.settings().get("unauthorized_cooldown_s") == 300, "cooldown preset applies")
+    check(edits and "cooldown" in edits[-1][0], "cooldown preset re-renders the dashboard")
+    mod.save_settings({"unauthorized_cooldown_s": 3600})
+
+    # cooldown view with presets
+    edits.clear()
+    await mod._on_callback(NS(callback_query=_q("tgm:panel:cool")))
+    await asyncio.sleep(0.02)
+    check(edits and "⏱ Cooldown" in edits[-1][0], "cooldown view opens")
+    mk = edits[-1][1].get("reply_markup")
+    check(mk and any(b.callback_data.endswith("panel:cool:60")
+                     for row in mk.inline_keyboard for b in row), "preset buttons present")
+
+    # guest texts output view
+    edits.clear()
+    await mod._on_callback(NS(callback_query=_q("tgm:panel:out:guests")))
+    await asyncio.sleep(0.02)
+    check(edits and "canned reply" in edits[-1][0], "guest texts view opens")
+
+    # guests section via the grid
+    edits.clear()
+    await mod._on_callback(NS(callback_query=_q("tgm:help:guests")))
+    await asyncio.sleep(0.02)
+    check(edits and "👾 Guests" in edits[-1][0], "guests section renders")
+
+    # wipe button reuses the existing confirm flow
+    async def _reply(text=None, **kw):
+        edits.append((text, kw))
+
+    q = NS(from_user=NS(id=900000001), data="tgm:wipe:-100777",
+           message=NS(chat=NS(id="900000001"), reply_text=_reply), answer=_ans)
+    await mod._on_callback(NS(callback_query=q))
+    await asyncio.sleep(0.02)
+    check(edits and "Wipe the session" in str(edits[-1][0]), "wipe button asks for confirmation")
+
+    mod.save_settings({"log_channel": None, "owner_id": None})
+
+
+asyncio.run(t15())
+
+
+# ---------------------------------------------------------------- [16] mirror + per-tab keys
+print("\n[16] owner off / whitelisted + others toggleable, per-tab keys")
+
+async def t16():
+    ad = FakeAdapter()
+    mod._ADAPTER["adapter"] = ad
+    saved_log = mod.settings().get("log_channel")
+    mod.save_settings({"log_channel": "-100777", "log_owner_messages": False,
+                       "log_whitelisted_messages": True, "log_other_messages": True})
+    friend_real = mod._read_allow_from
+    mod._read_allow_from = lambda: ["900000001", "555555"]
+    try:
+        # 1) owner never mirrored by default
+        n0 = len(ad._bot.sent)
+        ev = FakeEvent(text="owner hello", source=FakeSource("900000001", chat_type="dm"))
+        res = await mod._pre_gateway_dispatch(event=ev)
+        await asyncio.sleep(0.05)
+        check(res is None and len(ad._bot.sent) == n0, "owner message not mirrored")
+
+        # 2) whitelisted friend -> mirrored
+        ev = FakeEvent(text="friend hello", source=FakeSource("555555", chat_type="dm", user_id="555555"))
+        await mod._pre_gateway_dispatch(event=ev)
+        await asyncio.sleep(0.05)
+        check(len(ad._bot.sent) > n0 and "Whitelisted message" in str(ad._bot.sent[-1].get("text", "")),
+              "whitelisted message mirrored")
+        check("friend hello" in str(ad._bot.sent[-1].get("text", "")), "mirror carries the text")
+
+        # 3) toggle whitelisted off -> silent
+        mod.save_settings({"log_whitelisted_messages": False})
+        n1 = len(ad._bot.sent)
+        ev = FakeEvent(text="friend again", source=FakeSource("555555", chat_type="dm", user_id="555555"))
+        await mod._pre_gateway_dispatch(event=ev)
+        await asyncio.sleep(0.05)
+        check(len(ad._bot.sent) == n1, "whitelisted toggle off silences the mirror")
+
+        # 4) outsider in a group -> mirrored
+        mod.save_settings({"log_whitelisted_messages": True, "log_other_messages": True})
+        n2 = len(ad._bot.sent)
+        ev = FakeEvent(text="group chatter", source=FakeSource("-100123", chat_type="supergroup",
+                                                              user_id="424242", message_id="77"))
+        await mod._pre_gateway_dispatch(event=ev)
+        await asyncio.sleep(0.05)
+        check(len(ad._bot.sent) > n2 and "Message" in str(ad._bot.sent[-1].get("text", "")),
+              "other group message mirrored")
+
+        # 5) toggle others off -> silent
+        mod.save_settings({"log_other_messages": False})
+        n3 = len(ad._bot.sent)
+        ev = FakeEvent(text="group chatter", source=FakeSource("-100123", chat_type="supergroup",
+                                                              user_id="424242", message_id="78"))
+        await mod._pre_gateway_dispatch(event=ev)
+        await asyncio.sleep(0.05)
+        check(len(ad._bot.sent) == n3, "other-messages toggle off silences the mirror")
+
+        # 6) stranger DM stays guest territory (guest flow logs it, not the mirror)
+        mod.save_settings({"log_other_messages": True})
+        n4 = len(ad._bot.sent)
+        ev = FakeEvent(text="stranger hi", source=FakeSource("777777", chat_type="dm", user_id="777777"))
+        await mod._pre_gateway_dispatch(event=ev)
+        await asyncio.sleep(0.05)
+        check(len(ad._bot.sent) == n4, "stranger DM not mirrored (guest zone)")
+
+        # 7) owner toggle still works when switched on
+        mod.save_settings({"log_owner_messages": True})
+        n5 = len(ad._bot.sent)
+        ev = FakeEvent(text="owner mirror me", source=FakeSource("900000001", chat_type="dm"))
+        await mod._pre_gateway_dispatch(event=ev)
+        await asyncio.sleep(0.05)
+        check(len(ad._bot.sent) > n5 and "Owner DM" in str(ad._bot.sent[-1].get("text", "")),
+              "owner mirror toggle still works")
+    finally:
+        mod._read_allow_from = friend_real
+        mod.save_settings({"log_owner_messages": False, "log_whitelisted_messages": True,
+                           "log_other_messages": True})
+    mod.save_settings({"log_channel": "-100777"})
+
+    # per-tab keyboards really differ
+    keys = lambda v, cid=None: [b.callback_data for row in mod._help_keyboard(v, chat_id=cid) for b in row]
+    check(any("panel:logoff" in d for d in keys("log")), "Log tab offers turn-off")
+    check(any("panel:toggle:wmsgs" in d for d in keys("log")), "Log tab carries WL msgs toggle")
+    check(any("panel:toggle:omsgs" in d for d in keys("log")), "Log tab carries other-msgs toggle")
+    check(any("panel:out:settings" in d for d in keys("status")) and
+          not any("panel:logoff" in d for d in keys("status")), "Status tab is contextual")
+    check(any("panel:toggle:wmsgs" in d for d in keys("panel")) and
+          any("panel:toggle:omsgs" in d for d in keys("panel")), "dashboard exposes both mirrors")
+    check(keys("log") != keys("status"), "tabs hand out different buttons")
+
+    # turning the log off from the Log tab
+    mod.save_settings({"log_channel": "-100777"})
+    ans16, edit16 = [], []
+
+    async def _a16(*a, **k):
+        ans16.append((a, k))
+
+    async def _e16(*a, **k):
+        edit16.append((a, k))
+
+    await mod._on_callback(NS(callback_query=NS(
+        from_user=NS(id=900000001), data="tgm:panel:logoff",
+        answer=_a16,
+        message=NS(chat=NS(id="900000001"), chat_id="900000001", message_id="5",
+                   edit_message_text=_e16))))
+    check(mod.settings().get("log_channel") is None, "logoff button clears the log channel")
+    mod.save_settings({"log_channel": saved_log})
+
+asyncio.run(t16())
+
+print(f"\n=== {PASS} passed, {FAIL} failed ===")
+sys.exit(1 if FAIL else 0)
