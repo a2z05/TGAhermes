@@ -2204,11 +2204,12 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
     if info is None:
         return None
     st = settings()
-    # The owner already has full access in their own DM, so gating them in
-    # their guest chat protects nothing and only breaks the guest link for
-    # the one person entitled to use it. This was the real bug: the owner was
-    # blocked in their own guest chat, with no way to lift it.
-    if info.get("is_owner") and st.get("guest_owner_full_access", True):
+    # The owner has full access in their own DM, so gating them in their guest
+    # chat protects nothing and only breaks the guest link for the one person
+    # entitled to use it. That was a real bug. But the exemption stays OFF by
+    # default: it is only honoured for a session whose recorded guest id
+    # actually matches the owner, or one you explicitly unlocked.
+    if info.get("is_owner") and st.get("guest_owner_full_access", False):
         return None
     denied = _guest_allowed(frozenset())
     danger = name in denied
