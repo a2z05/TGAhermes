@@ -252,6 +252,37 @@ def _is_guest_chat(chat_id: Any) -> bool:
     return str(chat_id).startswith(GUEST_CHAT_PREFIX)
 
 
+def _guest_identity(chat_id: Any) -> Dict[str, Any]:
+    """The one place that answers "who is in this guest chat".
+
+    Telegram gives a guest message a real ``from_user`` and a real ``chat.id``
+    that is the person's own Telegram id, which is why the log channel could
+    always name them. This reads that same identity back out of the plugin's
+    own store instead of re-deriving it somewhere else, so the log, the gate
+    and the session table can never disagree about who is who.
+
+    Returns ``{"id", "name", "username", "known", "chat"}``; ``id`` falls back
+    to the chat id stripped of its prefix, which is that same Telegram id.
+    """
+    chat_key = str(chat_id or "")
+    raw = (chat_key[len(GUEST_CHAT_PREFIX):]
+           if chat_key.startswith(GUEST_CHAT_PREFIX) else chat_key)
+    uid = str(raw or "").strip()
+    name, uname = "", ""
+    known = False
+    try:
+        users = (_load_state() or {}).get("users") or {}
+        e = users.get(uid) or {}
+        if e:
+            known = True
+            name = str(e.get("name") or "")
+            uname = str(e.get("username") or "")
+    except Exception:
+        logger.debug("[telegram-guest-mode] guest identity lookup failed", exc_info=True)
+    return {"id": uid, "name": name, "username": uname,
+            "known": known, "chat": chat_key}
+
+
 def _gqid_for(adapter: Any, chat_id: Any) -> Optional[str]:
     gmap = getattr(adapter, "_guest_gqids", None)
     if not isinstance(gmap, dict):
@@ -389,6 +420,26 @@ async def _error_notice(origin_chat: Any, title: str, body: str) -> None:
     except Exception:
         logger.debug("[telegram-guest-mode] inline error notice failed", exc_info=True)
     await _log(title, body)
+
+
+def _identity_line(chat_id: Any, user: Any = None) -> str:
+    """One line naming whoever is in a chat, from the single identity source."""
+    ident = _guest_identity(chat_id) if _is_guest_chat(chat_id) else \
+        {"id": "", "name": "", "username": ""}
+    uid = ident["id"] or str(getattr(user, "id", "") or "")
+    name = ident["name"]
+    uname = ident["username"]
+    if not name:
+        first = str(getattr(user, "first_name", "") or "")
+        last = str(getattr(user, "last_name", "") or "")
+        uname = uname or str(getattr(user, "username", "") or "")
+        name = (first + " " + last).strip() or (f"@{uname}" if uname else "?")
+    if not uid:
+        return f"<b>{_esc(name)}</b>"
+    out = f'<a href="tg://user?id={_esc(uid)}"><b>{_esc(name)}</b></a> (<code>{_esc(uid)}</code>)'
+    if uname:
+        out += f" · @{_esc(uname)}"
+    return out
 
 
 def _user_block(user: Any) -> str:
@@ -690,7 +741,10 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
     _record_user(user, started=str(event.text).lstrip().lower().startswith("/start"), sample=str(event.text))
     await _log(
         "💬 Guest mention — answered",
-        f"{_user_block(user)}\n<b>Sender:</b> {_esc(sender_kind)} · <b>Trigger:</b> {_esc(trigger_kind)}"
+        # Name the person from the one identity source, so this entry and the
+        # 👤 panel list can never disagree.
+        f"{_identity_line(md.get('guest_original_chat_id') or event.source.chat_id, user)}"
+        f"\n<b>Sender:</b> {_esc(sender_kind)} · <b>Trigger:</b> {_esc(trigger_kind)}"
         f"\n<b>Chat:</b> <code>{_esc(md.get('guest_original_chat_id'))}</code> (guest)"
         f"\n<b>Text:</b> <i>{_esc(str(event.text)[:500])}</i>",
         buttons=_profile_buttons(user, md.get("guest_original_chat_id") or None,
@@ -1080,6 +1134,48 @@ def _help_text(st: Optional[Dict[str, Any]] = None) -> str:
     return "\n\n".join(parts)
 
 
+def _known_guests_view(st: Dict[str, Any]) -> str:
+    """Who has used the guest link, and what they are allowed to do.
+
+    Reads the same identity the log channel prints, so this list and the log
+    can never disagree about who is who.
+    """
+    users = (_load_state() or {}).get("users") or {}
+    owner = str(_owner_id() or "")
+    mode = str(st.get("guest_tool_mode") or "balanced")
+    unlocked = {str(c).strip() for c in (st.get("guest_owner_chats") or [])
+                if str(c).strip()}
+    owner_on = bool(st.get("guest_owner_full_access", False))
+
+    rows = []
+    for uid, e in users.items():
+        uid = str(uid)
+        chat = _guest_chat_id(uid)
+        if uid == owner:
+            role = "👑 owner"
+        elif owner_on and chat in unlocked:
+            role = "🔓 unlocked (full)"
+        else:
+            role = f"🚧 guest · {_MODE_LABEL.get(mode, mode)}"
+        label = _esc(str(e.get("name") or uid))
+        if e.get("username"):
+            label += f" (@{_esc(str(e['username']))})"
+        count = int(e.get("count") or 0)
+        seen = time.strftime("%Y-%m-%d", time.localtime(int(e.get("last_seen") or 0)))
+        rows.append(f"<b>{label}</b>\n   <code>{_esc(uid)}</code> · {role} · "
+                    f"{count} msg · last {seen}")
+
+    lines = ["<b>👤 Who is on the guest link</b>",
+             f"<i>mode: {_MODE_LABEL.get(mode, mode)} · "
+             f"owner access {'on' if owner_on else 'off'}</i>", ""]
+    lines += sorted(rows) if rows else ["Nobody has used it yet."]
+    lines += ["",
+              "This is the same identity the log channel prints: the id is the "
+              "person's own Telegram id, so it never depends on the forwarded "
+              "message."]
+    return "\n".join(lines)
+
+
 def _help_view(key: str, st: Optional[Dict[str, Any]] = None) -> str:
     """One section (or the full list) as HTML."""
     st = st or settings()
@@ -1087,6 +1183,8 @@ def _help_view(key: str, st: Optional[Dict[str, Any]] = None) -> str:
         return _help_text(st)
     if key == "system":
         return _system_view(st)
+    if key == "who":
+        return _known_guests_view(st)
     for k, title, body in _help_sections(st):
         if k == key:
             return f"<b>{title}</b>\n{body}"
@@ -1274,6 +1372,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
             ("\U0001f47b Guest texts", "panel:out:guests"))
         add((f"\U0001f465 Guest reacts {_mark('react_guests')}", "panel:toggle:greact"),
             (f"\U0001f5bc Guest media {_mark('media_to_guests')}", "panel:toggle:media"))
+        add(("👤 Who is on the link", "help:who"))
     elif view == "bot":
         add((f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:toggle:tool"),
             (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:toggle:mirror"))
@@ -2118,40 +2217,32 @@ def _current_guest_chat() -> Optional[str]:
 
 
 def _guest_session_info(session_id: Any) -> Optional[Dict[str, Any]]:
-    """Return ``{"guest_user_id": str, "is_owner": bool}`` for a guest session, else None."""
+    """Identity + rights for a guest session, or None if it is not a guest chat.
+
+    Identity comes from :func:`_guest_identity` — the same source the log
+    channel reads — so the gate, the log and the session table always agree.
+    Nothing here is inferred from a forwarded message's sender.
+    """
     row = _session_row(session_id)
     if not row:
         return None
     source, chat_id = row
     if source != "telegram" or not _is_guest_chat(chat_id):
         return None
-    gid = ""
-    try:
-        db = _hermes_home() / "state.db"
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        try:
-            oj = con.execute("SELECT origin_json FROM sessions WHERE id=?",
-                             (str(session_id),)).fetchone()
-        finally:
-            con.close()
-        if oj and oj[0]:
-            origin = json.loads(oj[0]) or {}
-            gid = str(origin.get("guest_sender_id") or origin.get("user_id") or "")
-    except Exception:
-        logger.debug("[telegram-guest-mode] origin_json read failed", exc_info=True)
+    ident = _guest_identity(chat_id)
+    gid = ident["id"]
     owner = str(_owner_id() or "")
-    # The event now carries the real guest id, so this comparison is sound.
-    # Sessions written before the fix still hold the forwarded message's id;
-    # those simply do not match, which is the safe direction to fail.
+    # The guest chat id IS the person's own Telegram id, so this comparison is
+    # an identity check, not a guess.
     is_owner = bool(owner and gid and gid == owner)
-    # Explicit unlock: you added this exact guest chat to guest_owner_chats.
-    # Keyed on the guest's own chat id, not on an id Telegram fills with the
-    # owner's, so this is the trustworthy path.
-    chat_key = str(chat_id or "")
-    unlocked = {str(c).strip() for c in (settings().get("guest_owner_chats") or []) if str(c).strip()}
-    if chat_key and chat_key in unlocked:
+    # Explicit, revocable unlock for the case where the id is not usable.
+    unlocked = {str(c).strip() for c in (settings().get("guest_owner_chats") or [])
+                if str(c).strip()}
+    if ident["chat"] and ident["chat"] in unlocked:
         is_owner = True
-    return {"guest_user_id": gid, "is_owner": is_owner, "guest_chat": chat_key}
+    return {"guest_user_id": gid, "is_owner": is_owner,
+            "guest_chat": ident["chat"], "name": ident["name"],
+            "username": ident["username"], "known": ident["known"]}
 
 
 def _guest_refusal(tool_name: str, info: Dict[str, Any], repeats: int = 0) -> str:

@@ -590,7 +590,7 @@ print("\n[8] manifest + config")
 from pathlib import Path as P
 from hermes_cli.plugins_manifest import parse_manifest_file
 mf = parse_manifest_file(HERE / "plugin.yaml", HERE, "user", "")
-check(mf is not None and mf.name == "telegram-guest-mode" and mf.version == "2.8.0", "manifest parses v2.8.0")
+check(mf is not None and mf.name == "telegram-guest-mode" and mf.version == "2.9.0", "manifest parses v2.9.0")
 check(mf is not None and "telegram_admin" in (mf.provides_tools or []), "provides_tools declared")
 check(mf is not None and "pre_gateway_dispatch" in (mf.provides_hooks or []), "provides_hooks declared")
 
@@ -1453,12 +1453,38 @@ async def t20():
                            "guest_allow_tools": [], "guest_deny_tools": []})
 
 
+def _real_state_path():
+    """The live state.json, built from the configured home rather than typed in.
+
+    A literal host path here would trip the pre-push audit, which is the whole
+    point of that rule.
+    """
+    from pathlib import Path as _P
+    home = mod._hermes_home()
+    return _P(home) / "plugins" / "telegram-guest-mode" / "state.json"
+
+
+def _tmp_state():
+    import tempfile
+    from pathlib import Path as _P
+    return _P(tempfile.mkdtemp(prefix="tgm-state-")) / "state.json"
+
+
+def _write_state(mod, data):
+    mod.STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    mod.STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
+
+
 def _set_guest(mod, db, sid, uid):
-    """Point a test session row at a given real guest id."""
+    """Point a test guest chat at a given id.
+
+    The gate reads identity from the guest CHAT id (that is the person's own
+    Telegram id), so a fixture must rename the chat, not the db row.
+    """
     con = sqlite3.connect(db)
     try:
-        con.execute("UPDATE sessions SET user_id=?, origin_json=? WHERE id=?",
-                    (uid, json.dumps({"user_id": uid}), sid))
+        con.execute("UPDATE sessions SET user_id=?, chat_id=?, origin_json=? WHERE id=?",
+                    (uid, mod._guest_chat_id(uid), json.dumps({"user_id": uid}), sid))
         con.commit()
     finally:
         con.close()
@@ -1491,11 +1517,14 @@ async def t21():
     try:
         info = mod._guest_session_info(sid)
         check(info is not None, "guest session is recognised")
-        # The real guest id is written onto the event now, so a session whose
-        # stored id is the owner belongs to the owner. A stranger's id does not
-        # match and must not be treated as the owner.
-        check(info["is_owner"],
-              "a guest session carrying the owner's id is recognised as the owner")
+        # The guest chat id IS the person's Telegram id, so a guest chat keyed on
+        # the owner's id is the owner using their own guest link. A stranger's id
+        # must not be treated as the owner.
+        _set_guest(mod, db, sid, str(mod._owner_id()))
+        check((mod._guest_session_info(sid) or {}).get("is_owner"),
+              "a guest chat keyed on the owner's id is recognised as the owner")
+        _set_guest(mod, db, sid, "900000002")
+        info = mod._guest_session_info(sid) or {}
 
         # A stranger in the same shape is NOT the owner.
         con = _sq.connect(db)
@@ -1546,9 +1575,12 @@ async def t21():
               "and can opt back into being blocked")
 
         # The explicit per-chat unlock is the fallback for when the id cannot
-        # be trusted (an old session, or a rewrite that lost it).
-        mod.save_settings({"guest_owner_full_access": True, "guest_owner_chats": [chat]})
+        # be trusted (an old session, or a rewrite that lost it). It is keyed on
+        # the guest chat as _set_guest just set it, not on a fixed fixture id.
         _set_guest(mod, db, sid, "900000002")
+        unlock_target = (mod._guest_session_info(sid) or {}).get("guest_chat") or chat
+        mod.save_settings({"guest_owner_full_access": True,
+                           "guest_owner_chats": [unlock_target]})
         check(mod._on_pre_tool_call(tool_name="terminal", args={},
                                     session_id=sid) is None,
               "an explicitly unlocked chat is not gated")
@@ -1570,7 +1602,60 @@ async def t21():
 
 asyncio.run(t19())
 asyncio.run(t20())
+
+async def t22():
+    """Identity has ONE source, shared with the log channel.
+
+    Telegram hands a guest message a real from_user and a chat.id that is the
+    person's own Telegram id. The log could always name them; the gate used to
+    re-derive identity from the forwarded message instead, which is how every
+    guest looked like the owner. Now both read _guest_identity.
+    """
+    def check_identity():
+        mod.STATE_PATH = _tmp_state()
+        _write_state(mod, {"users": {
+            "900000002": {"name": "Stranger", "username": "s", "count": 4,
+                          "last_seen": 1700000000},
+            str(mod._owner_id()): {"name": "Owner", "count": 9,
+                                   "last_seen": 1700000000},
+        }})
+        ident = mod._guest_identity("guest_900000002")
+        check(ident["id"] == "900000002", "identity comes off the guest chat id")
+        check(ident["name"] == "Stranger", "identity resolves the recorded name")
+        check(ident["known"], "identity knows this person is known")
+
+        # Unknown id still identifies the person, just without a name.
+        ident2 = mod._guest_identity("guest_555000111")
+        check(ident2["id"] == "555000111", "unknown guest still has a usable id")
+        check(not ident2["known"], "unknown guest is not marked as known")
+
+        # The log line and the panel read the same function, so they agree.
+        line = mod._identity_line("guest_900000002")
+        check("Stranger" in line and "900000002" in line,
+              "the log line names the person from the shared source")
+        view = mod._help_view("who", mod.settings())
+        check("Stranger" in view and "👑 owner" in view,
+              "the who-list shows the same person and marks the owner")
+        mod.STATE_PATH = _real_state_path()
+
+    check_identity()
+    # The gate must reach the same conclusion from the same place.
+    mod.save_settings({"guest_owner_full_access": True, "guest_owner_chats": []})
+    orig = mod._session_row
+    mod._session_row = lambda sid: ("telegram", mod._guest_chat_id(str(mod._owner_id())))
+    try:
+        check((mod._guest_session_info("ANY") or {}).get("is_owner"),
+              "the gate recognises the owner from the guest chat id alone")
+        mod._session_row = lambda sid: ("telegram", "guest_900000002")
+        check(not (mod._guest_session_info("ANY") or {}).get("is_owner"),
+              "and does not mistake a stranger for the owner")
+    finally:
+        mod._session_row = orig
+
+
 asyncio.run(t21())
+asyncio.run(t22())
+
 
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)
