@@ -113,10 +113,18 @@ def _run_tests(target: Path, timeout: int) -> Tuple[bool, str]:
         if py == "python3" and not shutil.which(py):
             continue
         code, out = _sh([py, str(test)], timeout=timeout)
-        tail = out.splitlines()[-1] if out else ""
+        # The suite logs warnings after the summary, so the last line is not
+        # the result. Match the summary explicitly and fall back to the tail.
+        summary = ""
+        for line in reversed(out.splitlines()):
+            if "passed" in line and "failed" in line:
+                summary = line.strip()
+                break
+        if not summary:
+            summary = out.splitlines()[-1].strip() if out else ""
         if code != 0:
-            return False, tail or f"{py} exited {code}"
-        return True, tail
+            return False, summary or f"{py} exited {code}"
+        return True, summary
     return True, "no usable python, skipped"
 
 
