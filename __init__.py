@@ -49,6 +49,13 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = PLUGIN_DIR / "settings.json"
 STATE_PATH = PLUGIN_DIR / "state.json"
 GUEST_CHAT_PREFIX = "guest_"
+
+# session_id -> how many tools the gate has refused for it in this turn.
+# A block comes back as a tool result, so the model will otherwise keep probing.
+_GUEST_BLOCK_COUNTS: Dict[str, int] = {}
+_GUEST_BLOCK_LAST: Dict[str, float] = {}
+# A guest turn lasts seconds; silence this long means the turn is over.
+_GUEST_BLOCK_TTL = 180.0
 _CB_PREFIX = "tgm:"
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
@@ -1836,24 +1843,46 @@ def _guest_session_info(session_id: Any) -> Optional[Dict[str, Any]]:
     return {"guest_user_id": gid, "is_owner": bool(owner and gid == owner)}
 
 
-def _guest_refusal(tool_name: str, info: Dict[str, Any]) -> str:
+def _guest_refusal(tool_name: str, info: Dict[str, Any], repeats: int = 0) -> str:
+    """Refusal text for the blocked-tool gate.
+
+    Two jobs, both learned the hard way:
+      1. Tell the model the block is FINAL so it stops probing other blocked
+         tools and answers with what it has. A refusal that reads like a
+         transient error makes the model retry for dozens of API calls.
+      2. Give the person a next step, so a block is an answer, not a wall.
+    """
     owner = str(_owner_id() or "")
+    if repeats:
+        # Second block in the same turn: the model ignored the first one.
+        # Be blunt that retrying is pointless and it must answer now.
+        tail = (
+            "You have already been told this is not possible. Do not call any "
+            "other tool from a guest chat, and do not try again — answer the "
+            "person NOW using only what you already have. If you cannot help "
+            "without these tools, say so in one sentence."
+        )
+    else:
+        tail = (
+            "Do not call this or any other blocked tool again; answer with what "
+            "you already have, or say in one sentence that you cannot."
+        )
     if info.get("is_owner"):
         return (
-            f"BLOCKED in guest mode: `{tool_name}` would change or delete something on the "
-            f"machine, so it is never run from a guest chat — not even for you. This IS your "
-            f"account, so just open your own DM (https://t.me/user?id={owner} or chat {owner}) "
-            f"and ask me there; I will do it straight away. Read-only things (searching the web, "
-            f"looking something up) still work fine right here."
+            f"BLOCKED in guest mode (final, not a transient error): `{tool_name}` would change "
+            f"or delete something on the machine, so it is never run from a guest chat — not even "
+            f"for you. This IS your account, so open your own DM "
+            f"(https://t.me/user?id={owner} or chat {owner}) and ask me there; I will do it "
+            f"straight away. Answering questions, searching, and simple analysis all work fine "
+            f"right here. {tail}"
         )
     return (
-        f"BLOCKED in guest mode: `{tool_name}` would change or delete something on the owner's "
-        f"machine, so it is never run from a guest chat. Tell the owner what you want and ask "
-        f"them to run it themselves in their own DM (https://t.me/user?id={owner} or chat "
-        f"{owner}) — they will do it there. Read-only things (searching the web, looking "
-        f"something up) still work fine right here."
+        f"BLOCKED in guest mode (final, not a transient error): `{tool_name}` would change or "
+        f"delete something on the owner's machine, so it is never run from a guest chat, and I "
+        f"cannot read the owner's files or private chats from here either. Ask the owner what you "
+        f"want and have them do it in their own DM (https://t.me/user?id={owner} or chat {owner}). "
+        f"Answering questions, web search and simple analysis all work fine right here. {tail}"
     )
-
 
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = None, **_) -> Optional[Dict[str, str]]:
     """Guest safety gate: refuse destructive/leaking tools, let the rest through."""
@@ -1871,9 +1900,46 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
             danger = False
     if not danger:
         return None
-    logger.warning("[telegram-guest-mode] guest tool refused: %s (guest_is_owner=%s)",
-                   name, info.get("is_owner"))
-    return {"action": "block", "message": _guest_refusal(name, info)}
+    # A block is delivered to the model as a tool result, not as a turn
+    # terminator, so without a per-turn counter the model re-probes blocked
+    # tools for dozens of calls and the guest never gets an answer.
+    turn_key = str(session_id or "")
+    count = _GUEST_BLOCK_COUNTS.get(turn_key, 0) + 1
+    _GUEST_BLOCK_COUNTS[turn_key] = count
+    _GUEST_BLOCK_LAST[turn_key] = time.monotonic()
+    if len(_GUEST_BLOCK_COUNTS) > 64:  # bound memory on long-lived gateways
+        now = time.monotonic()
+        for k, last in list(_GUEST_BLOCK_LAST.items()):
+            if now - last > _GUEST_BLOCK_TTL and k != turn_key:
+                _GUEST_BLOCK_COUNTS.pop(k, None)
+                _GUEST_BLOCK_LAST.pop(k, None)
+    logger.warning("[telegram-guest-mode] guest tool refused: %s (guest_is_owner=%s, block#%d)",
+                   name, info.get("is_owner"), count)
+    return {"action": "block", "message": _guest_refusal(name, info, repeats=count - 1)}
+
+
+def _guest_turn_expired(session_id: Any = None, **_) -> None:
+    """Drop a session's block counter once it has been quiet (turn over).
+
+    Hermes has no post-turn hook, so expiry is time-based: a guest turn lasts
+    seconds, so a couple of idle minutes means the turn is over.
+    """
+    key = str(session_id or "")
+    if not key:
+        return
+    last = _GUEST_BLOCK_LAST.get(key)
+    if last is not None and time.monotonic() - last > _GUEST_BLOCK_TTL:
+        _GUEST_BLOCK_COUNTS.pop(key, None)
+        _GUEST_BLOCK_LAST.pop(key, None)
+
+
+def _on_post_tool_call(tool_name: str = "", session_id: Any = None, **_) -> None:
+    """Observer: retire a guest's block counter once its turn has gone quiet."""
+    try:
+        _guest_turn_expired(session_id)
+    except Exception:
+        logger.debug("[telegram-guest-mode] block-counter expiry failed", exc_info=True)
+    return None
 
 
 def _on_transform_llm_output(text: Any = None, **_) -> Any:
@@ -2035,6 +2101,7 @@ def register(ctx) -> None:
     try:
         ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch)
         ctx.register_hook("pre_tool_call", _on_pre_tool_call)
+        ctx.register_hook("post_tool_call", _on_post_tool_call)
         ctx.register_tool(name="telegram_admin", toolset="telegram_admin",
                           schema=_TOOL_SCHEMA, handler=_tool_handler_json,
                           description=_TOOL_DESCRIPTION, emoji="\U0001f6e1️", is_async=True,

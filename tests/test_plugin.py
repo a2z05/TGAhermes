@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import sys
+import time
 import tempfile
 import types
 from pathlib import Path
@@ -1293,7 +1294,46 @@ async def t17():
     check('register_hook("pre_tool_call", _on_pre_tool_call)' in reg_src,
           "register() wires the pre_tool_call hook")
 
+
+async def t18():
+    """A block must end the turn, not start a probe loop (2026-09-30)."""
+    mod._GUEST_BLOCK_COUNTS.clear()
+    mod._GUEST_BLOCK_LAST.clear()
+    sess = "20260930_162658_5a05bae5"
+    first = mod._on_pre_tool_call(tool_name="read_file", session_id=sess,
+                                  arguments={"path": "/host/home/anything"})
+    second = mod._on_pre_tool_call(tool_name="execute_code", session_id=sess,
+                                   arguments={"code": "print(1)"})
+    check(first is not None and first.get("action") == "block", "first block still blocks")
+    check(mod._GUEST_BLOCK_COUNTS.get(sess) == 2, "blocks counted per session")
+    m1, m2 = first["message"], second["message"]
+    check("final, not a transient error" in m1, "block states it is final")
+    check("do not try again" in m2.lower(), "repeat block tells the model to stop")
+    check("NOW" in m2, "repeat block orders an immediate answer")
+    check("t.me/user?id=" in m1, "block gives the owner a DM link")
+    # owner-vs-stranger wording still intact
+    stranger = mod._guest_refusal("terminal", {"is_owner": False})
+    check("owner" in stranger and "DM" in stranger, "stranger refusal points at the owner")
+    # a non-blocked tool must NOT be counted
+    before = mod._GUEST_BLOCK_COUNTS.get(sess)
+    allow = mod._on_pre_tool_call(tool_name="web_search", session_id=sess,
+                                  arguments={"query": "python"})
+    check(allow is None, "web_search still allowed for guests")
+    check(mod._GUEST_BLOCK_COUNTS.get(sess) == before, "allowed tool not counted as a block")
+    # expiry clears the counter
+    mod._GUEST_BLOCK_LAST[sess] = time.monotonic() - (mod._GUEST_BLOCK_TTL + 5)
+    mod._guest_turn_expired(session_id=sess)
+    check(sess not in mod._GUEST_BLOCK_COUNTS, "idle session counter expires")
+    # a new turn starts clean (count 1 -> first-block wording)
+    again = mod._on_pre_tool_call(tool_name="terminal", session_id=sess, arguments={"cmd": "ls"})
+    check("final, not a transient error" in again["message"], "new turn resets block counter")
+    check("NOW" not in again["message"], "new turn no longer uses urgent wording")
+    mod._GUEST_BLOCK_COUNTS.clear()
+    mod._GUEST_BLOCK_LAST.clear()
+
+
 asyncio.run(t17())
+asyncio.run(t18())
 
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)
