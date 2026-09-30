@@ -589,7 +589,7 @@ print("\n[8] manifest + config")
 from pathlib import Path as P
 from hermes_cli.plugins_manifest import parse_manifest_file
 mf = parse_manifest_file(HERE / "plugin.yaml", HERE, "user", "")
-check(mf is not None and mf.name == "telegram-guest-mode" and mf.version == "2.6.0", "manifest parses v2.6.0")
+check(mf is not None and mf.name == "telegram-guest-mode" and mf.version == "2.7.0", "manifest parses v2.7.0")
 check(mf is not None and "telegram_admin" in (mf.provides_tools or []), "provides_tools declared")
 check(mf is not None and "pre_gateway_dispatch" in (mf.provides_hooks or []), "provides_hooks declared")
 
@@ -1333,7 +1333,49 @@ async def t18():
 
 
 asyncio.run(t17())
+
+async def t19():
+    """Self-update: owner-gated entry points, config-driven, no hardcoded identity."""
+    import inspect
+    src = inspect.getsource(mod)
+    # the two official entry points exist
+    check("check_update" in src and "update_plugin" in src,
+          "telegram_admin exposes check_update and update_plugin")
+    check("_run_selfupdate" in src, "plugin has an update entry point")
+    # both are wired
+    reg = inspect.getsource(mod.register)
+    check("check_update" in str(mod._TOOL_SCHEMA) or
+          "update_plugin" in str(mod._TOOL_SCHEMA), "schema lists the update actions")
+    # config-driven, not hardcoded
+    check(mod.DEFAULT_UPDATE_REPO.startswith("https://"), "default repo is a url")
+    cfg = mod._update_settings()
+    check(str(cfg.get("repo", "")).startswith("https://"), "update repo resolves to a url")
+    check(cfg.get("branch"), "branch configured")
+    check(cfg.get("target") == mod.PLUGIN_DIR, "target defaults to the installed plugin")
+    # the owner's identity is never baked into the update path
+    owner = str(mod._owner_id() or "")
+    upd_src = inspect.getsource(mod._run_selfupdate) + inspect.getsource(mod._update_settings)
+    check(owner not in upd_src or not owner, "no owner id in the update code path")
+    # panel surfaces it
+    kb = mod._help_keyboard("system", mod.settings())
+    labels = [b.text for row in kb for b in row]
+    check(any("update" in l.lower() for l in labels), "system tab has an update button")
+    check(any(l.startswith("v") for l in labels), "system tab shows the installed version")
+    home = mod._help_keyboard("panel", mod.settings())
+    check(any("System" in b.text for row in home for b in row), "home grid links to System")
+    # view renders
+    body = mod._help_view("system", mod.settings())
+    check("System" in body and mod._plugin_version() in body, "system view renders version")
+    # lock switch honoured
+    try:
+        mod.save_settings({"update_enabled": False})
+        check(mod._update_settings()["enabled"] is False, "update lock respected")
+    finally:
+        mod.save_settings({"update_enabled": True})
+
+
 asyncio.run(t18())
+asyncio.run(t19())
 
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

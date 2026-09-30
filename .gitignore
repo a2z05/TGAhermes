@@ -1,5 +1,9 @@
 # Never commit live state — these are per-install and contain personal data.
 settings.json
 state.json
+
+# Local leak-pattern config: holds real Telegram ids/names. Never commit it.
+.audit-identities.json
+
 __pycache__/
 *.pyc

@@ -14,5 +14,9 @@
   "log_owner_messages": false,
   "log_group_mentions": true,
   "tool_enabled": true,
-  "persona_path": null
+  "persona_path": null,
+  "update_enabled": true,
+  "update_repo": null,
+  "update_branch": "master",
+  "update_timeout_s": 300
 }

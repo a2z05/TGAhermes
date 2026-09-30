@@ -37,6 +37,8 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -58,6 +60,10 @@ _GUEST_BLOCK_LAST: Dict[str, float] = {}
 _GUEST_BLOCK_TTL = 180.0
 _CB_PREFIX = "tgm:"
 
+# Where !update / update_plugin pull from when settings.update_repo is empty.
+# Override per install with settings.json -> update_repo.
+DEFAULT_UPDATE_REPO = "https://github.com/a2z05/TGAhermes.git"
+
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "owner_id": None,                # override; else telegram.extra.allow_from / TELEGRAM_ALLOWED_USERS / ""
     "log_channel": None,             # group (recommended) or channel id/@username; bot must be able to post
@@ -77,6 +83,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "log_group_mentions": True,      # log @bot mentions from groups/channels the bot is in
     "tool_enabled": True,            # telegram_admin agent tool
     "persona_path": None,            # default: <hermes_home>/assets/guest_persona.md
+    # !update — pull a newer version of this plugin from git
+    "update_enabled": True,          # set False to lock the plugin version
+    "update_repo": None,             # git URL; None = use the plugin's own origin
+    "update_branch": "master",       # branch to track
+    "update_timeout_s": 300,         # git/test budget per attempt
 }
 
 _FALLBACK_PERSONA = """I'm ATRA — named after Atropos, the Greek Fate who cuts the thread.
@@ -1037,12 +1048,44 @@ def _help_text(st: Optional[Dict[str, Any]] = None) -> str:
 
 def _help_view(key: str, st: Optional[Dict[str, Any]] = None) -> str:
     """One section (or the full list) as HTML."""
+    st = st or settings()
     if key == "full":
         return _help_text(st)
+    if key == "system":
+        return _system_view(st)
     for k, title, body in _help_sections(st):
         if k == key:
             return f"<b>{title}</b>\n{body}"
     return _help_text(st)
+
+
+def _system_view(st: Dict[str, Any]) -> str:
+    """Body text for the System tab."""
+    cfg = _update_settings()
+    lines = [
+        "<b>🔧 System</b>",
+        f"<b>Installed version:</b> <code>{_esc(_plugin_version())}</code>",
+        f"<b>Updates:</b> {'enabled' if st.get('update_enabled', True) else '🔒 locked'}",
+        f"<b>Source:</b> <code>{_esc(cfg['repo'])}</code> "
+        f"<code>({_esc(str(cfg['branch']))})</code>",
+        "",
+        "Checking compares the installed version against the source. Installing "
+        "backs up the current files, copies the newer ones, runs the test suite, "
+        "and only then hot-reloads. Your settings and learned state are never "
+        "touched.",
+    ]
+    return "\n".join(lines)
+
+
+def _update_note(report: Dict[str, Any]) -> str:
+    """One-line result for the panel, or a readable error block."""
+    if report.get("error"):
+        return f"❌ <b>update failed</b>\n<code>{_esc(str(report['error'])[:300])}</code>"
+    if report.get("action"):
+        return f"📦 {report['action']}"
+    if report.get("newer_available"):
+        return "⬆️ a newer version is available — tap Install update"
+    return "✅ up to date"
 
 
 def _plugin_version() -> str:
@@ -1087,6 +1130,16 @@ def _panel_text(st: Optional[Dict[str, Any]] = None, note: str = "") -> str:
     return "\n".join(lines)
 
 
+def _plugin_version() -> str:
+    """Version from plugin.yaml, read without importing the plugin."""
+    try:
+        text = (PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "?"
+    m = re.search(r"^version:\s*[\"\']?([^\s\"\']+)", text, re.M)
+    return m.group(1) if m else "?"
+
+
 def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
                    chat_id: Optional[str] = None) -> list:
     """Per-tab button sets: the full console grid at home, contextual actions inside a tab."""
@@ -1107,6 +1160,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
             ("\U0001f6e1 Access", "help:access"))
         add(("\U0001f9f9 Sessions", "help:sessions"), ("\U0001f47e Guests", "help:guests"),
             ("\U0001f916 Bot", "help:bot"))
+        add(("\U0001f527 System", "help:system"))
         add(("\U0001f4dc Full help", "help:full"))
         add((f"\U0001f501 Reactions {_mark('auto_react')}", "panel:toggle:react"),
             (f"\U0001f465 Guest reacts {_mark('react_guests')}", "panel:toggle:greact"),
@@ -1152,6 +1206,13 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         add((f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:toggle:tool"),
             (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:toggle:mirror"))
         add(("\u2699\ufe0f Settings", "panel:out:settings"), ("\U0001f4cb Users", "panel:out:users"))
+    elif view == "system":
+        if st.get("update_enabled", True):
+            add(("🔍 Check for update", "panel:upd:check"))
+            add(("⬆️ Install update", "panel:upd:apply"))
+        else:
+            add(("🔒 Updates locked", "panel:upd:check"))
+        add((f"v{_plugin_version()}", "panel:upd:check"))
     elif view == "out":
         add(("\U0001f4cb Users", "panel:out:users"), ("\u2699\ufe0f Settings", "panel:out:settings"),
             ("\U0001f6e1 Whitelist", "panel:out:whitelist"))
@@ -1174,7 +1235,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
 _VIEW_LABEL = {"full": "📜 Full help", "panel": "🧩 Console", "out": "📋 Output",
                "status": "ℹ️ Status", "log": "📡 Log", "access": "🛡 Access",
                "sessions": "🧹 Sessions", "bot": "🤖 Bot", "guests": "👾 Guests",
-               "cool": "⏱ Cooldown"}
+               "cool": "⏱ Cooldown", "system": "🔧 System"}
 
 
 def _msg_chat_id(msg: Any) -> Optional[str]:
@@ -1568,6 +1629,20 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     body = (f"<b>⏱ Cooldown</b> — how long a stranger waits before the "
                             f"canned reply may repeat\ncurrent: <b>{st.get('unauthorized_cooldown_s')}s</b>\n"
                             "Tap a preset, or type <code>!setcooldown &lt;seconds&gt;</code>")
+            elif action == "upd":
+                # Runs git + the test suite, so hand control back to the user
+                # with a "working" toast before it blocks.
+                if sub == "apply":
+                    await q.answer("⬆️ updating… this takes a minute", show_alert=False)
+                    report = await _run_selfupdate(apply=True, force=False)
+                    note = _update_note(report)
+                else:
+                    await q.answer("🔍 checking…", show_alert=False)
+                    report = await _run_selfupdate(apply=False)
+                    note = _update_note(report)
+                st = settings()
+                view = "system"
+                body = _system_view(st) + f"\n\n{_update_note(report)}"
             elif action == "logoff" and st.get("log_channel"):
                 prev = st.get("log_channel")
                 save_settings({"log_channel": None})
@@ -1588,9 +1663,10 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             if res == "failed":
                 await q.answer("⚠️ couldn't update the panel", show_alert=True)
                 return
-            await q.answer(_html_plain(note)
-                           or (f"{_VIEW_LABEL.get(view, '🧩')} — already showing"
-                               if res == "same" else "🧩"),
+            await q.answer("" if view == "system"
+                           else (_html_plain(note)
+                                 or (f"{_VIEW_LABEL.get(view, '🧩')} — already showing"
+                                     if res == "same" else "🧩")),
                            show_alert=False)
             return
         if data.startswith(f"{_CB_PREFIX}info:"):
@@ -1734,7 +1810,7 @@ _TOOL_SCHEMA = {
             "action": {"type": "string", "enum": [
                 "delete_message", "ban_user", "unban_user", "mute_user", "unmute_user",
                 "get_member", "chat_info", "react", "send_dm", "pin_message", "unpin_message",
-                "bang"]},
+                "bang", "check_update", "update_plugin"]},
             "chat_id": {"type": "string", "description": "Target chat id (group/channel/supergroup/user chat)"},
             "user_id": {"type": "string", "description": "Target user id (ban/mute/unban/get_member/send_dm)"},
             "message_id": {"type": "string", "description": "Target message id (delete/react/pin)"},
@@ -1742,6 +1818,8 @@ _TOOL_SCHEMA = {
             "text": {"type": "string", "description": "Message text for action=send_dm; the full !command for action=bang (e.g. '!setlog -100123')"},
             "hours": {"type": "number", "description": "ban/mute duration in hours (omit = permanent / until unmuted)"},
             "silent": {"type": "boolean", "description": "pin without notification"},
+            "apply": {"type": "boolean", "description": "update_plugin: install the newer version (default false = check only)"},
+            "force": {"type": "boolean", "description": "update_plugin: reinstall even if the version matches"},
         },
         "required": ["action"],
     },
@@ -1947,17 +2025,100 @@ def _on_transform_llm_output(text: Any = None, **_) -> Any:
     return None
 
 
+def _update_settings() -> Dict[str, Any]:
+    """Resolve update config into concrete paths and flags.
+
+    Everything is configurable: repo URL, branch, and the directory to update
+    default to the running install, so a fork or a test copy works without a
+    code change.
+    """
+    st = settings()
+    try:
+        from hermes_cli.config import load_config_readonly
+        home = Path(load_config_readonly().get("home") or "/host/home")
+    except Exception:
+        home = PLUGIN_DIR.parent.parent
+    repo = str(st.get("update_repo") or "").strip() or _plugin_origin() or DEFAULT_UPDATE_REPO
+    return {
+        "enabled": bool(st.get("update_enabled", True)),
+        "repo": repo,
+        "branch": str(st.get("update_branch") or "master"),
+        "timeout": int(st.get("update_timeout_s") or 300),
+        "target": PLUGIN_DIR,
+        "home": home,
+        "backup_root": home / "cache" / "scratch" / "guest_restore",
+    }
+
+
+def _plugin_origin() -> str:
+    """The git origin of the checkout this module was loaded from, if any.
+
+    The deployed directory is not a git repo, so this is normally empty and
+    the configured update_repo (or the packaged default) is used instead.
+    """
+    if not (PLUGIN_DIR / ".git").exists():
+        return ""
+    try:
+        r = subprocess.run(["git", "config", "--get", "remote.origin.url"],
+                           cwd=str(PLUGIN_DIR), capture_output=True, text=True,
+                           timeout=15, check=False)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+async def _run_selfupdate(apply: bool = False, force: bool = False) -> Dict[str, Any]:
+    """Check for, or install, a plugin update. Never raises.
+
+    Runs in a worker thread: git plus the test suite can take a minute, and
+    the gateway's event loop must keep serving while it happens.
+    """
+    cfg = _update_settings()
+    if not cfg["enabled"]:
+        return {"ok": False, "error": "updates are locked (settings.update_enabled=false)"}
+    try:
+        sys.path.insert(0, str(PLUGIN_DIR))
+        import selfupdate as _su
+    except Exception as exc:
+        return {"ok": False, "error": f"selfupdate unavailable: {exc}"}
+
+    def _work() -> Dict[str, Any]:
+        try:
+            if apply:
+                return _su.apply_update(
+                    cfg["target"], cfg["repo"], cfg["branch"],
+                    home=cfg["home"], backup_root=cfg["backup_root"],
+                    timeout=cfg["timeout"], force=force)
+            return _su.check_update(cfg["target"], cfg["repo"], cfg["branch"],
+                                    timeout=cfg["timeout"])
+        except Exception as exc:  # never let an update crash a turn
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    return await asyncio.to_thread(_work)
+
+
 async def _tool_handler(args: Dict[str, Any], session_id: Any = None, **_) -> Dict[str, Any]:
     st = settings()
     if not st.get("tool_enabled"):
         return {"ok": False, "error": "telegram_admin is disabled (settings.tool_enabled=false)"}
     if not _tool_owner_ok(session_id):
         return {"ok": False, "error": "owner-only: telegram_admin runs only from the owner's session"}
+    action = str(args.get("action") or "")
+
+    # Update runs before the bot check on purpose: a plugin update should still
+    # work when Telegram is disconnected, and it must never post anything.
+    if action in ("check_update", "update_plugin"):
+        apply_it = action == "update_plugin" and args.get("apply", True)
+        report = await _run_selfupdate(apply=bool(apply_it),
+                                       force=bool(args.get("force")))
+        await _log("⬆️ Plugin update" + (" (applied)" if apply_it else " (check)"),
+                   f"<code>{_esc(json.dumps(report, ensure_ascii=False)[:900])}</code>")
+        return {"ok": bool(report.get("ok", False)), "result": report}
+
     ad = _ADAPTER.get("adapter")
     bot = getattr(ad, "_bot", None) if ad else None
     if bot is None:
         return {"ok": False, "error": "telegram adapter not connected"}
-    action = str(args.get("action") or "")
     chat_id = args.get("chat_id")
     user_id = args.get("user_id")
     message_id = args.get("message_id")
