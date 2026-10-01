@@ -1,187 +1,262 @@
-# AGENT.md — how to install this plugin
+# AGENT.md — install TGAhermes
 
-You are an agent. Someone just gave you a link to this repository. Your job:
-install the plugin, configure it, verify it works, and report back plainly.
+## What you are being asked to do
 
-Do not ask the user to read instructions and do it themselves. You have shell
-access. Read this file, follow it, then tell them what you did in their
-language (Farsi for a Farsi speaker, English for an English speaker).
+One sentence: install the TGAhermes plugin into this Hermes installation,
+check that it actually loaded, and tell the human what to do next.
 
----
-
-## What this is
-
-`telegram-guest-mode` is a **Hermes Agent** plugin that turns a Telegram bot
-into a guest-mode assistant. Strangers message the bot through its guest link
-and get answered. A private owner chat stays private. Everything can be
-inspected from a log channel with inline buttons.
-
-It needs:
-
-- Hermes Agent **0.21.5 or newer** (it registers a `pre_gateway_dispatch` hook)
-- A Telegram bot token (from @BotFather)
-- Python 3.11+ with `python-telegram-bot` (Hermes already ships it)
-
-It does **not** need `pyrogram`, `telethon`, or a userbot session. If the
-target is not a Telegram bot, stop and say so — don't improvise.
+The human-facing instructions live in [README.md](README.md). This file is
+for you. Follow it in order, don't improvise, and report what really
+happened — including anything that failed.
 
 ---
 
-## Step 1 — check the environment
+## Step 0 — prerequisites
+
+Find the CLI:
 
 ```bash
-hermes --version                 # must be >= 0.21.5
-python3 -c "import telegram; print(telegram.__version__)"
+command -v hermes || echo /opt/hermes/.venv/bin/hermes
 ```
 
-If Hermes is missing or older, **stop and report that**. Don't try to upgrade
-someone else's agent install behind their back.
-
-## Step 2 — install the plugin
+Use `hermes` if it printed a path, otherwise the `/opt/hermes/.venv/bin/hermes`
+fallback. Then check both exist:
 
 ```bash
-git clone https://github.com/a2z05/telegram-guest-mode.git \
-  "$HOME/hermes/plugins/telegram-guest-mode"
+hermes --version              # expect 0.21.5 or newer
+hermes gateway status         # a gateway should be present (running or installable)
 ```
 
-If the plugins directory doesn't exist, create it first:
+If Hermes is missing or older than 0.21.5, stop and say so. Do not upgrade
+someone else's install behind their back.
+
+Plugin name and source:
+
+- Name: `TGAhermes` (version 3.0.0)
+- Source: `https://github.com/a2z05/TGAhermes`
+- Installs to: `$HERMES_HOME/plugins/TGAhermes`
+- `$HERMES_HOME` is `~/.hermes` unless the environment says otherwise — read
+  it from the environment, never hardcode it.
+
+---
+
+## Step 1 — install
 
 ```bash
-mkdir -p "$HOME/hermes/plugins"
+hermes plugins install https://github.com/a2z05/TGAhermes --enable
 ```
 
-If the repository is already there, `git -C "$HOME/hermes/plugins/telegram-guest-mode" pull`.
+Expected output (wording varies slightly by version):
 
-## Step 3 — create the bot
+```
+Warning: custom (unreviewed) source — not from the Hermes catalog.
+Cloning https://github.com/a2z05/TGAhermes...
 
-The user needs a Telegram bot token:
+✓ Installed
+│ Plugin installed: https://github.com/a2z05/TGAhermes
+│ Location: $HERMES_HOME/plugins/TGAhermes
 
-1. Open Telegram, message **@BotFather**
-2. `/newbot` → pick a name → pick a username ending in `bot`
-3. Copy the token (looks like `100000001:AA...`)
+✓ Plugin TGAhermes enabled.
 
-**Two things that are easy to miss and that this plugin depends on:**
+  Plugin TGAhermes requests the following capabilities:
+    tools.override — Replace built-in tools (e.g. shell_exec, write_file) ...
+  Non-interactive session: capabilities NOT granted (fail closed). ...
 
-- **Inline mode must be ON** for the bot. In @BotFather: `/setinline` → choose
-  placeholder text → send a placeholder. Without it, guest replies fail.
-- The bot does not need to be an admin anywhere. Guest mode is a Bot API 10
-  feature; it works on a plain bot token.
+Restart the gateway for the plugin to take effect:
+  hermes gateway restart
+```
 
-Never ask the user to paste their bot token into this chat or any log. Have
-them write it into the settings file themselves (step 4), or set it as an
-environment variable.
+`--enable` skips the confirmation prompt, which you can't answer in a
+non-interactive session. Never drop it.
 
-## Step 4 — settings
+The `tools.override` line matters: in a non-interactive session the
+capability is **not** granted, so the plugin's `telegram_admin` tool stays
+closed until you grant it in Step 3.
 
-The plugin reads `settings.json` next to `__init__.py`. Start from the example:
+---
+
+## Step 2 — verify the install
 
 ```bash
-cd "$HOME/hermes/plugins/telegram-guest-mode"
-cp settings.example.json settings.json
+hermes plugins list --plain | grep -i TGAhermes
 ```
 
-Minimum viable config:
+Expected: one line like
 
-```json
-{
-  "owner_id": "100000001",
-  "log_channel": "-1001000000010",
-  "unauthorized_reply": "I only talk to my person."
-}
+```
+enabled      git      3.0.0    TGAhermes
 ```
 
-- `owner_id` — the user's Telegram numeric id. The bot answers them privately and
-  treats their DM as the command console.
-- `log_channel` — a group/channel id the user controls, where the bot posts an
-  audit line for every guest interaction, with buttons (profile / ban / delete).
-  Negative ids for supergroups. The bot must be able to post there.
-- `unauthorized_reply` — what a stranger gets when they mention the bot
-  casually instead of replying to it.
-
-Optional keys (all have sane defaults): `unauthorized_cooldown_s`,
-`guest_error_reply_en`, `guest_error_reply_fa`, `auto_react`, `react_guests`,
-`react_emoji_receive`, `react_emoji_done`, `react_emoji_error`,
-`media_to_guests`, `log_owner_messages`, `log_whitelisted_messages`,
-`log_other_messages`, `log_group_mentions`, `tool_enabled`, `persona_path`.
-
-## Step 5 — persona (optional but recommended)
-
-`persona_path` points at a markdown file that becomes the system prompt for
-guest turns. A ready one ships in `assets/guest_persona.example.md`. Copy it
-and let the user edit it:
+The first column must say `enabled`. Then confirm the manifest agrees:
 
 ```bash
-cp assets/guest_persona.example.md ~/guest_persona.md
+hermes plugins show TGAhermes
 ```
 
-Without a persona file the plugin uses a built-in fallback so nothing breaks.
+Expected: `TGAhermes v3.0.0` and `Status: enabled`.
 
-## Step 6 — enable and start
+**If `grep` finds nothing**, the manifest name and the directory name may
+disagree (a manual copy keeps the old name). Read the real name and use it
+everywhere below:
 
 ```bash
-hermes plugins enable telegram-guest-mode     # if that subcommand exists
-hermes plugins list                           # confirm it is loaded
+hermes plugins list --plain --user
+```
+
+Then enable whatever name it printed:
+
+```bash
+hermes plugins enable <name-from-list>
+```
+
+---
+
+## Step 3 — grant the capability
+
+```bash
+hermes plugins enable TGAhermes --allow-tool-override
+hermes plugins capabilities TGAhermes
+```
+
+Expected last line:
+
+```
+  tools.override: granted
+```
+
+Without this, the plugin loads but its admin tool refuses to run. Safe to
+run even if the plugin is already enabled.
+
+---
+
+## Step 4 — reload and health-check the gateway
+
+Installing nudges a running gateway to reload its plugins. If no gateway
+answered, a restart is required:
+
+```bash
 hermes gateway restart
 ```
 
-If the subcommand names differ in this Hermes version, run `hermes plugins --help`
-and use the equivalent. Report the command you actually ran.
-
-## Step 7 — verify (do not skip this)
+Then check the gateway is alive:
 
 ```bash
 curl -s http://127.0.0.1:8642/health
 ```
 
-Expect `{"status": "ok", ...}`. Then check the log for the plugin loading
-without exceptions.
+Expected:
 
-Ask the user to do one real test and confirm it:
+```
+{"status": "ok", "platform": "hermes-agent", "version": "..."}
+```
 
-1. From **another account or a guest-friendly context**, open the bot's guest
-   link and send a message.
-2. Confirm a reply comes back.
-3. Confirm the log channel received the audit line.
-4. Confirm a casual mention (no reply-to) from a stranger gets
-   `unauthorized_reply`.
-
-If inline replies come back empty, the cause is almost always inline mode being
-off in @BotFather. Check that before debugging anything else.
-
-## Step 8 — report
-
-Tell the user, in their language:
-
-- the version you installed
-- where the plugin lives
-- what the bot username is and that **inline mode is required**
-- that guest conversations are isolated per guest chat, and that replies are
-  sent as inline results (not as normal messages)
-- how to change the persona file
-- how to reach the bang console (`!help`, `!panel`, `!users`, `!settings`) in
-  the log channel or the owner's DM
-- anything that failed, plainly — no pretending a step worked
+If the health endpoint fails, the gateway is down — that's a gateway
+problem, not a plugin problem. Report it as such.
 
 ---
 
-## Operational notes
+## Step 5 — configuration
 
-- **State lives in `state.json`** (user registry, cooldowns). It is written
-  atomically. Don't delete it while the gateway runs.
-- **Owner identity** comes from `settings.owner_id` first, then the Hermes
-  Telegram `allow_from` config. An explicit `owner_id` always wins.
-- **A note on Telegram's rules**: guest mode is a Bot API feature, so this is
-  bot behaviour, not a userbot. Still worth telling the user that automating
-  accounts can violate Telegram's terms — bots don't, users do.
-- **Don't paste secrets into the conversation.** Tokens, ids and persona
-  content belong in files, not chat.
+Settings live next to the plugin:
+
+```
+$HERMES_HOME/plugins/TGAhermes/settings.json
+```
+
+Two keys matter at first run: `owner_id` and `log_channel`. The file is
+created on the first save, so you do **not** have to write it by hand — the
+owner commands below do it, and they are the preferred route because they're
+validated by the plugin itself. If the human prefers editing a file, start
+from `settings.example.json` in the plugin directory.
+
+Send these as messages to the bot, in the human's own DM with it:
+
+1. `!setowner <their telegram id>` — sets `owner_id`. Hot, no restart.
+2. `!setlog <chat id>` — sets `log_channel`. Or, sent from inside the
+   target channel/group, `!setlog here`. `!setlog off` clears it.
+   The bot must be able to post in that chat; make it admin there, otherwise
+   log entries won't arrive.
+3. `!panel` — opens the admin panel.
+
+If a command isn't recognised (for example `here` is answered with the raw
+word instead of a chat id), fall back to `!setlog <chat id>` and say so in
+your report.
+
+Full owner command list: `!panel !help !settings !users !setowner
+!setlog <id|@name|here|off> !whitelist list|add|remove <id>
+!wipe <chat_id> !send <user_id> <text> !setcooldown <s>
+!setunauthorized <text> !seterror <text> !seterrorfa <text>
+!setreact on|off !setmedia on|off !guestlock on|off`.
+
+The panel's **Actions** view has wizards for these — mention to the human
+that they can click instead of type.
+
+---
+
+## Step 6 — verification checklist
+
+Do not skip any of these:
+
+- [ ] `hermes plugins list --plain | grep -i TGAhermes` shows `enabled`.
+- [ ] `hermes plugins show TGAhermes` shows `Status: enabled`.
+- [ ] `hermes plugins capabilities TGAhermes` shows `tools.override: granted`.
+- [ ] `curl -s http://127.0.0.1:8642/health` returns `"status": "ok"`.
+- [ ] `settings.json` exists at `$HERMES_HOME/plugins/TGAhermes/settings.json`
+      after the owner commands ran, with `owner_id` set.
+- [ ] A real test message from the human got a reply, and a line appeared in
+      the log channel.
+
+---
+
+## Step 7 — report
+
+Tell the human plainly:
+
+- version installed and where it lives
+- the three first-config commands (or the ones you already ran)
+- that the panel's Actions view replaces typing commands
+- anything that failed, without dressing it up
+
+---
+
+## Updating later
+
+Two ways, no third:
+
+1. `!panel` → **🔧 System** → **Check for update**, then **Install update**.
+2. Re-run Step 1 (`hermes plugins install ... --enable`) to reinstall fresh.
+
+Your agent-side option is the plugin's update tool, which refuses while
+updates are locked (`update_enabled: false` in `settings.json` — the panel
+shows 🔒 Updates locked). If it refuses, tell the human the version is
+locked on purpose; don't try to unlock it yourself.
+
+---
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Guest replies empty | inline mode off in @BotFather | `/setinline` on the bot |
-| No log lines | bot can't post in `log_channel` | add it as admin / check the id |
-| Bot answers strangers as owner | `owner_id` wrong | numeric id, not username |
-| Plugin not loaded after restart | bad manifest | `hermes plugins list`, read the error |
-| Guests get the generic fallback | `persona_path` wrong | path must be absolute |
+| Plugin not listed, or listed as `not enabled` | install didn't finish, or enable was skipped | `hermes plugins install https://github.com/a2z05/TGAhermes --enable`, then `hermes plugins enable TGAhermes` |
+| `No plugin named 'TGAhermes'` | directory name and manifest name disagree | `hermes plugins list --plain --user`, use the name printed there |
+| `hermes: command not found` | CLI not on PATH | use `/opt/hermes/.venv/bin/hermes` |
+| Settings changes have no effect | looking at the wrong file | the path is `$HERMES_HOME/plugins/TGAhermes/settings.json` — read `$HERMES_HOME` from the environment |
+| Log channel silent | bot can't post there | add the bot as admin in that chat, then `!setlog here` again |
+| `!setlog here` echoed literally | build wants an id | use `!setlog <chat id>` |
+| Strangers answered as the owner | wrong `owner_id` | numeric telegram id, not a username: `!setowner <id>` |
+| `telegram_admin` tool unavailable | capability not granted | `hermes plugins enable TGAhermes --allow-tool-override` |
+| Health endpoint unreachable | gateway down | `hermes gateway restart`, then re-check `/health` |
+| Updates refused | locked via panel | human choice — report it, don't unlock |
+
+---
+
+## Ground rules
+
+- **Never print, ask for, or paste secrets.** No bot tokens, no API keys, no
+  passwords — not into the chat, not into logs, not into files you write.
+  If a token is needed, tell the human where to put it and let them do it.
+- **Never edit `config.yaml` by hand.** Use `hermes config set <key> <value>`
+  if a config change is genuinely needed; a stray indent can break the
+  running gateway.
+- **Don't touch anything outside `$HERMES_HOME/plugins/TGAhermes`.**
+- **Report honestly.** If a step didn't work, say which one and why.

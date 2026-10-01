@@ -1,4 +1,4 @@
-"""telegram-guest-mode — all-in-one Telegram guest mode, logging console and admin tools for Hermes.
+"""TGAhermes — all-in-one Telegram guest mode, logging console and admin tools for Hermes.
 
 Restores the Atropos guest-mode behavior on Hermes 0.21.5+ as a plugin (no core edits), plus:
 
@@ -162,7 +162,7 @@ def settings() -> Dict[str, Any]:
             if isinstance(loaded, dict):
                 data.update({k: v for k, v in loaded.items() if k in DEFAULT_SETTINGS})
     except Exception:
-        logger.exception("[telegram-guest-mode] settings read failed; using defaults")
+        logger.exception("[TGAhermes] settings read failed; using defaults")
     return data
 
 
@@ -183,7 +183,7 @@ def _load_state() -> Dict[str, Any]:
             if isinstance(loaded, dict):
                 return loaded
     except Exception:
-        logger.exception("[telegram-guest-mode] state read failed")
+        logger.exception("[TGAhermes] state read failed")
     return {}
 
 
@@ -278,7 +278,7 @@ def _guest_identity(chat_id: Any) -> Dict[str, Any]:
             name = str(e.get("name") or "")
             uname = str(e.get("username") or "")
     except Exception:
-        logger.debug("[telegram-guest-mode] guest identity lookup failed", exc_info=True)
+        logger.debug("[TGAhermes] guest identity lookup failed", exc_info=True)
     return {"id": uid, "name": name, "username": uname,
             "known": known, "chat": chat_key}
 
@@ -311,7 +311,7 @@ def _spawn(coro) -> None:
         try:
             await coro
         except Exception:
-            logger.debug("[telegram-guest-mode] background task failed", exc_info=True)
+            logger.debug("[TGAhermes] background task failed", exc_info=True)
 
     loop.create_task(_guarded())
 
@@ -326,7 +326,7 @@ async def _react(chat_id: Any, message_id: Any, emoji: str) -> bool:
             return False
         return bool(await fn(str(chat_id), str(message_id), emoji))
     except Exception:
-        logger.debug("[telegram-guest-mode] reaction failed", exc_info=True)
+        logger.debug("[TGAhermes] reaction failed", exc_info=True)
         return False
 
 
@@ -347,10 +347,10 @@ async def _answer_guest(adapter: Any, gqid: str, result) -> bool:
         return False
     try:
         await bot.answer_guest_query(guest_query_id=gqid, result=result)
-        logger.info("[telegram-guest-mode] answered guest query %s", gqid)
+        logger.info("[TGAhermes] answered guest query %s", gqid)
         return True
     except Exception as exc:
-        logger.warning("[telegram-guest-mode] answer_guest_query failed for %s: %s", gqid, exc)
+        logger.warning("[TGAhermes] answer_guest_query failed for %s: %s", gqid, exc)
         return False
 
 
@@ -395,7 +395,7 @@ async def _answer_guest_media(adapter: Any, gqid: str, kind: str, url: str,
         if result is not None and await _answer_guest(adapter, gqid, result):
             return True
     except Exception:
-        logger.debug("[telegram-guest-mode] media result build failed", exc_info=True)
+        logger.debug("[TGAhermes] media result build failed", exc_info=True)
     # Text fallback: keep the caption and the URL visible.
     fb = "\n".join(x for x in (cap, url) if x) or name or "📎 media"
     return await _answer_guest_text(adapter, gqid, fb)
@@ -418,7 +418,7 @@ async def _error_notice(origin_chat: Any, title: str, body: str) -> None:
             await bot.send_message(chat_id=chat, text=f"⚠️ {title}\n{_html_plain(body)}"[:4000])
             return
     except Exception:
-        logger.debug("[telegram-guest-mode] inline error notice failed", exc_info=True)
+        logger.debug("[TGAhermes] inline error notice failed", exc_info=True)
     await _log(title, body)
 
 
@@ -492,7 +492,7 @@ async def _log(title: str, body: str, buttons: Optional[list] = None) -> bool:
             reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
         return True
     except Exception:
-        logger.warning("[telegram-guest-mode] log channel post failed", exc_info=True)
+        logger.warning("[TGAhermes] log channel post failed", exc_info=True)
         return False
 
 
@@ -580,7 +580,7 @@ def _chat_display_name(adapter: Any, chat_id: Any) -> str:
             if uname:
                 return f"@{uname}"
     except Exception:
-        logger.debug("[telegram-guest-mode] chat name lookup failed for %s", chat_id)
+        logger.debug("[TGAhermes] chat name lookup failed for %s", chat_id)
     return str(chat_id)
 
 
@@ -669,7 +669,7 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
         if allowed:
             await _answer_guest_text(adapter, gqid, str(st.get("unauthorized_reply") or ""))
         else:
-            logger.info("[telegram-guest-mode] guest mention by %s suppressed by cooldown", user_id or "?")
+            logger.info("[TGAhermes] guest mention by %s suppressed by cooldown", user_id or "?")
         return
 
     try:
@@ -677,7 +677,7 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
         event = adapter._build_message_event(
             guest, MessageType.TEXT, update_id=getattr(update, "update_id", None))
     except Exception:
-        logger.exception("[telegram-guest-mode] failed to build guest event")
+        logger.exception("[TGAhermes] failed to build guest event")
         await _answer_guest_text(adapter, gqid, "\u26a0\ufe0f Something went wrong \u2014 please try again.")
         return
 
@@ -716,7 +716,7 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
         try:
             event.source.user_id = user_id
         except Exception:
-            logger.debug("[telegram-guest-mode] could not set source.user_id", exc_info=True)
+            logger.debug("[TGAhermes] could not set source.user_id", exc_info=True)
     if hasattr(event.source, "chat_name") and user_name:
         event.source.chat_name = user_name
     if hasattr(event.source, "user_name"):
@@ -753,7 +753,7 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
         _spawn(_react(md.get("guest_original_chat_id"), md.get("guest_message_id"),
                       st.get("react_emoji_receive") or "👀"))
     if getattr(adapter, "_message_handler", None) is None:
-        logger.warning("[telegram-guest-mode] guest summon received but no message handler installed")
+        logger.warning("[TGAhermes] guest summon received but no message handler installed")
         await _answer_guest_text(adapter, gqid, "")
         return
     await adapter.handle_message(event)
@@ -784,11 +784,11 @@ def _install_wraps(adapter: Any) -> None:
             try:
                 await adapter._release_turn_marker(event)
             except Exception:
-                logger.debug("[telegram-guest-mode] turn marker release failed", exc_info=True)
+                logger.debug("[TGAhermes] turn marker release failed", exc_info=True)
             if text_content and str(text_content).strip():
                 await _answer_guest_text(adapter, gqid, str(text_content))
             else:
-                logger.info("[telegram-guest-mode] empty final for guest query %s", gqid)
+                logger.info("[TGAhermes] empty final for guest query %s", gqid)
             return SendResult(success=True, message_id=None), adapter
         result, who = await _orig_sfl(event, session_key, text_content, metadata,
                                       reply_to=reply_to,
@@ -829,7 +829,7 @@ def _install_wraps(adapter: Any) -> None:
                 await _answer_guest_text(adapter, gqid, text)
             return SendResult(success=True, message_id=None)
         except Exception as e:
-            logger.warning("[telegram-guest-mode] guest clarify failed: %s", e)
+            logger.warning("[TGAhermes] guest clarify failed: %s", e)
             return SendResult(success=False, error=str(e))
 
     _orig_sc = adapter.send_clarify
@@ -850,7 +850,7 @@ def _install_wraps(adapter: Any) -> None:
                 await _answer_guest_text(adapter, gqid, str(text))
             return SendResult(success=True, message_id=None)
         except Exception as e:
-            logger.warning("[telegram-guest-mode] guest prompt %s failed: %s", what, e)
+            logger.warning("[TGAhermes] guest prompt %s failed: %s", what, e)
             return SendResult(success=False, error=str(e))
 
     _orig_sp = adapter._send_prompt
@@ -868,7 +868,7 @@ def _install_wraps(adapter: Any) -> None:
                     _spawn(_react(src.chat_id, src.message_id, st.get("react_emoji_error") or "❌"))
             return result
         # Guest-mode errors only (by design): log channel, else owner DM fallback.
-        logger.error("[telegram-guest-mode] guest turn failed: %s", e, exc_info=e)
+        logger.error("[TGAhermes] guest turn failed: %s", e, exc_info=e)
         guest_text = getattr(event, "text", "") or ""
         err = f"{type(e).__name__}: {e}"
         body = (f"{_user_block_id(md.get('guest_user_id'))}\n"
@@ -887,7 +887,7 @@ def _install_wraps(adapter: Any) -> None:
                               f"Query: `{guest_text[:120]}`\nError: `{err[:400]}`"),
                         parse_mode="Markdown")
             except Exception:
-                logger.exception("[telegram-guest-mode] owner error notice failed")
+                logger.exception("[TGAhermes] owner error notice failed")
         st = settings()
         key = "guest_error_reply_fa" if re.search(r"[\u0600-\u06FF]", guest_text) else "guest_error_reply_en"
         await _answer_guest_text(adapter, gqid, str(st.get(key) or ""))
@@ -950,7 +950,7 @@ def _install_wraps(adapter: Any) -> None:
     _wrap_media("send_document", "document", url_pos=1, name_pos=4)
     _wrap_media("send_voice", "voice", url_pos=1)
     _wrap_media("send_multiple_images", "photo", url_pos=1)
-    logger.info("[telegram-guest-mode] outbound wraps installed (v2)")
+    logger.info("[TGAhermes] outbound wraps installed (v2)")
 
 
 def _user_block_id(uid: Any) -> str:
@@ -1008,20 +1008,20 @@ def _write_allow_from(ids: List[str]) -> bool:
         import subprocess
         exe = shutil.which("hermes")
         if not exe:
-            logger.error("[telegram-guest-mode] hermes CLI not found; whitelist not saved")
+            logger.error("[TGAhermes] hermes CLI not found; whitelist not saved")
             return False
         env = dict(os.environ)
         env["HERMES_HOME"] = str(_hermes_home())
         proc = subprocess.run([exe, "config", "set", "telegram.extra.allow_from", csv],
                               capture_output=True, text=True, timeout=90, env=env)
         if proc.returncode != 0:
-            logger.error("[telegram-guest-mode] config set failed: %s",
+            logger.error("[TGAhermes] config set failed: %s",
                          (proc.stderr or proc.stdout or "")[:400])
             return False
         _nudge_gateway_reload()  # live adapters pick up the new allow_from now
         return True
     except Exception:
-        logger.exception("[telegram-guest-mode] whitelist write failed")
+        logger.exception("[TGAhermes] whitelist write failed")
         return False
 
 
@@ -1041,7 +1041,7 @@ def _nudge_gateway_reload() -> None:
         subprocess.Popen([sys.executable, "-c", code], env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
-        logger.debug("[telegram-guest-mode] reload nudge failed", exc_info=True)
+        logger.debug("[TGAhermes] reload nudge failed", exc_info=True)
 
 
 def _is_authorized_user(uid: str, owner: str = "") -> bool:
@@ -1072,7 +1072,7 @@ def _wipe_sessions(store: Any, chat: Any) -> Optional[int]:
             store.reset_session(k)
         return len(keys)
     except Exception:
-        logger.exception("[telegram-guest-mode] session wipe failed")
+        logger.exception("[TGAhermes] session wipe failed")
         return None
 
 
@@ -1093,11 +1093,14 @@ def _help_sections(st: Optional[Dict[str, Any]] = None) -> list:
     log_now = _esc(st.get("log_channel") or "off")
     return [
         ("status", "ℹ️ Status",
+         "<b>⚡ Actions</b> — guided flows (log here, whitelist, DM, wipe, updates)\n"
          "<code>!settings</code> — editable settings\n"
          "<code>!users</code> — who used the bot\n"
          "<code>!panel</code> — this glass-button panel (same as !help)"),
         ("log", "📡 Log",
-         f"now: <code>{log_now}</code>\n<code>!setlog &lt;id|@name|off&gt;</code>"),
+         f"now: <code>{log_now}</code>\n"
+         "<code>!setlog here</code> — send <i>inside</i> the chat you want to log\n"
+         "<code>!setlog &lt;id|@name|off&gt;</code>"),
         ("access", "🛡 Access",
          f"{len(wl)} whitelisted\n"
          "<code>!whitelist list</code>\n"
@@ -1293,9 +1296,11 @@ def _panel_text(st: Optional[Dict[str, Any]] = None, note: str = "") -> str:
         lines.append(note)
     lines += [
         "",
+        "<b>⚡ Actions</b> — tap it for guided flows (log here, whitelist, send DM, "
+        "wipe, updates): answer a prompt instead of typing a command.",
         "<b>Sections</b> — tap a button, or type a command:",
-        "<code>!panel</code> · <code>!help</code> · <code>!wipe &lt;chat_id&gt;</code> · "
-        "<code>!setlog &lt;id|off&gt;</code> · <code>!whitelist add &lt;id&gt;</code>",
+        "<code>!panel</code> · <code>!help</code> · <code>!setlog here</code> · "
+        "<code>!wipe &lt;chat_id&gt;</code> · <code>!whitelist add &lt;id&gt;</code>",
     ]
     return "\n".join(lines)
 
@@ -1308,6 +1313,33 @@ def _plugin_version() -> str:
         return "?"
     m = re.search(r"^version:\s*[\"\']?([^\s\"\']+)", text, re.M)
     return m.group(1) if m else "?"
+
+
+def _actions_view(st: Dict[str, Any], note: str = "") -> str:
+    """Body text for the Actions tab — the panel's command replacement."""
+    wl = _read_allow_from()
+    lines = [
+        "<b>⚡ Actions</b> — guided flows that replace typing commands",
+        f"📡 log: <code>{_esc(st.get('log_channel') or 'off')}</code> · "
+        f"🛡 whitelist: <b>{len(wl)}</b> · "
+        f"⏱ cooldown: <b>{_esc(st.get('unauthorized_cooldown_s'))}s</b>",
+        "",
+        "📍 <b>Log here</b> — start logging into THIS chat",
+        "🛡 <b>Whitelist</b> — add or remove a friend (id or @username)",
+        "📨 <b>Send a DM</b> — message someone as the bot",
+        "🧹 <b>Wipe a session</b> — give a chat a fresh start",
+        "⏱ <b>Cooldown</b> · 👾 <b>Stranger reply</b> — canned texts and delays",
+        "🛡 <b>Guest tool gate</b> · 🔧 <b>System + updates</b>",
+        "",
+        "Tap a button, answer the prompt, done. Every flow runs the same code "
+        "as its command twin (<code>!setlog</code>, <code>!whitelist</code>, "
+        "<code>!wipe</code>, <code>!send</code>, <code>!setcooldown</code>, "
+        "<code>!setunauthorized</code>), so the buttons and the commands can "
+        "never drift apart.",
+    ]
+    if note:
+        lines.insert(1, note)
+    return "\n".join(lines)
 
 
 def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
@@ -1326,11 +1358,11 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
             rows.append([B(lbl, callback_data=f"{_CB_PREFIX}{path}") for lbl, path in pairs])
 
     if view == "panel":
-        add(("\u2139\ufe0f Status", "help:status"), ("\U0001f4e1 Log", "help:log"),
-            ("\U0001f6e1 Access", "help:access"))
-        add(("\U0001f9f9 Sessions", "help:sessions"), ("\U0001f47e Guests", "help:guests"),
-            ("\U0001f916 Bot", "help:bot"))
-        add(("\U0001f527 System", "help:system"))
+        add(("⚡ Actions — do things", "panel:actions"))
+        add(("\U0001f4e1 Log", "help:log"),
+            ("\U0001f6e1 Access", "help:access"), ("\U0001f9f9 Sessions", "help:sessions"))
+        add(("\U0001f47e Guests", "help:guests"), ("\U0001f916 Bot", "help:bot"),
+            ("\U0001f527 System", "help:system"))
         add(("\U0001f4dc Full help", "help:full"))
         add((f"\U0001f501 Reactions {_mark('auto_react')}", "panel:toggle:react"),
             (f"\U0001f465 Guest reacts {_mark('react_guests')}", "panel:toggle:greact"),
@@ -1340,10 +1372,22 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
             (f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:toggle:tool"))
         add((f"\U0001f4ac WL msgs {_mark('log_whitelisted_messages')}", "panel:toggle:wmsgs"),
             (f"\U0001f5e8 Other msgs {_mark('log_other_messages')}", "panel:toggle:omsgs"))
-        add(("\U0001f4cb Users", "panel:out:users"), ("\u2699\ufe0f Settings", "panel:out:settings"),
+        add(("\U0001f4cb Users", "panel:out:users"), ("⚙️ Settings", "panel:out:settings"),
             ("\U0001f6e1 Whitelist", "panel:out:whitelist"))
         add(("\U0001f47b Guest texts", "panel:out:guests"),
-            (f"\u23f1 Cooldown {st.get('unauthorized_cooldown_s')}s", "panel:cool"))
+            (f"⏱ Cooldown {st.get('unauthorized_cooldown_s')}s", "panel:cool"))
+    elif view == "actions":
+        add(("\U0001f4e1 Log here — log into THIS chat", "panel:sethere"))
+        add(("\U0001f6e1 Whitelist add", "panel:wiz:wladd"),
+            ("\U0001f6e1 Whitelist remove", "panel:wiz:wldel"))
+        add(("\U0001f4cb Send a DM as the bot", "panel:wiz:send"))
+        add(("\U0001f9f9 Wipe a session", "panel:wiz:wipe"))
+        add(("\u23f1 Cooldown", "panel:cool"))
+        add(("\U0001f47b Stranger reply text", "panel:wiz:unauth"))
+        add(("\U0001f6e0 Guest tool gate", "panel:gate"))
+        add(("\U0001f527 System + updates", "help:system"))
+    elif view == "wiz":
+        add(("\u2716 Cancel the wizard", "panel:wizcancel"))
     elif view == "status":
         add(("\u2699\ufe0f Settings", "panel:out:settings"), ("\U0001f4cb Users", "panel:out:users"))
         add((f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:toggle:tool"),
@@ -1384,8 +1428,9 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         if st.get("update_enabled", True):
             add(("🔍 Check for update", "panel:upd:check"))
             add(("⬆️ Install update", "panel:upd:apply"))
+            add(("🔓 Updates on — tap to lock", "panel:upd:lock"))
         else:
-            add(("🔒 Updates locked", "panel:upd:check"))
+            add(("🔒 Updates locked — tap to unlock", "panel:upd:lock"))
         add((f"v{_plugin_version()}", "panel:upd:check"))
     elif view == "out":
         add(("\U0001f4cb Users", "panel:out:users"), ("\u2699\ufe0f Settings", "panel:out:settings"),
@@ -1411,7 +1456,8 @@ _MODE_LABEL = {"strict": "🔒 strict", "balanced": "⚖️ balanced", "open": "
 _VIEW_LABEL = {"full": "📜 Full help", "panel": "🧩 Console", "out": "📋 Output",
                "status": "ℹ️ Status", "log": "📡 Log", "access": "🛡 Access",
                "sessions": "🧹 Sessions", "bot": "🤖 Bot", "guests": "👾 Guests",
-               "cool": "⏱ Cooldown", "system": "🔧 System"}
+               "cool": "⏱ Cooldown", "system": "🔧 System",
+               "actions": "⚡ Actions", "wiz": "📝 Wizard"}
 
 
 def _msg_chat_id(msg: Any) -> Optional[str]:
@@ -1446,7 +1492,7 @@ async def _panel_edit(q: Any, body: str, view: str, st: Dict[str, Any]) -> str:
     except Exception as e:
         if "not modified" in str(e).lower():
             return "same"
-        logger.warning("[telegram-guest-mode] panel edit failed (%s): %s",
+        logger.warning("[TGAhermes] panel edit failed (%s): %s",
                        type(msg).__name__, e, exc_info=True)
         return "failed"
 
@@ -1467,12 +1513,12 @@ async def _reply_to_event(adapter: Any, chat_id: Any, text: str, buttons: Option
                                    reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
             return
         except Exception:
-            logger.debug("[telegram-guest-mode] HTML console reply failed; plain fallback",
+            logger.debug("[TGAhermes] HTML console reply failed; plain fallback",
                          exc_info=True)
     try:
         await adapter.send(cid, _html_plain(text))
     except Exception:
-        logger.warning("[telegram-guest-mode] console reply failed", exc_info=True)
+        logger.warning("[TGAhermes] console reply failed", exc_info=True)
 
 
 async def _whitelist_cmd(adapter: Any, arg: str) -> str:
@@ -1551,7 +1597,19 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
             reply = "Usage: <code>!send &lt;user_id&gt; &lt;text&gt;</code>"
     elif cmd == "!setlog":
         val = arg.strip()
-        if val.lower() in ("off", "none", "-"):
+        low = val.lower()
+        if low in ("here", "this", "now", "."):
+            # The point of `here`: send it inside the chat you want to log —
+            # no id to copy, no risk of typos. Works from any group/channel.
+            if str(chat_id).startswith(GUEST_CHAT_PREFIX):
+                reply = ("This is a guest chat — Telegram hides who sent it. "
+                         "Send <code>!setlog here</code> inside the real channel or group instead.")
+            else:
+                save_settings({"log_channel": str(chat_id)})
+                reply = f"Log channel → <code>{_esc(str(chat_id))}</code> <i>(this chat)</i>"
+                await _log("🧭 Log channel configured",
+                           "Log channel set — guest-mode activity will be posted here.")
+        elif low in ("off", "none", "-"):
             save_settings({"log_channel": None})
             reply = "Log channel cleared."
         elif val:
@@ -1670,6 +1728,92 @@ async def _run_bang_command(adapter: Any, event: Any, text: str,
         await _log(f"🖥 Bang command {cmd}", f"From <code>{_esc(chat_id)}</code> → executed")
 
 
+# ---------------------------------------------------------------- panel wizards (Actions)
+
+# One open wizard per chat: {"flow": name, "data": [typed answers]}.
+# The panel starts a flow with a button; the owner types the answers as normal
+# messages; the flow finishes by running the SAME bang command the panel
+# replaces — so button and command can never drift apart.
+_WIZARD: Dict[str, Dict[str, Any]] = {}
+
+_WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
+    "wladd": {
+        "prompts": ["🛡 <b>Add to whitelist</b>\n\nSend the user id (or @username).\n"
+                    "<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!whitelist add {d[0]}"},
+    "wldel": {
+        "prompts": ["🛡 <b>Remove from whitelist</b>\n\nSend the user id (or @username).\n"
+                    "<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!whitelist remove {d[0]}"},
+    "owner": {
+        "prompts": ["👑 <b>Set owner id</b>\n\nSend your Telegram user id (numeric).\n"
+                    "<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!setowner {d[0]}"},
+    "wipe": {
+        "prompts": ["🧹 <b>Wipe a session</b>\n\nSend the chat id whose conversation "
+                    "should start fresh.\n<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!wipe {d[0]}"},
+    "cooldown": {
+        "prompts": ["⏱ <b>Cooldown</b>\n\nSend the seconds a stranger waits before the "
+                    "canned reply may repeat.\n<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!setcooldown {d[0]}"},
+    "unauth": {
+        "prompts": ["👾 <b>Stranger reply</b>\n\nSend the exact text a stranger gets as "
+                    "the canned reply.\n<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!setunauthorized {d[0]}"},
+    "send": {
+        "prompts": ["📨 <b>Send a DM as the bot</b>\n\nStep 1/2 — send the user id.\n"
+                    "<i>Type cancel to abort.</i>",
+                    "📨 <b>Send a DM as the bot</b>\n\nStep 2/2 — send the message text."],
+        "build": lambda d: f"!send {d[0]} {d[1]}"},
+}
+
+
+def _wizard_start(chat_id: Any, flow: str) -> Optional[str]:
+    """Open a wizard in this chat; returns the first prompt, or None."""
+    f = _WIZ_FLOWS.get(flow)
+    if not f:
+        return None
+    _WIZARD[str(chat_id)] = {"flow": flow, "data": []}
+    return f["prompts"][0]
+
+
+def _wizard_cancel(chat_id: Any) -> None:
+    _WIZARD.pop(str(chat_id), None)
+
+
+async def _wizard_feed(adapter: Any, chat_id: Any, text: str,
+                       session_store: Any = None) -> Optional[str]:
+    """Feed one owner message to the open wizard.
+
+    Returns the reply to send, or None when no wizard is open in this chat.
+    The flow is cleared before its final command runs, so one message
+    completes exactly one step.
+    """
+    key = str(chat_id)
+    w = _WIZARD.get(key)
+    if not w:
+        return None
+    f = _WIZ_FLOWS.get(str(w.get("flow") or ""))
+    if not f:
+        _WIZARD.pop(key, None)
+        return None
+    if text.strip().lower() in ("cancel", "/cancel", "!cancel", "stop"):
+        _WIZARD.pop(key, None)
+        return "✖ cancelled."
+    w["data"].append(text.strip()[:4000])
+    if len(w["data"]) < len(f["prompts"]):
+        return f["prompts"][len(w["data"])]
+    _WIZARD.pop(key, None)
+    try:
+        out = await _bang_execute(adapter, key, f["build"](w["data"]),
+                                  session_store=session_store)
+    except Exception:
+        logger.exception("[TGAhermes] wizard command failed")
+        return "❌ the wizard failed — check the gateway log."
+    return out or "✅ done."
+
+
 # ---------------------------------------------------------------- pre_gateway_dispatch hook
 
 def _live_adapter(gateway: Any) -> Any:
@@ -1714,19 +1858,33 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
         uid = str(src.user_id or "")
         owner = _owner_id(ad)
 
-        # Bang console: owner, in the log channel or their own DM.
+        # Bang console: owner, in the log channel or their own DM — plus
+        # `!setlog …` from ANY group/channel they are in, so `!setlog here`
+        # works from inside the chat they want to log (its id is the message's).
         in_log = st.get("log_channel") and chat == str(st["log_channel"])
         in_owner_dm = owner and chat == owner and (src.chat_type or "") == "dm"
-        if text.startswith("!") and owner and uid == owner and (in_log or in_owner_dm):
+        in_group = (src.chat_type or "") in ("group", "supergroup", "forum", "channel")
+        setlog_here = in_group and text.lower().startswith("!setlog")
+        if text.startswith("!") and owner and uid == owner and (in_log or in_owner_dm or setlog_here):
+            _WIZARD.pop(chat, None)  # a real command abandons any open wizard step
             await _run_bang_command(ad, event, text, session_store=session_store)
-            return {"action": "skip", "reason": "telegram-guest-mode bang command"}
+            return {"action": "skip", "reason": "TGAhermes bang command"}
+
+        # Panel wizard input: the owner answering a step the panel is waiting on.
+        if owner and uid == owner and text and not text.startswith("!") and chat in _WIZARD:
+            out = await _wizard_feed(ad, chat, text, session_store=session_store)
+            if out is not None:
+                await _reply_to_event(ad, chat, out,
+                                      buttons=_help_keyboard("wiz", st, chat_id=chat)
+                                      if chat in _WIZARD else None)
+                return {"action": "skip", "reason": "TGAhermes wizard input"}
 
         # Tell the model where this turn came from (DM vs group vs channel, which
         # chat, whose message). Nothing else in the stack provides it.
         try:
             event.channel_prompt = _origin_identity_block(ad, src)
         except Exception:
-            logger.exception("[telegram-guest-mode] channel origin block failed")
+            logger.exception("[TGAhermes] channel origin block failed")
 
         is_owner_dm = owner and chat == owner and (src.chat_type or "") == "dm"
         if is_owner_dm:
@@ -1773,7 +1931,7 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
                         buttons=_profile_buttons(user_obj, chat, src.message_id))
         return None
     except Exception as e:
-        logger.exception("[telegram-guest-mode] pre_gateway_dispatch failed")
+        logger.exception("[TGAhermes] pre_gateway_dispatch failed")
         if chat_for_error:
             await _error_notice(chat_for_error, "plugin error",
                                 f"<code>{_esc(type(e).__name__)}: {_esc(str(e)[:300])}</code>")
@@ -1794,7 +1952,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             return
         ad = _ADAPTER.get("adapter")
         bot = getattr(ad, "_bot", None) if ad else None
-        logger.info("[telegram-guest-mode] callback %s msg=%s", data,
+        logger.info("[TGAhermes] callback %s msg=%s", data,
                     type(getattr(q, "message", None)).__name__)
         if bot is None:
             await q.answer("Bot not connected.", show_alert=True)
@@ -1888,7 +2046,17 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             elif action == "upd":
                 # Runs git + the test suite, so hand control back to the user
                 # with a "working" toast before it blocks.
-                if sub == "apply":
+                report = None
+                if sub == "lock":
+                    on = not bool(st.get("update_enabled", True))
+                    save_settings({"update_enabled": on})
+                    st = settings()
+                    note = ("🔓 updates unlocked — check/install re-enabled" if on
+                            else "🔒 updates locked — check, install and the "
+                                 "selfupdate tool now refuse")
+                    await _log("🔧 Updates",
+                               f"Updates {'unlocked' if on else 'locked'} by owner")
+                elif sub == "apply":
                     await q.answer("⬆️ updating… this takes a minute", show_alert=False)
                     report = await _run_selfupdate(apply=True, force=False)
                     note = _update_note(report)
@@ -1898,12 +2066,33 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     note = _update_note(report)
                 st = settings()
                 view = "system"
-                body = _system_view(st) + f"\n\n{_update_note(report)}"
+                body = _system_view(st) + (f"\n\n{_update_note(report)}" if report else "")
             elif action == "logoff" and st.get("log_channel"):
                 prev = st.get("log_channel")
                 save_settings({"log_channel": None})
                 st = settings()
                 note = f"\U0001f4e1 log \u2192 <b>off</b> (was <code>{_esc(prev)}</code>)"
+            elif action == "actions":
+                view, body = "actions", _actions_view(st)
+            elif action == "sethere":
+                view = "actions"
+                cid = _msg_chat_id(q.message) or ""
+                if not cid or str(cid).startswith(GUEST_CHAT_PREFIX):
+                    note = ("❌ open the panel inside the chat you want to log, "
+                            "then tap Log here")
+                    body = _actions_view(st, note)
+                else:
+                    save_settings({"log_channel": str(cid)})
+                    st = settings()
+                    await _log("🧭 Log channel configured",
+                               "Log channel set — guest-mode activity will be posted here.")
+                    body = _actions_view(st, f"✅ now logging into <code>{_esc(cid)}</code>")
+            elif action == "wizcancel":
+                _wizard_cancel(_msg_chat_id(q.message) or "")
+                view, body = "actions", _actions_view(st, "✖ wizard cancelled")
+            elif action == "wiz" and sub in _WIZ_FLOWS:
+                prompt = _wizard_start(_msg_chat_id(q.message) or "", sub)
+                view, body = "wiz", (prompt or "❌ unknown flow")
             elif action == "out":
                 if sub == "guests":
                     view, body = "out", _help_view("guests", st)
@@ -2004,7 +2193,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             return
         await q.answer()
     except Exception:
-        logger.exception("[telegram-guest-mode] callback failed")
+        logger.exception("[TGAhermes] callback failed")
         try:
             await q.answer("Error.")
         except Exception:
@@ -2029,7 +2218,7 @@ async def _on_private_text(adapter: Any, update: Any, context: Any = None) -> No
             else:
                 await adapter._handle_text_message(update, context)
         except Exception:
-            logger.exception("[telegram-guest-mode] owner delegation failed")
+            logger.exception("[TGAhermes] owner delegation failed")
         return
     st = settings()
     allowed = _canned_allowed(user)
@@ -2045,7 +2234,7 @@ async def _on_private_text(adapter: Any, update: Any, context: Any = None) -> No
             try:
                 await adapter._bot.send_message(chat_id=msg.chat.id, text=reply[:4000])
             except Exception:
-                logger.warning("[telegram-guest-mode] stranger canned reply failed", exc_info=True)
+                logger.warning("[TGAhermes] stranger canned reply failed", exc_info=True)
 
 
 # ---------------------------------------------------------------- telegram_admin tool
@@ -2171,6 +2360,29 @@ _GUEST_DANGER_ARG_RE = re.compile(
     re.I,
 )
 
+# Path-level tripwire for the path-bearing file tools. Two classes:
+#   * secrets — reading them pastes credentials into a guest chat (the leak);
+#   * execution — writing hooks/, scripts/ or cron/ runs code with the
+#     owner's rights, and those jobs fire every minute on their own.
+# SOUL/AGENTS/settings/state carry identity, config and the user registry.
+# Only the path ARGUMENTS of read_file/write_file/patch are matched, so
+# prose that happens to mention "config.yaml" is not collateral damage —
+# and owner sessions never reach this check (exempted above).
+_GUEST_PATH_TOOLS = frozenset({"read_file", "write_file", "patch"})
+_GUEST_FORBIDDEN_PATH_RE = re.compile(
+    r"config\.ya?ml"                       # gateway config: bot token, provider keys
+    r"|\.github_\w*token"                  # git tokens lying in the home dir
+    r"|\.env\b"                            # dotenv secrets
+    r"|\.ssh/"                             # ssh keys / authorized_keys
+    r"|id_rsa"                             # raw keys anywhere
+    r"|identity\.md"                       # alt-persona file carrying real passwords
+    r"|/(hooks|scripts|cron|logs|memories|backups?)/"  # execution paths + private state
+    r"|SOUL\.md|AGENTS\.md"                # identity / persona
+    r"|settings\.json|state\.(db|json)"    # plugin config + user registry
+    r"|\.9router",                         # router data dir (credentials)
+    re.I,
+)
+
 
 def _session_row(session_id: Any) -> Optional[Tuple[str, str]]:
     if not session_id:
@@ -2184,7 +2396,7 @@ def _session_row(session_id: Any) -> Optional[Tuple[str, str]]:
         finally:
             con.close()
     except Exception:
-        logger.exception("[telegram-guest-mode] session DB lookup failed")
+        logger.exception("[TGAhermes] session DB lookup failed")
         return None
     if not row:
         return None
@@ -2211,7 +2423,7 @@ def _current_guest_chat() -> Optional[str]:
         finally:
             con.close()
     except Exception:
-        logger.debug("[telegram-guest-mode] current guest chat lookup failed", exc_info=True)
+        logger.debug("[TGAhermes] current guest chat lookup failed", exc_info=True)
         return None
     return str(row[0]) if row and row[0] else None
 
@@ -2304,6 +2516,9 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
         return None
     denied = _guest_allowed(frozenset())
     danger = name in denied
+    if not danger and name in _GUEST_PATH_TOOLS and isinstance(args, dict):
+        blob = " ".join(str(args.get(k, "")) for k in ("path", "file_path", "file"))
+        danger = bool(blob.strip() and _GUEST_FORBIDDEN_PATH_RE.search(blob))
     if not danger and args is not None:
         try:
             danger = bool(_GUEST_DANGER_ARG_RE.search(json.dumps(args, ensure_ascii=False, default=str)))
@@ -2324,7 +2539,7 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
             if now - last > _GUEST_BLOCK_TTL and k != turn_key:
                 _GUEST_BLOCK_COUNTS.pop(k, None)
                 _GUEST_BLOCK_LAST.pop(k, None)
-    logger.warning("[telegram-guest-mode] guest tool refused: %s (guest_is_owner=%s, block#%d)",
+    logger.warning("[TGAhermes] guest tool refused: %s (guest_is_owner=%s, block#%d)",
                    name, info.get("is_owner"), count)
     return {"action": "block", "message": _guest_refusal(name, info, repeats=count - 1)}
 
@@ -2349,7 +2564,7 @@ def _on_post_tool_call(tool_name: str = "", session_id: Any = None, **_) -> None
     try:
         _guest_turn_expired(session_id)
     except Exception:
-        logger.debug("[telegram-guest-mode] block-counter expiry failed", exc_info=True)
+        logger.debug("[TGAhermes] block-counter expiry failed", exc_info=True)
     return None
 
 
@@ -2368,7 +2583,10 @@ def _update_settings() -> Dict[str, Any]:
     st = settings()
     try:
         from hermes_cli.config import load_config_readonly
-        home = Path(load_config_readonly().get("home") or "/host/home")
+        # Never a host literal: config home -> env -> this install's own root.
+        home = Path(load_config_readonly().get("home")
+                    or os.environ.get("HERMES_HOME")
+                    or PLUGIN_DIR.parent.parent)
     except Exception:
         home = PLUGIN_DIR.parent.parent
     repo = str(st.get("update_repo") or "").strip() or _plugin_origin() or DEFAULT_UPDATE_REPO
@@ -2552,7 +2770,7 @@ def _make_factory():
         try:
             _install_wraps(adapter)
         except Exception:
-            logger.exception("[telegram-guest-mode] outbound wrap install failed")
+            logger.exception("[TGAhermes] outbound wrap install failed")
         if native is None:
             return
         try:
@@ -2575,9 +2793,9 @@ def _make_factory():
             async def _cb(update, context):
                 await _on_callback(update, context)
             native.add_handler(CallbackQueryHandler(_cb, pattern=r"^tgm:"))
-            logger.info("[telegram-guest-mode] v2 handlers registered (guest/private/callback)")
+            logger.info("[TGAhermes] v2 handlers registered (guest/private/callback)")
         except Exception:
-            logger.exception("[telegram-guest-mode] registration failed")
+            logger.exception("[TGAhermes] registration failed")
 
     return factory
 
@@ -2601,6 +2819,6 @@ def register(ctx) -> None:
                           description=_TOOL_DESCRIPTION, emoji="\U0001f6e1️", is_async=True,
                           check_fn=_tool_check)
         ctx.register_telegram_handler(_make_factory())
-        logger.info("[telegram-guest-mode] v2 active (hook + tool + PTB factory)")
+        logger.info("[TGAhermes] v2 active (hook + tool + PTB factory)")
     except Exception:
-        logger.exception("[telegram-guest-mode] register failed")
+        logger.exception("[TGAhermes] register failed")

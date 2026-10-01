@@ -36,7 +36,7 @@ PY=$(find_python)
 
 # Only these files are copied. settings.json, state.json and anything learned
 # at runtime are never touched: an update must not reset the owner's config.
-FILES=(__init__.py selfupdate.py plugin.yaml README.md settings.example.json)
+FILES=(__init__.py selfupdate.py plugin.yaml README.md AGENT.md settings.example.json)
 DIRS=(tests scripts assets)
 
 # Never copy the identity file that holds the owner's real ids: it stays
@@ -52,7 +52,7 @@ reload() {
   fi
   echo "--- hot reload ---"
   "$PY" "$RELOAD" 2>&1 | grep -o "'reloaded': [A-Za-z]*" | head -1
-  "$PY" "$RELOAD" 2>&1 | grep -o "'hooks': \[[^]]*\]" | grep -o "'telegram-guest-mode'.*" || true
+  "$PY" "$RELOAD" 2>&1 | grep -o "'hooks': \[[^]]*\]" | grep -o "'TGAhermes'.*" || true
 }
 
 drift() {

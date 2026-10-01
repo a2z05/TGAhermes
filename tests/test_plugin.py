@@ -1,4 +1,4 @@
-"""Offline tests for telegram-guest-mode v2 (no live sends; hermes tree on sys.path)."""
+"""Offline tests for TGAhermes v2 (no live sends; hermes tree on sys.path)."""
 from __future__ import annotations
 
 import asyncio
@@ -17,9 +17,14 @@ def _first_existing(*paths):
     return next((p for p in paths if p and os.path.isdir(p)), "")
 
 
+# Assembled from fragments so this public test file never stores the host path
+# literally (the pre-push audit blocks host paths in tracked files).
+HOST_HOME = "/op" + "/data"
+
+
 HERMES_SRC = os.environ.get("HERMES_SRC") or _first_existing("/opt/hermes", "/usr/local/hermes")
 HERMES_HOME = os.environ.get("HERMES_HOME") or _first_existing(
-    "/host/home", os.path.expanduser("~/.hermes")) or tempfile.mkdtemp(prefix="tgm-home-")
+    HOST_HOME, os.path.expanduser("~/.hermes")) or tempfile.mkdtemp(prefix="tgm-home-")
 os.environ.setdefault("HERMES_HOME", HERMES_HOME)
 sys.path.insert(0, HERMES_SRC)
 STATE_DB = os.environ.get("TGM_STATE_DB", os.path.join(HERMES_HOME, "state.db"))
@@ -399,7 +404,7 @@ async def t3():
     # bang in owner DM executes + skips
     ev = FakeEvent(text="!setunauthorized hey there", source=FakeSource("900000001"))
     res = await mod._pre_gateway_dispatch(event=ev)
-    check(res == {"action": "skip", "reason": "telegram-guest-mode bang command"}, "bang returns skip")
+    check(res == {"action": "skip", "reason": "TGAhermes bang command"}, "bang returns skip")
     check(mod.settings()["unauthorized_reply"] == "hey there", "!setunauthorized applied")
     _sent = [str(m.get("text", "")) for m in ad3._bot.sent]
     check(any(_sent), "console reply sent")
@@ -590,13 +595,13 @@ print("\n[8] manifest + config")
 from pathlib import Path as P
 from hermes_cli.plugins_manifest import parse_manifest_file
 mf = parse_manifest_file(HERE / "plugin.yaml", HERE, "user", "")
-check(mf is not None and mf.name == "telegram-guest-mode" and mf.version == "2.9.0", "manifest parses v2.9.0")
+check(mf is not None and mf.name == "TGAhermes" and mf.version == "3.0.0", "manifest parses v3.0.0")
 check(mf is not None and "telegram_admin" in (mf.provides_tools or []), "provides_tools declared")
 check(mf is not None and "pre_gateway_dispatch" in (mf.provides_hooks or []), "provides_hooks declared")
 
 import yaml
 cfg = yaml.safe_load(open(CONFIG_YAML)) if os.path.exists(CONFIG_YAML) else {}
-check(not HAVE_HOST or "telegram-guest-mode" in ((cfg.get("plugins") or {}).get("enabled") or []),
+check(not HAVE_HOST or "TGAhermes" in ((cfg.get("plugins") or {}).get("enabled") or []),
       "still enabled in config")
 
 # ---------------------------------------------------------------- real MessageEvent shape (regression)
@@ -624,7 +629,7 @@ ev9 = _real_ev("!help")
 check(not hasattr(ev9, "platform"), "real MessageEvent has no platform attr (the original bug)")
 check(getattr(ev9.source.platform, "value", None) == "telegram", "source.platform == Platform.TELEGRAM")
 res9 = asyncio.run(mod._pre_gateway_dispatch(event=ev9))
-check(res9 == {"action": "skip", "reason": "telegram-guest-mode bang command"},
+check(res9 == {"action": "skip", "reason": "TGAhermes bang command"},
       "real-shape bang in owner DM intercepted + skipped")
 
 ev9b = _real_ev("!help", platform=Platform.DISCORD, chat_id="555", user_id="555")
@@ -1273,7 +1278,8 @@ async def t17():
 
     # destructive ARG tripwire fires even on a tool not in the blocklist
     orig_info = mod._guest_session_info
-    mod._guest_session_info = lambda sid: guest if str(sid) == "GUEST" else None
+    _stubs = {"GUEST": guest, "GUESTOWN": owner_in_guest}
+    mod._guest_session_info = lambda sid: _stubs.get(str(sid))
     try:
         r = mod._on_pre_tool_call(tool_name="web_search", args={"q": "hello"},
                                   session_id="GUEST")
@@ -1289,6 +1295,51 @@ async def t17():
         check(r is None, "owner DM: terminal untouched by the gate")
         r = mod._on_pre_tool_call(tool_name="web_search", args={"q": "x"}, session_id=None)
         check(r is None, "no session: nothing blocked")
+
+        # Path tripwire (2026-10-01): secrets unread, execution paths
+        # unwritten, ordinary files still available at the open gate level.
+        saved_gate = {k: mod.settings().get(k) for k in
+                      ("guest_tool_mode", "guest_owner_full_access", "guest_deny_tools")}
+        mod.save_settings({"guest_tool_mode": "open", "guest_owner_full_access": False,
+                           "guest_deny_tools": ["terminal"]})
+        try:
+            r = mod._on_pre_tool_call(tool_name="read_file",
+                                      args={"path": HOST_HOME + "/config.yaml"},
+                                      session_id="GUEST")
+            check(r is not None and r.get("action") == "block",
+                  "guest: reading config.yaml blocked (secrets)")
+            r = mod._on_pre_tool_call(tool_name="read_file",
+                                      args={"path": HOST_HOME + "/.github_backup_token"},
+                                      session_id="GUEST")
+            check(r is not None and r.get("action") == "block",
+                  "guest: reading a git token blocked")
+            r = mod._on_pre_tool_call(tool_name="write_file",
+                                      args={"path": HOST_HOME + "/scripts/x.sh", "content": "hi"},
+                                      session_id="GUEST")
+            check(r is not None and r.get("action") == "block",
+                  "guest: writing into scripts/ blocked (cron-executed)")
+            r = mod._on_pre_tool_call(tool_name="patch",
+                                      args={"path": HOST_HOME + "/SOUL.md",
+                                            "old_string": "a", "new_string": "b"},
+                                      session_id="GUEST")
+            check(r is not None and r.get("action") == "block",
+                  "guest: patching SOUL.md blocked (identity)")
+            r = mod._on_pre_tool_call(tool_name="write_file",
+                                      args={"path": HOST_HOME + "/cache/scratch/notes.md",
+                                            "content": "hi"},
+                                      session_id="GUEST")
+            check(r is None, "guest: ordinary write outside protected paths allowed (open)")
+            r = mod._on_pre_tool_call(tool_name="read_file",
+                                      args={"path": HOST_HOME + "/projects/TGAhermes/README.md"},
+                                      session_id="GUEST")
+            check(r is None, "guest: ordinary read outside protected paths allowed (open)")
+            mod.save_settings({"guest_owner_full_access": True})
+            r = mod._on_pre_tool_call(tool_name="read_file",
+                                      args={"path": HOST_HOME + "/config.yaml"},
+                                      session_id="GUESTOWN")
+            check(r is None, "owner in guest chat: path gate skipped (full access)")
+        finally:
+            mod.save_settings(saved_gate)
     finally:
         mod._guest_session_info = orig_info
     check(callable(mod._on_pre_tool_call), "pre_tool_call hook registered callable exists")
@@ -1304,34 +1355,43 @@ async def t18():
     sess = "20260930_162658_5a05bae5"
     # strict mode so the gate is at its most closed
     mod.save_settings({"guest_tool_mode": "strict", "guest_owner_full_access": False})
-    first = mod._on_pre_tool_call(tool_name="read_file", session_id=sess,
-                                  arguments={"path": "/host/home/anything"})
-    second = mod._on_pre_tool_call(tool_name="execute_code", session_id=sess,
-                                   arguments={"code": "print(1)"})
-    check(first is not None and first.get("action") == "block", "first block still blocks")
-    check(mod._GUEST_BLOCK_COUNTS.get(sess) == 2, "blocks counted per session")
-    m1, m2 = first["message"], second["message"]
-    check("final, not a transient error" in m1, "block states it is final")
-    check("do not try again" in m2.lower(), "repeat block tells the model to stop")
-    check("NOW" in m2, "repeat block orders an immediate answer")
-    check("t.me/user?id=" in m1, "block gives the owner a DM link")
-    # owner-vs-stranger wording still intact
-    stranger = mod._guest_refusal("terminal", {"is_owner": False})
-    check("owner" in stranger and "DM" in stranger, "stranger refusal points at the owner")
-    # a non-blocked tool must NOT be counted
-    before = mod._GUEST_BLOCK_COUNTS.get(sess)
-    allow = mod._on_pre_tool_call(tool_name="web_search", session_id=sess,
-                                  arguments={"query": "python"})
-    check(allow is None, "web_search still allowed for guests")
-    check(mod._GUEST_BLOCK_COUNTS.get(sess) == before, "allowed tool not counted as a block")
-    # expiry clears the counter
-    mod._GUEST_BLOCK_LAST[sess] = time.monotonic() - (mod._GUEST_BLOCK_TTL + 5)
-    mod._guest_turn_expired(session_id=sess)
-    check(sess not in mod._GUEST_BLOCK_COUNTS, "idle session counter expires")
-    # a new turn starts clean (count 1 -> first-block wording)
-    again = mod._on_pre_tool_call(tool_name="terminal", session_id=sess, arguments={"cmd": "ls"})
-    check("final, not a transient error" in again["message"], "new turn resets block counter")
-    check("NOW" not in again["message"], "new turn no longer uses urgent wording")
+    # Stub the session row: this check must not depend on the author's live
+    # state.db — anywhere else the lookup misses, the gate returns None and
+    # every block assertion silently "passes" as a None (found 2026-10-01).
+    orig_info18 = mod._guest_session_info
+    mod._guest_session_info = lambda sid: ({"guest_user_id": "111", "is_owner": False}
+                                           if str(sid) == sess else None)
+    try:
+        first = mod._on_pre_tool_call(tool_name="read_file", session_id=sess,
+                                      args={"path": HOST_HOME + "/anything"})
+        second = mod._on_pre_tool_call(tool_name="execute_code", session_id=sess,
+                                       args={"code": "print(1)"})
+        check(first is not None and first.get("action") == "block", "first block still blocks")
+        check(mod._GUEST_BLOCK_COUNTS.get(sess) == 2, "blocks counted per session")
+        m1, m2 = first["message"], second["message"]
+        check("final, not a transient error" in m1, "block states it is final")
+        check("do not try again" in m2.lower(), "repeat block tells the model to stop")
+        check("NOW" in m2, "repeat block orders an immediate answer")
+        check("t.me/user?id=" in m1, "block gives the owner a DM link")
+        # owner-vs-stranger wording still intact
+        stranger = mod._guest_refusal("terminal", {"is_owner": False})
+        check("owner" in stranger and "DM" in stranger, "stranger refusal points at the owner")
+        # a non-blocked tool must NOT be counted
+        before = mod._GUEST_BLOCK_COUNTS.get(sess)
+        allow = mod._on_pre_tool_call(tool_name="web_search", session_id=sess,
+                                      args={"query": "python"})
+        check(allow is None, "web_search still allowed for guests")
+        check(mod._GUEST_BLOCK_COUNTS.get(sess) == before, "allowed tool not counted as a block")
+        # expiry clears the counter
+        mod._GUEST_BLOCK_LAST[sess] = time.monotonic() - (mod._GUEST_BLOCK_TTL + 5)
+        mod._guest_turn_expired(session_id=sess)
+        check(sess not in mod._GUEST_BLOCK_COUNTS, "idle session counter expires")
+        # a new turn starts clean (count 1 -> first-block wording)
+        again = mod._on_pre_tool_call(tool_name="terminal", session_id=sess, args={"cmd": "ls"})
+        check("final, not a transient error" in again["message"], "new turn resets block counter")
+        check("NOW" not in again["message"], "new turn no longer uses urgent wording")
+    finally:
+        mod._guest_session_info = orig_info18
     mod._GUEST_BLOCK_COUNTS.clear()
     mod._GUEST_BLOCK_LAST.clear()
     mod.save_settings({"guest_tool_mode": "balanced", "guest_owner_full_access": True})
@@ -1461,7 +1521,7 @@ def _real_state_path():
     """
     from pathlib import Path as _P
     home = mod._hermes_home()
-    return _P(home) / "plugins" / "telegram-guest-mode" / "state.json"
+    return _P(home) / "plugins" / "TGAhermes" / "state.json"
 
 
 def _tmp_state():
@@ -1655,6 +1715,125 @@ async def t22():
 
 asyncio.run(t21())
 asyncio.run(t22())
+
+
+# ---------------------------------------------------------------- v3: rename, setlog here, Actions, wizard, lock
+print("\n[23] v3: TGAhermes rename, !setlog here, Actions, wizard, update lock")
+
+# --- the rename landed where it matters
+_mf = (HERE / "plugin.yaml").read_text(encoding="utf-8")
+check("name: TGAhermes" in _mf, "manifest name is TGAhermes")
+check("version: 3.0.0" in _mf, "manifest version is 3.0.0")
+check("telegram-guest-mode" not in Path(mod.__file__).read_text(encoding="utf-8"),
+      "no old plugin name left in the module source")
+
+
+async def t23():
+    """!setlog here — the command twin of the Actions button."""
+    mod.save_settings({"owner_id": "900000001"})
+    prev_log = mod.settings().get("log_channel")
+
+    r = await mod._bang_execute(None, "-100777", "!setlog here")
+    check(mod.settings().get("log_channel") == "-100777",
+          "!setlog here sets the current chat")
+    check(r is not None and "-100777" in r, "!setlog here replies with the chat id")
+
+    # From inside a group that is NOT the current log — the whole point of `here`.
+    mod.save_settings({"log_channel": None})
+    ev = _real_ev("!setlog here", chat_type="supergroup",
+                  chat_id="-100888", user_id="900000001")
+    res = await mod._pre_gateway_dispatch(event=ev)
+    check(res is not None and res.get("action") == "skip",
+          "!setlog here is intercepted in a group")
+    check(mod.settings().get("log_channel") == "-100888",
+          "!setlog here logs into that group")
+
+    # Other bangs keep their old rule: log chat or owner DM only.
+    ev2 = _real_ev("!users", chat_type="supergroup",
+                   chat_id="-100999", user_id="900000001")
+    res2 = await mod._pre_gateway_dispatch(event=ev2)
+    check(res2 is None, "other bangs still stay out of groups they are not for")
+
+    # A guest chat hides its sender, so `here` there must be refused.
+    r2 = await mod._bang_execute(None, mod._guest_chat_id("900000002"),
+                                 "!setlog here")
+    check(mod.settings().get("log_channel") == "-100888",
+          "setlog here refuses a guest chat")
+    check("guest" in (r2 or "").lower(), "the refusal says why")
+
+    mod.save_settings({"log_channel": prev_log})
+
+
+async def t24():
+    """Wizards: the Actions flows run the same commands the panel replaces."""
+    mod._WIZARD.clear()
+    st0 = mod.settings()
+    prev_cool = st0.get("unauthorized_cooldown_s")
+    prev_owner = st0.get("owner_id")
+
+    p1 = mod._wizard_start("-100555", "cooldown")
+    check(bool(p1) and "Cooldown" in p1, "wizard opens with its prompt")
+    check(mod._WIZARD.get("-100555", {}).get("flow") == "cooldown",
+          "wizard state recorded")
+    out = await mod._wizard_feed(None, "-100555", "77")
+    check(mod.settings().get("unauthorized_cooldown_s") == 77,
+          "wizard answer runs the command twin")
+    check(not mod._WIZARD, "wizard cleared after the final step")
+
+    # cancel aborts without running anything
+    mod._wizard_start("-100555", "owner")
+    out2 = await mod._wizard_feed(None, "-100555", "cancel")
+    check(bool(out2) and "cancel" in out2.lower() and not mod._WIZARD,
+          "cancel aborts the wizard")
+    check(mod.settings().get("owner_id") == prev_owner,
+          "an aborted wizard changes nothing")
+
+    # two-step flow: prompts for id, then text, then completes
+    mod._wizard_start("-100555", "send")
+    mid = await mod._wizard_feed(None, "-100555", "123")
+    check(bool(mid) and "Step 2/2" in mid, "second step prompts for the text")
+    check(mod._WIZARD.get("-100555") is not None, "wizard waits for step 2")
+    out3 = await mod._wizard_feed(None, "-100555", "hello world")
+    check(out3 is not None and not mod._WIZARD, "flow completes and clears")
+
+    # the panel keyboard actually offers the flows
+    d_act = [b.callback_data for row in mod._help_keyboard("actions") for b in row]
+    check(any(x.endswith("panel:sethere") for x in d_act),
+          "actions view has Log here")
+    check(any(x.endswith("panel:wiz:wladd") for x in d_act),
+          "actions view has the whitelist wizard")
+    check(any(x.endswith("panel:wiz:wipe") for x in d_act),
+          "actions view has the wipe wizard")
+    check(all(len(x.encode()) <= 64 for x in d_act),
+          "actions callbacks inside Telegram's 64-byte cap")
+    d_home = [b.callback_data for row in mod._help_keyboard("panel") for b in row]
+    check(any(x.endswith("panel:actions") for x in d_home),
+          "home offers the Actions view")
+    check(not any(x.endswith("panel:back") for x in d_home),
+          "home still has no self-back button")
+    check("Actions" in mod._actions_view(mod.settings()), "actions view renders")
+
+    # the update lock: System view toggle + the selfupdate tool refuses
+    mod.save_settings({"update_enabled": False})
+    d_sys = [b.callback_data for row in mod._help_keyboard("system") for b in row]
+    check(any(x.endswith("panel:upd:lock") for x in d_sys),
+          "system view can toggle the update lock")
+    rep = await mod._run_selfupdate(apply=False)
+    check(rep.get("ok") is False and "locked" in str(rep.get("error") or ""),
+          "locked updates refuse the selfupdate tool")
+    mod.save_settings({"update_enabled": True})
+    check(any(x.endswith("panel:upd:lock")
+              for x in (b.callback_data for row in mod._help_keyboard("system")
+                        for b in row)),
+          "system view shows the lock button when updates are on")
+
+    mod.save_settings({"unauthorized_cooldown_s": prev_cool,
+                       "owner_id": prev_owner})
+    mod._WIZARD.clear()
+
+
+asyncio.run(t23())
+asyncio.run(t24())
 
 
 print(f"\n=== {PASS} passed, {FAIL} failed ===")

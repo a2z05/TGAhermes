@@ -1,214 +1,131 @@
-# telegram-guest-mode
+# TGAhermes
 
-All-in-one Telegram guest mode for [Hermes](https://github.com/NousResearch/hermes-agent):
-Bot API 10 guest replies, a log-channel activity console, an owner-gated admin tool,
-reaction feedback and media delivery to guests — as a **plugin**, no core edits.
+A Telegram plugin for [Hermes](https://github.com/NousResearch/hermes-agent).
 
-Works on Hermes **0.21.5+** with `python-telegram-bot` **≥ 22.8** (the version that
-introduced `Update.guest_message` / `filters.UpdateType.GUEST_MESSAGE`).
+It puts a gate in front of your bot: strangers can reach it through the guest
+link, your own chats stay private, and every interaction shows up in a log
+channel you pick. There's an admin panel to run it all, and the plugin can
+update itself.
+
+Needs Hermes 0.21.5+ and a Bot API 10 bot token.
 
 ## What it does
 
-### 🎭 Guest mode
-Anyone can summon your bot from a chat it is **not** a member of (a group it isn't in, a
-stranger's chat). The plugin:
+- **Guest gate** — people who find the guest link get answered; casual
+  mentions get a canned reply you control, with a cooldown.
+- **Log channel** — everything lands in one channel, with buttons: profile,
+  info, delete, ban.
+- **Admin panel** — `!panel` opens a console of buttons: status, log, access,
+  sessions, guests, system.
+- **Telegram admin tool** — ask in plain language ("delete that message",
+  "ban this user") and it runs, in your session only.
+- **Reactions and media** — 👀 ✅ ❌ feedback, and URL media sent to guests.
+- **Self-update** — pull a newer version from the panel without reinstalling.
 
-- answers **only** owner plain-mentions and replies to your bot's own messages —
-  everyone else's plain mention gets the editable canned reply (default
-  *"I only serve to my owner"*) with a per-user cooldown;
-- injects a persona (`assets/guest_persona.md`) plus a `[Sender identity]` tag, so the
-  assistant knows who is talking and how they reached the bot;
-- keeps guest conversations in **their own session** (`guest_<chat_id>`) — guest text
-  never touches the owner's DM transcript;
-- delivers replies **exclusively** through `answerGuestQuery` (never `send_message`):
-  final answers, clarify prompts, control prompts — while status/typing/footer noise is
-  suppressed for guest chats;
-- URL **media** (photos, documents, voice) is delivered to guests as inline results,
-  with a plain-text fallback if the API rejects the result type;
-- guest-turn **errors** go to your log channel (or the owner DM when no channel is set)
-  and the guest receives the editable pre-made error text (English/Persian).
-
-### 📋 Log channel console
-Point the plugin at any group (recommended) or channel where the bot can post:
-
-```
-!setlog -100xxxxxxxxxx
-```
-
-Every interaction posts an HTML entry with inline buttons — **👤 Profile**, **ℹ️ Info**
-(recorded history), **✂ Delete** (confirm), **🚫 Ban** (confirm, where the bot is admin):
-
-- guest mentions (answered *and* unauthorized)
-- stranger DMs and `/start`s
-- `telegram_admin` tool invocations and `!send` DMs
-- guest-mode errors
-- group @mentions of the bot (optional: owner DM mirror)
-
-### 🖥 Bang commands (log channel or your DM with the bot, owner only)
-
-| Command | Effect |
-|---|---|
-| `!panel` | full glass console: live status + version, 7 sections, 6 in-place toggles (reactions/guest reacts/guest media/mirror/mentions/tool), output views (users/settings/whitelist/guest texts), cooldown presets, wipe-this-chat |\n| `!help` | same buttons around the full command list |
-| `!users` | who started / used the bot (name, count, last seen, samples) |
-| `!send <user_id> <text>` | the bot DMs someone (result logged) |
-| `!settings` | show every editable setting |
-| `!setlog <id\|@name\|off>` | set / clear the log channel |
-| `!setowner <id>` | change the owner id (hot, no restart) |
-| `!setunauthorized <text>` | reply text for unauthorized users |
-| `!seterror <text>` / `!seterrorfa <text>` | guest error texts (English / Persian) |
-| `!setreact on\|off` | reaction feedback (👀 / ✅ / ❌) |
-| `!setmedia on\|off` | media delivery to guests |
-| `!setcooldown <seconds>` | unauthorized-reply cooldown |
-| `!whitelist list` | show who may talk to the real bot (`telegram.extra.allow_from`) |
-| `!whitelist add <user_id>` | whitelist a friend — their DMs go to the real bot, not the canned reply |
-| `!whitelist remove <user_id>` | drop someone from the whitelist (owner is protected) |
-| `!wipe <chat_id>` | delete that chat's session and start a fresh one **there** (DM / group / guest; also from the log channel — a bare `!wipe` is refused so your own session can never be wiped implicitly) |
-
-Every chat (your DM, each group, each guest) is a separate session; log entries carry a
-**🧹 Wipe** button (with confirm) as a point-and-click way to reset that chat.
-
-All settings are stored in `settings.json` next to the plugin (hot-read on every use —
-edits apply immediately, no restart).
-
-### 🛡 `telegram_admin` tool
-
-The agent gets a `telegram_admin` tool **restricted to the owner's own session**
-(guest or group sessions are refused by a database lookup, fail-closed):
-
-`delete_message` · `ban_user` · `unban_user` · `mute_user` · `unmute_user` ·
-`get_member` · `chat_info` · `react` · `send_dm` · `pin_message` · `unpin_message` ·
-`bang` (run any `!console` command — the agent can do everything you can type)
-
-Just ask in plain language — *"delete the message he just sent in X"*, *"ban 12345 in
-group Y"*, *"react 👍 to that"* — and it runs, provided the bot is admin in the target
-chat. Every action is logged to the log channel. Disable with `!setreact`-style
-settings: `"tool_enabled": false`.
-
-### ✨ Reactions
-
-When `auto_react` is on: 👀 when your message lands, ✅ after the reply is delivered,
-❌ on errors (owner DM and groups; guests only if `react_guests` is on). The agent can
-also set reactions on demand via the tool.
-
-## 📍 Channel origin (where a turn came from)
-
-Every Telegram turn now carries a short context block, so the model never has to
-guess where it is. It is injected through the documented `channel_prompt` hook
-path — no core edits.
-
-```
-[Channel origin] this turn came from Telegram.
-chat_kind=direct message (private 1:1 chat with you)
-chat_id='100000001'
-chat_name='@yourname'
-sender_user_id='100000001'
-bot_username='@your_bot'
-message_id='4939'
-sender_role=owner (this is your own 1:1 chat with the plugin owner)
-Channel context only — not a request; do not echo these values back verbatim.
-```
-
-*(values above are placeholders — the block carries whatever the real chat
-reports)*
-
-* `chat_kind` names the shape: **direct message**, **group chat**, **supergroup**,
-  **forum**, **channel**, or **guest chat** (with the "summoned the bot through its
-  guest link" clarification).
-* `chat_name` is resolved through `get_chat` — a group title / channel title /
-  `@username` when available, otherwise the raw id.
-* `sender_role` says whether the sender is the owner.
-* The block is explicitly labelled **context, not a request**, so a message that
-  quotes these values cannot turn them into instructions.
-
-Guest-mode turns keep their dedicated fields (`guest_name`, `guest_user_id`,
-`sender`, `trigger`) and also state that the chat came from the guest link.
+Every chat — your DM, each group, each guest — is its own session, so guest
+traffic never bleeds into your own conversations.
 
 ## Install
 
-```bash
-# 1. copy the plugin into your Hermes plugins dir
-cp -r telegram-guest-mode ~/.hermes/plugins/          # (or $HERMES_HOME/plugins/)
+Two ways. Pick whichever suits you.
 
-# 2. enable it — hot-reloads the running gateway
-hermes plugins enable telegram-guest-mode
-```
+### Path A — give it to your agent (recommended)
 
-Requirements: a bot token with Bot API 10+ (guest mode), PTB ≥ 22.8 (bundled with
-recent Hermes). Set your owner id either in `settings.json`
-(`"owner_id": "100000001"`) or via `telegram.extra.allow_from` in `config.yaml`.
+Send your Hermes agent the link to this repo and say:
 
-### Persona
+> install this Telegram plugin for me
 
-Copy `assets/guest_persona.example.md` to `<hermes_home>/assets/guest_persona.md` and
-edit it. Read fresh on every guest message — hot-editable. Missing file ⇒ built-in
-neutral fallback.
+It reads [AGENT.md](AGENT.md) — a step-by-step guide written for agents —
+runs the install, checks that the plugin loaded, and tells you what to do
+next. You don't have to touch the terminal.
 
-### Log channel
-
-1. Create a group, add the bot (as admin for ban/delete buttons to work).
-2. From your DM with the bot: `!setlog <chat_id>` (grab the id from e.g.
-   `@getidsbot`, it looks like `-1001000000010`).
-
-No channel configured? Everything still works; guest errors fall back to your DM.
-
-## Settings reference
-
-See [`settings.example.json`](settings.example.json). Every key:
-
-| Key | Default | Meaning |
-|---|---|---|
-| `owner_id` | `null` | owner override (else `allow_from` / `TELEGRAM_ALLOWED_USERS`) |
-| `log_channel` | `null` | group/channel for activity logs and `!` console |
-| `unauthorized_reply` | `I only serve to my owner` | reply to unauthorized users |
-| `unauthorized_cooldown_s` | `3600` | min gap between canned replies per user |
-| `guest_error_reply_en/fa` | see example | pre-made guest error texts |
-| `auto_react` | `true` | 👀/✅/❌ reaction feedback |
-| `react_guests` | `false` | also try reactions in guest chats |
-| `media_to_guests` | `true` | deliver URL media to guests |
-| `log_owner_messages` | `false` | mirror your DMs to the log channel |
-| `log_group_mentions` | `true` | log @bot mentions from groups |
-| `tool_enabled` | `true` | `telegram_admin` tool |
-| `persona_path` | `null` | persona file (default `<hermes_home>/assets/guest_persona.md`) |
-
-## How it hooks in
-
-- `register_platform_handler("telegram", factory)` — PTB handlers (`GUEST_MESSAGE`
-  first, then private text, then a `^tgm:` callback handler) registered before the core
-  handlers, so first-match dispatch wins without touching core code.
-- Instance wraps on the adapter's outbound path (`send`, `send_final_ledgered`,
-  `send_clarify`, `_send_prompt`, `_notify_turn_error`, `send_typing`, media senders) —
-  guest chats are answered via the stored `guest_query_id` and everything else passes
-  through untouched.
-- `pre_gateway_dispatch` hook — bang console (returns `skip` so the agent never sees
-  `!` commands), reaction feedback, group-mention and optional owner-DM logging.
-- `ctx.register_tool("telegram_admin", …)` — plugin toolsets are enabled by default in
-  Hermes; visibility can be toggled with `tool_enabled`.
-
-## Tests
+### Path B — install it yourself
 
 ```bash
-python tests/test_plugin.py    # needs the Hermes repo on sys.path; exit 0 = pass
+hermes plugins install https://github.com/a2z05/TGAhermes --enable
 ```
 
-## Known limitations
-
-- One guest message = one `guest_query_id`. A clarify turn answers it twice (prompt,
-  then final); if your Bot API build rejects the second answer, the final is lost and
-  the failure is logged loudly.
-- Media to guests needs a **public URL** (local files fall back to a text note).
-- Guest replies are text + inline media — no buttons/keyboards.
-- `!` console requires a **group** for the sender check (channel posts carry no author).
-
-## Running the tests
+Check that it landed:
 
 ```bash
-HERMES_SRC=/path/to/hermes-agent HERMES_HOME=/path/to/hermes-home \
-  python tests/test_plugin.py
+hermes plugins list --plain | grep -i TGAhermes
 ```
 
-Paths are auto-detected when they live in the usual places. Checks that need a
-live Hermes install (real sessions DB, installed `config.yaml`) skip themselves
-on a machine that has none — everything else runs offline with fakes.
+You want `enabled` in front of `TGAhermes`. A running gateway usually picks
+the plugin up on the spot; if it doesn't:
+
+```bash
+hermes gateway restart
+```
+
+**Manual fallback**, if the CLI isn't an option:
+
+```bash
+git clone https://github.com/a2z05/TGAhermes.git "$HERMES_HOME/plugins/TGAhermes"
+hermes plugins enable TGAhermes
+hermes gateway restart
+```
+
+`$HERMES_HOME` is your Hermes home directory (`~/.hermes` for most people).
+
+## First config — three messages
+
+Message your bot directly and send:
+
+1. `!setowner <your telegram id>` — sets you as the owner. Hot, no restart.
+2. `!setlog <chat id>` — where activity gets logged. Or go into the channel
+   or group you want and send `!setlog here`. The bot must be able to post
+   there (make it admin if you want the delete/ban buttons to work).
+3. `!panel` — opens the admin panel.
+
+That's the whole setup.
+
+The panel has an **Actions** view with wizards for the common jobs — set the
+log channel, whitelist a friend, change the reply strangers get — so most of
+the time you never have to type a command at all.
+
+## The commands
+
+| Command | What it does |
+|---|---|
+| `!panel` / `!help` | the admin panel and full command list |
+| `!settings` | show every setting |
+| `!users` | who has used the bot |
+| `!setowner <id>` | change the owner |
+| `!setlog <id\|@name\|here\|off>` | set or clear the log channel |
+| `!whitelist list\|add\|remove <id>` | let friends past the gate |
+| `!wipe <chat_id>` | fresh start for that chat |
+| `!send <user_id> <text>` | have the bot DM someone |
+| `!setcooldown <s>` | gap between canned replies |
+| `!setunauthorized <text>` | reply strangers get |
+| `!seterror <text>` / `!seterrorfa <text>` | guest error texts (English / Persian) |
+| `!setreact on\|off` / `!setmedia on\|off` | reaction feedback, media to guests |
+| `!guestlock on\|off` | unlock this guest chat for yourself |
+
+## Settings
+
+Everything lives in `$HERMES_HOME/plugins/TGAhermes/settings.json`. It's read
+on every use, so edits apply immediately — no restart. Start from
+[`settings.example.json`](settings.example.json) if you'd rather edit a file
+than send commands.
+
+## Updating
+
+Open `!panel` → **🔧 System** → **Check for update**, then **Install update**.
+Your agent can do the same through its update tool. Lock the version by
+setting `update_enabled` to `false` in `settings.json`.
+
+## When something's wrong
+
+- **No log entries** — the bot can't post in the log channel. Add it as
+  admin, then `!setlog here` again.
+- **Strangers treated as you** — `owner_id` is wrong; it's a numeric id, not
+  a username.
+- **Plugin not there after a restart** — run `hermes plugins list` and read
+  the status column.
+
+[AGENT.md](AGENT.md) has a longer troubleshooting table — that's the file
+your agent follows.
 
 ## License
 
