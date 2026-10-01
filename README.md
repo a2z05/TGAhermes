@@ -33,7 +33,9 @@ Two ways. Pick whichever suits you.
 
 Send your Hermes agent the link to this repo and say:
 
-> install this plugin for me : https://github.com/a2z05/TGAhermes
+```bash
+install this plugin for me : https://github.com/a2z05/TGAhermes
+```
 
 It reads [AGENT.md](AGENT.md) — a step-by-step guide written for agents —
 runs the install, checks that the plugin loaded, and tells you what to do
