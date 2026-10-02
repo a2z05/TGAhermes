@@ -595,7 +595,7 @@ print("\n[8] manifest + config")
 from pathlib import Path as P
 from hermes_cli.plugins_manifest import parse_manifest_file
 mf = parse_manifest_file(HERE / "plugin.yaml", HERE, "user", "")
-check(mf is not None and mf.name == "TGAhermes" and mf.version == "3.1.0", "manifest parses v3.1.0")
+check(mf is not None and mf.name == "TGAhermes" and mf.version == "3.1.1", "manifest parses v3.1.1")
 check(mf is not None and "telegram_admin" in (mf.provides_tools or []), "provides_tools declared")
 check(mf is not None and "pre_gateway_dispatch" in (mf.provides_hooks or []), "provides_hooks declared")
 
@@ -1723,7 +1723,7 @@ print("\n[23] v3: TGAhermes rename, !setlog here, Actions, wizard, update lock")
 # --- the rename landed where it matters
 _mf = (HERE / "plugin.yaml").read_text(encoding="utf-8")
 check("name: TGAhermes" in _mf, "manifest name is TGAhermes")
-check("version: 3.1.0" in _mf, "manifest version is 3.1.0")
+check("version: 3.1.1" in _mf, "manifest version is 3.1.1")
 check("telegram-guest-mode" not in Path(mod.__file__).read_text(encoding="utf-8"),
       "no old plugin name left in the module source")
 
@@ -1834,6 +1834,62 @@ async def t24():
 
 asyncio.run(t23())
 asyncio.run(t24())
+
+
+# --- first dispatched message after a hot reload requests the PTB rewire once
+# (on_plugin_loaded never fires for a RE-load, so nothing else wires the new
+# factory; FakeAdapter gets a counting rewire to observe the trigger).
+_ad_rw = FakeAdapter()
+_rw_calls = []
+_ad_rw.rewire_plugin_handlers = lambda: _rw_calls.append(1)
+_ad_rw._guest_gqids = {}
+_prev_ad = mod._ADAPTER.get("adapter")
+mod._ADAPTER["adapter"] = _ad_rw
+
+
+async def t_rw():
+    ev = FakeEvent(text="ping", source=FakeSource("900000001", message_id="1"))
+    await mod._pre_gateway_dispatch(event=ev)
+    await mod._pre_gateway_dispatch(event=ev)
+
+
+asyncio.run(t_rw())
+check(len(_rw_calls) == 1 and getattr(_ad_rw, "_tga_instance", None) is mod._INSTANCE,
+      "post-reload rewire requested exactly once on first dispatch")
+mod._ADAPTER["adapter"] = _prev_ad
+
+
+# --- hot reload must actually swap handlers (the 2026-10-02 stale-handler bug:
+# base._wire_plugin_handlers dedups factories by (plugin, qualname), so without a
+# per-deploy unique qualname the rewire skips ours and the old module's closures
+# keep serving the panel + a stale allow_from forever).
+import types as _types
+_stale_cb = lambda: None
+_stale_cb.__module__ = mod.__name__  # pretend an older instance of the plugin defined it
+_stale_h = _types.SimpleNamespace(callback=_stale_cb)
+_mine_h = _types.SimpleNamespace(callback=mod._drop_stale_handlers)  # this instance — keep
+_foreign_h = _types.SimpleNamespace(callback=check)  # another module — untouched
+
+
+class _FakeNative:
+    def __init__(self):
+        self.handlers = {0: [_stale_h, _mine_h, _foreign_h]}
+        self.removed = []
+
+    def remove_handler(self, h, group=0):
+        self.removed.append(h)
+        self.handlers[group].remove(h)
+
+
+_fn = _FakeNative()
+_n = mod._drop_stale_handlers(_fn)
+check(_n == 1 and _fn.removed == [_stale_h],
+      "stale handler from a previous load is swept")
+check(len(_fn.handlers[0]) == 2 and _mine_h in _fn.handlers[0]
+      and _foreign_h in _fn.handlers[0],
+      "current instance and foreign handlers are kept")
+check(mod._make_factory().__qualname__.startswith("factory.m"),
+      "factory qualname is unique per deployed file (rewire dedup key)")
 
 
 print(f"\n=== {PASS} passed, {FAIL} failed ===")

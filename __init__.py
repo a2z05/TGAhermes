@@ -161,6 +161,11 @@ Everything that can be done, I do, and I finish it.
 """
 _lock = threading.Lock()
 _ADAPTER: Dict[str, Any] = {"adapter": None}  # live adapter, set by the PTB factory
+# Fresh object per module instance: when a hot reload swaps this module, the
+# first hook run sees its sentinel differ from the one stored on the adapter and
+# triggers the PTB re-wire (on_plugin_loaded never fires for a RE-load, so
+# nothing else would — see the factory qualname comment).
+_INSTANCE = object()
 _CTX: Dict[str, Any] = {"session_store": None}  # live SessionStore, cached from the dispatch hook
 
 
@@ -2264,6 +2269,33 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
                 _ADAPTER["adapter"] = ad
         if ad is None:
             return None
+        # Hot-reload rewire trigger: the gateway only re-wires adapters for
+        # plugins it had never loaded before, so after a reload the OLD module's
+        # PTB callbacks would keep serving the panel/guest flow forever. One
+        # sentinel check on the first dispatched message makes the adapter rewire;
+        # the factory's per-deploy qualname key is then unknown to the wired set,
+        # so it runs, sweeps the stale handlers and re-syncs allow_from.
+        if getattr(ad, "_tga_instance", None) is not _INSTANCE:
+            ad._tga_instance = _INSTANCE
+            try:
+                ad.rewire_plugin_handlers()
+                logger.info("[TGAhermes] post-reload rewire requested")
+            except Exception:
+                logger.debug("[TGAhermes] post-reload rewire failed", exc_info=True)
+        # Push file-side allow_from into the adapter's wire-time snapshot. A CLI
+        # `hermes config set` writes the file but never reaches the running
+        # prefilter, so without this a freshly whitelisted user keeps bouncing
+        # until something re-wires the adapter.
+        try:
+            _ids = _read_allow_from()
+            if _ids:
+                _extra = getattr(getattr(ad, "config", None), "extra", None)
+                _cur = str(_extra.get("allow_from") or "") if isinstance(_extra, dict) else ""
+                _want = _allow_csv(_ids)
+                if _cur != _want:
+                    _sync_allow_from_live(_want)
+        except Exception:
+            logger.debug("[TGAhermes] opportunistic allow_from sync failed", exc_info=True)
         src = event.source
         text = str(event.text or "")
         chat = str(src.chat_id or "")
@@ -3242,6 +3274,47 @@ async def _tool_handler(args: Dict[str, Any], session_id: Any = None, **_) -> Di
 
 # ---------------------------------------------------------------- registration
 
+def _drop_stale_handlers(native: Any) -> int:
+    """Remove PTB handlers left in the bot by an EARLIER load of this plugin.
+
+    The gateway's rewire dedups factories by ``(plugin, qualname)`` — a key that
+    never changes between loads of the same source file — so a hot reload alone
+    never re-runs our factory and the previous module's closures keep serving
+    the panel and the guest flow out of their dead module state (measured
+    2026-10-02: reload 14:40:12 ran register() but no factory; the panel still
+    rendered pre-3.1.0 buttons and allow_from never re-synced). Sweeping every
+    handler registered under this plugin's module names (current, or the
+    pre-rename ``telegram_guest_mode``) before adding ours makes a reload an
+    actual swap.
+    """
+    removed = 0
+    try:
+        table = getattr(native, "handlers", None)
+        if not isinstance(table, dict):
+            return 0
+        mine = globals()
+        for group, entries in list(table.items()):
+            for h in list(entries):
+                cb = getattr(h, "callback", None)
+                if not callable(cb):
+                    continue
+                mod = getattr(cb, "__module__", "") or ""
+                if mod != __name__ and "telegram_guest_mode" not in mod:
+                    continue
+                if getattr(cb, "__globals__", None) is mine:
+                    continue  # registered by THIS very instance — keep it
+                try:
+                    native.remove_handler(h, group=group)
+                    removed += 1
+                except Exception:
+                    logger.debug("[TGAhermes] stale handler remove failed", exc_info=True)
+    except Exception:
+        logger.debug("[TGAhermes] stale handler sweep failed", exc_info=True)
+    if removed:
+        logger.info("[TGAhermes] dropped %d stale handler(s) from a previous load", removed)
+    return removed
+
+
 def _make_factory():
     def factory(native: Any, adapter: Any) -> None:
         _ADAPTER["adapter"] = adapter
@@ -3262,6 +3335,9 @@ def _make_factory():
             logger.exception("[TGAhermes] outbound wrap install failed")
         if native is None:
             return
+        # Previous load's handlers must go before ours, or PTB keeps matching
+        # the old closures (first match per group) and the panel never updates.
+        _drop_stale_handlers(native)
         try:
             from telegram.ext import CallbackQueryHandler, MessageHandler, filters
 
@@ -3286,6 +3362,16 @@ def _make_factory():
         except Exception:
             logger.exception("[TGAhermes] registration failed")
 
+    # Unique per deployed file mtime: base._wire_plugin_handlers dedups by
+    # (plugin, qualname) only, so an unchanged qualname makes the rewire skip
+    # this factory on every hot reload — the exact failure that left stale
+    # handlers and a stale allow_from live. Changing the file changes the key,
+    # the rewire calls us, and the sweep above replaces the old handlers.
+    try:
+        import os as _os
+        factory.__qualname__ = f"factory.m{int(_os.path.getmtime(__file__))}"
+    except Exception:
+        pass
     return factory
 
 
