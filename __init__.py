@@ -12,10 +12,15 @@ Restores the Atropos guest-mode behavior on Hermes 0.21.5+ as a plugin (no core 
   group/channel with inline buttons (profile / info / ban / delete). Errors of GUEST turns
   only go to the log channel (owner DM fallback when no channel is configured).
 * **Bang command console** (log channel or owner DM, owner only):
-  ``!help !users !send !settings !setlog !setowner !whitelist add|remove|list !wipe [chat_id]
+  ``!help !users !send !settings !setlog !setowner !whitelist add|remove|list|perms
+  !gs list|open|lock|reset !gate show|allow|deny !auth [user_id] !wipe [chat_id]
   !setunauthorized !seterror !seterrorfa !setreact !setmedia !setcooldown`` — texts/ids
   editable live. Every chat (DM / group / guest) is its own session; ``!wipe`` (or the 🧹
-  button on log entries) resets it. The whitelist adds friends who talk to the real bot.
+  button on log entries) resets it. The whitelist adds friends who talk to the real bot,
+  each with a permission level (talk / gate / full). Guest sessions can be opened for a
+  specific person or locked — whether you opened them or they appeared automatically —
+  and ``!auth`` shows exactly why a user is getting through or being blocked (config file
+  vs the live adapter snapshot the core prefilter actually checks).
 * **``telegram_admin`` agent tool** (owner session ONLY): delete messages, ban/unban/mute,
   reactions, DM users, chat/member info, pin, and ``bang`` (run any console command — the
   agent can do everything the owner can type) — gated by DB lookup to the owner's session.
@@ -106,6 +111,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # the ONLY reliable way to give yourself access from a guest chat: it is
     # explicit, per chat, and revocable from the panel.
     "guest_owner_chats": [],
+    # --- whitelisted-friend permissions ------------------------------
+    # Per-user tool level for a whitelisted friend's own DM session:
+    #   "talk" — only the safe read-only set (web, vision, skills)
+    #   "gate" — the same rules as the guest tool gate above (default)
+    #   "full" — no tool gating (the old whitelisted behavior)
+    "whitelist_perms": {},          # {"<user_id>": "talk"|"gate"|"full"}
+    # What a locked guest session answers (rate-limited by the cooldown).
+    "guest_locked_reply": "This session is locked by the owner.",
     # !update — pull a newer version of this plugin from git
     "update_enabled": True,          # set False to lock the plugin version
     "update_repo": None,             # git URL; None = use the plugin's own origin
@@ -652,8 +665,34 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
     is_owner = user_id == owner_id and owner_id not in ("", "*")
     st = settings()
 
+    # --- session control: owner-opened / auto-created / locked --------------------
+    # state.json keeps one record per guest uid. It appears automatically the first
+    # time they talk ("created": "auto") or when the owner opens one from the panel
+    # ("created": "owner"). "locked" answers only the locked reply; "open" skips the
+    # canned gate below — a plain mention reaches the brain.
+    gstate = "default"
+    if user_id:
+        _rec = _guest_sessions().get(user_id)
+        if _rec is None:
+            _touch_guest_session(user_id)  # auto-create the observation record
+        else:
+            gstate = str(_rec.get("state") or "default")
+    if gstate == "locked":
+        allowed = _canned_allowed(user)
+        _record_user(user, sample=text, canned=True)
+        await _log(
+            "🔒 Guest session locked",
+            f"{_user_block(user)}\n<b>Text:</b> <i>{_esc(text[:500])}</i>\n"
+            f"<b>Action:</b> {'locked reply sent' if allowed else 'ignored (cooldown)'}",
+            buttons=_profile_buttons(user))
+        if allowed:
+            await _answer_guest_text(adapter, gqid, str(st.get("guest_locked_reply") or ""))
+        else:
+            logger.info("[TGAhermes] locked session suppressed by cooldown: %s", user_id)
+        return
+
     # --- unauthorized plain mention: canned reply + log (with cooldown) ------------
-    if reply_to is None and not is_owner:
+    if reply_to is None and not is_owner and gstate != "open":
         allowed = _canned_allowed(user)
         _record_user(user, sample=text, canned=True)
         if st.get("react_guests") and st.get("auto_react"):
@@ -1001,8 +1040,18 @@ def _read_allow_from() -> List[str]:
 
 
 def _write_allow_from(ids: List[str]) -> bool:
-    """Persist telegram.extra.allow_from via the hermes CLI (subprocess — safe from the gateway)."""
-    csv = ",".join(dict.fromkeys(str(x).strip() for x in ids if str(x).strip()))
+    """Persist telegram.extra.allow_from via the hermes CLI (subprocess — safe from the gateway).
+
+    Two hard lessons encoded here: the owner id is always merged back in
+    (_allow_csv), and the file alone is not enough — the running adapter keeps
+    its own snapshot, so the new value is pushed into it directly
+    (_sync_allow_from_live) instead of trusting the plugin reload to do it
+    (it does not; measured 2026-10-02).
+    """
+    csv = _allow_csv(ids)
+    if not csv:
+        logger.error("[TGAhermes] refusing to write an empty allow_from")
+        return False
     try:
         import shutil
         import subprocess
@@ -1018,7 +1067,10 @@ def _write_allow_from(ids: List[str]) -> bool:
             logger.error("[TGAhermes] config set failed: %s",
                          (proc.stderr or proc.stdout or "")[:400])
             return False
-        _nudge_gateway_reload()  # live adapters pick up the new allow_from now
+        _sync_allow_from_live(csv)   # immediate: the very next message already passes
+        _nudge_gateway_reload()      # + rewire the plugin handlers
+        logger.info("[TGAhermes] allow_from write verified: file=%s adapter=%s",
+                    _read_allow_from(), _adapter_allow_raw())
         return True
     except Exception:
         logger.exception("[TGAhermes] whitelist write failed")
@@ -1052,6 +1104,119 @@ def _is_authorized_user(uid: str, owner: str = "") -> bool:
     if owner and uid == owner:
         return True
     return uid in _read_allow_from()
+
+
+# ------------------------------------------------------------- access-control helpers
+# Whitelisted friends carry a permission level for their own DM session:
+#   talk — only the safe read-only set (web/vision/skills)
+#   gate — the guest tool gate's rules, deny list included (default)
+#   full — no tool gating (the old whitelisted behavior)
+_FRIEND_LEVELS = ("talk", "gate", "full")
+_FRIEND_LEVEL_LABEL = {"talk": "💬 talk only", "gate": "🛡 gated", "full": "🔓 full"}
+
+
+def _friend_level(uid: str) -> str:
+    """Resolved tool level for uid — owner is always full, unknown users 'gate'."""
+    uid = str(uid or "")
+    if uid and uid == str(_owner_id() or ""):
+        return "full"
+    lvl = str((settings().get("whitelist_perms") or {}).get(uid) or "gate").lower()
+    return lvl if lvl in _FRIEND_LEVELS else "gate"
+
+
+def _adapter_allow_raw() -> Any:
+    """What the CORE prefilter actually sees: the adapter's bound config snapshot.
+
+    Deliberately NOT config.yaml — a write to the file does not reach this until
+    it is synced or the gateway restarts, and !auth exists to make that visible.
+    """
+    ad = _ADAPTER.get("adapter")
+    extra = getattr(getattr(ad, "config", None), "extra", None)
+    return extra.get("allow_from") if isinstance(extra, dict) else None
+
+
+def _allow_csv(ids: List[str]) -> str:
+    """allow_from value: the owner id is ALWAYS merged back in.
+
+    allow_from is the DM gate; a list that lost the owner locks the owner out of
+    their own DM on the next restart (2026-10-02: a whitelist write left only the
+    friend's id behind — this function exists so that cannot happen again).
+    """
+    owner = str(_owner_id() or "")
+    merged = [x for x in [owner] + [str(i).strip() for i in ids] if x]
+    return ",".join(dict.fromkeys(merged))
+
+
+def _sync_allow_from_live(csv: str) -> bool:
+    """Push a fresh allow_from into the running adapter's config snapshot.
+
+    The adapter binds config.extra when it wires up, and neither `hermes config
+    set` nor `reload_gateway_plugins` rebuilds it (measured: write 13:33:23,
+    plugin reload 13:33:25, same user blocked again 13:33:33). Without this the
+    core prefilter keeps rejecting users the owner just whitelisted until the
+    next gateway restart. In-place dict update — the authz mixin reads the same
+    object, so the prefilter and the runner chain both see the new value.
+    """
+    if not csv:
+        return False
+    ad = _ADAPTER.get("adapter")
+    if ad is None:
+        return False
+    try:
+        extra = getattr(getattr(ad, "config", None), "extra", None)
+        if not isinstance(extra, dict):
+            logger.warning("[TGAhermes] adapter config.extra unavailable — allow_from not synced")
+            return False
+        extra["allow_from"] = csv
+        logger.info("[TGAhermes] live allow_from synced: %s", csv)
+        return True
+    except Exception:
+        logger.exception("[TGAhermes] live allow_from sync failed")
+        return False
+
+
+# ------------------------------------------------------------ guest session control
+# state.json -> "guest_sessions": {"<uid>": {"state": ..., "created": ..., "updated": ts}}
+#   default — the usual stranger rules (canned on plain mention, brain on reply)
+#   open    — may talk without replying to ATRA
+#   locked  — answers only guest_locked_reply (rate-limited by the cooldown)
+# A record appears automatically the first time someone talks ("created": "auto")
+# or when the owner opens one ("created": "owner") — either can be locked.
+
+def _guest_sessions() -> Dict[str, Any]:
+    return (_load_state().get("guest_sessions") or {})
+
+
+def _set_guest_session(uid: str, state: str, by: str = "owner") -> None:
+    uid = str(uid or "").strip()
+    if not uid or state not in ("default", "open", "locked"):
+        return
+
+    def _fn(st: Dict[str, Any]):
+        recs = st.setdefault("guest_sessions", {})
+        rec = recs.setdefault(uid, {"state": "default", "created": "auto"})
+        rec["state"] = state
+        if by == "owner":
+            rec["created"] = "owner"
+        rec["updated"] = int(time.time())
+        return None
+
+    _mutate_state(_fn)
+
+
+def _touch_guest_session(uid: str) -> None:
+    """Auto-create an observation record when a guest first talks."""
+    uid = str(uid or "").strip()
+    if not uid:
+        return
+
+    def _fn(st: Dict[str, Any]):
+        recs = st.setdefault("guest_sessions", {})
+        if uid not in recs:
+            recs[uid] = {"state": "default", "created": "auto", "updated": int(time.time())}
+        return None
+
+    _mutate_state(_fn)
 
 
 def _wipe_sessions(store: Any, chat: Any) -> Optional[int]:
@@ -1106,12 +1271,17 @@ def _help_sections(st: Optional[Dict[str, Any]] = None) -> list:
          "<code>!whitelist list</code>\n"
          "<code>!whitelist add &lt;user_id&gt;</code>\n"
          "<code>!whitelist remove &lt;user_id&gt;</code>\n"
-         "Whitelisted friends talk to the real bot, not the canned reply."),
+         "<code>!whitelist perms &lt;user_id&gt; talk|gate|full</code> — tool level\n"
+         "Whitelisted friends talk to the real bot; their level decides which "
+         "tools their session may use.\n"
+         "<code>!auth [user_id]</code> — see file vs live prefilter verdicts"),
         ("sessions", "🧹 Sessions",
          "one per chat; wipe = fresh start\n"
          "<code>!wipe &lt;chat_id&gt;</code> — delete that chat's session, fresh start "
          "<i>there</i> (any DM/group/guest; works from the log channel too)\n"
-         "Or use the 🧹 button under a log entry."),
+         "Or use the 🧹 button under a log entry.\n"
+         "<code>!gs list|open|lock|reset &lt;user_id&gt;</code> — guest sessions: "
+         "🔓 open = talk freely · 🔒 locked = sealed · ▫️ reset = stranger rules"),
         ("guests", "👾 Guests",
          f"canned reply: <i>{_esc(st.get('unauthorized_reply'))}</i>\n"
          f"cooldown: <b>{_esc(st.get('unauthorized_cooldown_s'))}s</b> "
@@ -1272,6 +1442,31 @@ def _plugin_version() -> str:
         return "?"
 
 
+def _gsess_view(st: Dict[str, Any]) -> str:
+    """Guest session records: what each state means, who created it, what to press."""
+    recs = _guest_sessions()
+    lines = [
+        "<b>🔐 Guest sessions</b>",
+        "",
+        "▫️ <b>default</b> — stranger rules: canned on a plain mention, real answer on a reply",
+        "🔓 <b>open</b> — may talk without replying to ATRA",
+        "🔒 <b>locked</b> — answers only the locked reply (cooldown applies)",
+        "",
+    ]
+    if not recs:
+        lines += ["No sessions yet. One appears here automatically the first time someone "
+                  "talks on the guest link — or open one for a specific person below."]
+    else:
+        for uid, rec in sorted(recs.items()):
+            state = str(rec.get("state") or "default")
+            mark = {"open": "🔓 open", "locked": "🔒 locked"}.get(state, "▫️ default")
+            who = "opened by you" if rec.get("created") == "owner" else "auto-created"
+            lines.append(f"<code>{_esc(uid)}</code> · {mark} · {who}")
+    lines += ["", "Buttons below open, lock or reset a session; the command twin is "
+                  "<code>!gs list|open|lock|reset &lt;user_id&gt;</code>."]
+    return "\n".join(lines)
+
+
 def _panel_text(st: Optional[Dict[str, Any]] = None, note: str = "") -> str:
     """Dashboard for !panel — live status lines + the glass buttons beneath it."""
     st = st or settings()
@@ -1325,17 +1520,20 @@ def _actions_view(st: Dict[str, Any], note: str = "") -> str:
         f"⏱ cooldown: <b>{_esc(st.get('unauthorized_cooldown_s'))}s</b>",
         "",
         "📍 <b>Log here</b> — start logging into THIS chat",
-        "🛡 <b>Whitelist</b> — add or remove a friend (id or @username)",
+        "🛡 <b>Whitelist</b> — add, remove, or set a friend's permission level",
+        "🔐 <b>Guest sessions</b> — open a session for one guest, or lock it",
         "📨 <b>Send a DM</b> — message someone as the bot",
         "🧹 <b>Wipe a session</b> — give a chat a fresh start",
         "⏱ <b>Cooldown</b> · 👾 <b>Stranger reply</b> — canned texts and delays",
-        "🛡 <b>Guest tool gate</b> · 🔧 <b>System + updates</b>",
+        "🩺 <b>Auth debug</b> — who gets through where, file vs live snapshot",
+        "🛡 <b>Safeguards</b> — tool gate modes, allow/deny lists, friend levels",
+        "🔧 <b>System + updates</b>",
         "",
         "Tap a button, answer the prompt, done. Every flow runs the same code "
         "as its command twin (<code>!setlog</code>, <code>!whitelist</code>, "
-        "<code>!wipe</code>, <code>!send</code>, <code>!setcooldown</code>, "
-        "<code>!setunauthorized</code>), so the buttons and the commands can "
-        "never drift apart.",
+        "<code>!gs</code>, <code>!gate</code>, <code>!auth</code>, "
+        "<code>!wipe</code>, <code>!send</code>), so the buttons and the "
+        "commands can never drift apart.",
     ]
     if note:
         lines.insert(1, note)
@@ -1380,12 +1578,36 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         add(("\U0001f4e1 Log here — log into THIS chat", "panel:sethere"))
         add(("\U0001f6e1 Whitelist add", "panel:wiz:wladd"),
             ("\U0001f6e1 Whitelist remove", "panel:wiz:wldel"))
+        add(("\U0001f6e1 Friend permission level", "panel:wiz:wlperm"))
+        add(("\U0001f510 Guest sessions — open / lock", "panel:gslist"))
         add(("\U0001f4cb Send a DM as the bot", "panel:wiz:send"))
         add(("\U0001f9f9 Wipe a session", "panel:wiz:wipe"))
         add(("\u23f1 Cooldown", "panel:cool"))
         add(("\U0001f47b Stranger reply text", "panel:wiz:unauth"))
-        add(("\U0001f6e0 Guest tool gate", "panel:gate"))
+        add(("\U0001fa7a Auth debug", "panel:wiz:authdbg"))
+        add(("\U0001f6e1 Safeguards & tool gate", "panel:gate"))
         add(("\U0001f527 System + updates", "help:system"))
+    elif view == "safeguard":
+        add((f"\U0001f6e1 Mode: {_MODE_LABEL.get(str(st.get('guest_tool_mode') or 'balanced'), 'balanced')}",
+             "panel:gate"))
+        add(("\U0001f513 Owner access" + (" ON" if st.get("guest_owner_full_access") else " OFF"),
+             "panel:gate:owner"))
+        add(("\u270f\ufe0f Allow a tool", "panel:wiz:gateallow"),
+            ("\U0001f6ab Deny a tool", "panel:wiz:gatedeny"))
+        add(("\U0001f6e1 Friend levels", "panel:wiz:wlperm"),
+            ("\U0001f4cb Full rules", "panel:gate:list"))
+    elif view == "gsess":
+        recs = _guest_sessions()
+        for _uid, _rec in list(sorted(recs.items()))[:8]:
+            _state = str(_rec.get("state") or "default")
+            if _state == "locked":
+                add((f"\U0001f513 Open {_uid}", f"panel:gs:open:{_uid}"))
+            else:
+                add((f"\U0001f514 Lock {_uid}", f"panel:gs:lock:{_uid}"))
+            if _state != "default":
+                add((f"\u25ab\ufe0f Default {_uid}", f"panel:gs:reset:{_uid}"))
+        add(("\u2795 Open a new session", "panel:wiz:gsopen"))
+        add(("\U0001f512 Lock by id", "panel:wiz:gslock"))
     elif view == "wiz":
         add(("\u2716 Cancel the wizard", "panel:wizcancel"))
     elif view == "status":
@@ -1456,8 +1678,8 @@ _MODE_LABEL = {"strict": "🔒 strict", "balanced": "⚖️ balanced", "open": "
 _VIEW_LABEL = {"full": "📜 Full help", "panel": "🧩 Console", "out": "📋 Output",
                "status": "ℹ️ Status", "log": "📡 Log", "access": "🛡 Access",
                "sessions": "🧹 Sessions", "bot": "🤖 Bot", "guests": "👾 Guests",
-               "cool": "⏱ Cooldown", "system": "🔧 System",
-               "actions": "⚡ Actions", "wiz": "📝 Wizard"}
+               "cool": "⏱ Cooldown", "system": "🔧 System", "safeguard": "🛡 Safeguards",
+               "actions": "⚡ Actions", "gsess": "🔐 Guest sessions", "wiz": "📝 Wizard"}
 
 
 def _msg_chat_id(msg: Any) -> Optional[str]:
@@ -1528,11 +1750,35 @@ async def _whitelist_cmd(adapter: Any, arg: str) -> str:
     owner = _owner_id(adapter)
     if sub == "list":
         ids = _read_allow_from()
-        rows = [f"<code>{_esc(i)}</code>" + (" 👑 owner" if i == owner else "") for i in ids]
-        return "🛡 Whitelist (<code>telegram.extra.allow_from</code>):\n" + ("\n".join(rows) or "(empty)")
+        rows = [
+            f"<code>{_esc(i)}</code>" + (" 👑 owner" if i == owner else
+                                        f" · {_FRIEND_LEVEL_LABEL.get(_friend_level(i), '')}")
+            for i in ids]
+        return ("🛡 Whitelist (<code>telegram.extra.allow_from</code>):\n"
+                + ("\n".join(rows) or "(empty)")
+                + "\n\n💬 talk = safe tools only · 🛡 gated = guest rules (default) · "
+                  "🔓 full = no gating"
+                  "\nChange a level: <code>!whitelist perms &lt;user_id&gt; talk|gate|full</code>")
+    if sub in ("perms", "level"):
+        bits2 = val.split(maxsplit=1)
+        if len(bits2) != 2:
+            return ("Usage: <code>!whitelist perms &lt;user_id&gt; talk|gate|full</code>\n"
+                    "💬 talk = web/vision only · 🛡 gate = guest tool rules · 🔓 full = everything")
+        target, lvl = bits2[0], bits2[1].strip().lower()
+        if lvl not in _FRIEND_LEVELS:
+            return f"Unknown level <code>{_esc(lvl)}</code> — use talk, gate or full."
+        if target != owner and target not in _read_allow_from():
+            return f"<code>{_esc(target)}</code> is not whitelisted — add them first."
+        perms = dict(settings().get("whitelist_perms") or {})
+        perms[target] = lvl
+        save_settings({"whitelist_perms": perms})
+        await _log("🛡 Whitelist permission",
+                   f"<code>{_esc(target)}</code> → <b>{_FRIEND_LEVEL_LABEL.get(lvl, lvl)}</b>")
+        return (f"✅ <code>{_esc(target)}</code> → {_FRIEND_LEVEL_LABEL.get(lvl, lvl)}\n"
+                "Applies to their own DM session from the next message.")
     if sub in ("add", "remove"):
         if not val:
-            return "Usage: <code>!whitelist add|remove &lt;user_id&gt;</code>"
+            return f"Usage: <code>!whitelist {sub} &lt;user_id&gt;</code>"
         target = val
         if target.startswith("@"):
             try:
@@ -1543,24 +1789,153 @@ async def _whitelist_cmd(adapter: Any, arg: str) -> str:
                 target = ""
             if not target:
                 return f"⚠️ could not resolve {_esc(val)} — send the numeric user id instead"
+        target = str(target).strip()
+        if target == owner and sub == "remove":
+            return "Refusing to remove the owner — the owner is always authorized; use <code>!setowner</code> to change ownership."
         ids = _read_allow_from()
         if sub == "add":
             if target in ids:
                 return f"<code>{_esc(target)}</code> is already whitelisted."
             new = ids + [target]
         else:
-            if target in ids and target == owner:
-                return "Refusing to remove the owner — change the owner with <code>!setowner</code> first."
             if target not in ids:
                 return f"<code>{_esc(target)}</code> is not whitelisted."
-            new = [i for i in ids if i != target]
+            new = [x for x in ids if x != target]
         if not _write_allow_from(new):
             return "❌ could not write config — see the gateway log"
         verb = "Added" if sub == "add" else "Removed"
         await _log("🛡 Whitelist updated",
-                   f"<b>{verb}:</b> <code>{_esc(target)}</code>\nNow: <code>{_esc(','.join(new))}</code>")
-        return f"✅ {verb.lower()} <code>{_esc(target)}</code>\nWhitelist: <code>{_esc(','.join(new))}</code>"
-    return "Usage: <code>!whitelist list|add|remove &lt;user_id&gt;</code>"
+                   f"<b>{verb}:</b> <code>{_esc(target)}</code>\n"
+                   f"Now: <code>{_esc(_allow_csv(new))}</code>")
+        out = (f"✅ {verb.lower()} <code>{_esc(target)}</code>\n"
+               f"Whitelist: <code>{_esc(_allow_csv(new))}</code>")
+        if sub == "add":
+            out += (f"\nLevel: {_FRIEND_LEVEL_LABEL.get(_friend_level(target), '')} — "
+                    f"change with <code>!whitelist perms {_esc(target)} talk|gate|full</code>")
+        return out
+    return ("Usage: <code>!whitelist list|add|remove|perms "
+            "&lt;user_id&gt; [talk|gate|full]</code>")
+
+
+async def _gs_cmd(adapter: Any, arg: str) -> str:
+    """!gs list|open|lock|reset <user_id> — guest session control (panel twin)."""
+    bits = arg.strip().split(maxsplit=1)
+    sub = bits[0].lower() if bits else "list"
+    val = bits[1].strip() if len(bits) > 1 else ""
+    states = {"open": "open", "unlock": "open", "lock": "locked", "reset": "default"}
+    marks = {"open": "🔓 open", "locked": "🔒 locked", "default": "▫️ default rules"}
+    if sub == "list":
+        recs = _guest_sessions()
+        if not recs:
+            return ("🔐 No guest sessions recorded yet.\n"
+                    "One appears here automatically the first time someone talks on the "
+                    "guest link — or open one yourself with "
+                    "<code>!gs open &lt;user_id&gt;</code>.")
+        rows = []
+        for uid, rec in sorted(recs.items()):
+            state = str(rec.get("state") or "default")
+            mark = marks.get(state, state)
+            who = "opened by you" if rec.get("created") == "owner" else "auto-created"
+            rows.append(f"<code>{_esc(uid)}</code> · {mark} · {who}")
+        return ("🔐 Guest sessions:\n" + "\n".join(rows)
+                + "\n\n🔓 open = may talk without replying to ATRA · "
+                  "🔒 locked = only the locked reply · ▫️ default = stranger rules")
+    if sub in states:
+        if not val:
+            return f"Usage: <code>!gs {sub} &lt;user_id&gt;</code>"
+        # guest ids are numeric (the id they carry on the link); @names don't resolve here
+        uid = val[1:] if val.startswith("@") else val
+        _set_guest_session(uid, states[sub], by="owner")
+        mark = marks.get(states[sub], states[sub])
+        await _log("🔐 Guest session", f"<code>{_esc(uid)}</code> → <b>{mark}</b>")
+        return f"✅ <code>{_esc(uid)}</code> → {mark}\nList: <code>!gs list</code>"
+    return "Usage: <code>!gs list|open|lock|reset &lt;user_id&gt;</code>"
+
+
+async def _gate_cmd(arg: str) -> str:
+    """!gate show|allow|deny — the safeguard lists, editable without the panel."""
+    bits = arg.strip().split(maxsplit=1)
+    sub = bits[0].lower() if bits else "show"
+    val = bits[1].strip() if len(bits) > 1 else ""
+    st = settings()
+    if sub in ("show", "list"):
+        return _gate_view(st)
+    if sub in ("allow", "deny"):
+        key = "guest_allow_tools" if sub == "allow" else "guest_deny_tools"
+        remove = val.startswith("-")
+        tool = val.lstrip("+-").strip()
+        if not tool:
+            cur = ", ".join(str(t) for t in (st.get(key) or [])) or "none"
+            return (f"Usage: <code>!gate {sub} &lt;tool&gt;</code> — prefix "
+                    f"<code>-</code> to remove\nCurrent {sub} list: <code>{_esc(cur)}</code>")
+        cur = [str(t) for t in (st.get(key) or [])]
+        if remove:
+            if tool not in cur:
+                return f"<code>{_esc(tool)}</code> is not in the {sub} list."
+            cur = [t for t in cur if t != tool]
+            verb = "removed from"
+        else:
+            if tool in cur:
+                return f"<code>{_esc(tool)}</code> is already in the {sub} list."
+            cur = cur + [tool]
+            verb = "added to"
+        save_settings({key: cur})
+        await _log("🛡 Gate list",
+                   f"<code>{_esc(tool)}</code> {verb} {sub} → <code>{_esc(', '.join(cur))}</code>")
+        return f"✅ <code>{_esc(tool)}</code> {verb} the {sub} list.\n{_gate_view(settings())}"
+    return "Usage: <code>!gate show|allow|deny [tool]</code>"
+
+
+def _auth_debug(uid: str = "") -> str:
+    """Whose config wins where: file vs the live prefilter snapshot vs the plugin."""
+    file_ids = _read_allow_from()
+    raw = _adapter_allow_raw()
+    if raw is None:
+        snap_ids = None
+        snap = "(not set — the prefilter falls through to runner auth)"
+    else:
+        if isinstance(raw, (list, tuple, set)):
+            snap_ids = [str(x).strip() for x in raw]
+        else:
+            snap_ids = [x.strip() for x in str(raw).split(",") if x.strip()]
+        snap = ", ".join(snap_ids) or "(empty)"
+    owner = str(_owner_id() or "")
+    lines = [
+        "<b>🩺 Auth debug</b>",
+        f"<b>config file allow_from:</b> <code>{_esc(','.join(file_ids)) or '(empty)'}</code>",
+        f"<b>live adapter snapshot:</b> <code>{_esc(snap)}</code>",
+        ("  <i>← this is what the core prefilter checks; a write to the file does "
+         "not change it until it is synced or the gateway restarts</i>"
+         if raw is not None else ""),
+        f"<b>owner:</b> <code>{_esc(owner or 'unset')}</code>",
+    ]
+
+    def _verdict(ids: Optional[List[str]]) -> str:
+        if ids is None:
+            return "falls through to runner auth"
+        if uid == owner and owner or uid in ids or "*" in ids:
+            return "PASS"
+        return "BLOCK"
+
+    if uid:
+        plugin_ok = _is_authorized_user(uid, owner)
+        lines += [
+            "",
+            f"<b>for <code>{_esc(uid)}</code>:</b>",
+            f"  prefilter with file: <b>{_verdict(file_ids)}</b> · "
+            f"with live snapshot: <b>{_verdict(snap_ids)}</b>",
+            "  plugin route: "
+            + ("owner/whitelisted → real brain" if plugin_ok else "stranger → canned reply")
+            + (f" · level {_FRIEND_LEVEL_LABEL.get(_friend_level(uid), _friend_level(uid))}"
+               if plugin_ok and uid != owner else ""),
+        ]
+        rec = (_load_state().get("users") or {}).get(uid) or {}
+        cool = max(0, int(float(rec.get("canned_until", 0) or 0) - time.time()))
+        lines.append(f"  canned cooldown left: {cool}s")
+        if file_ids and snap_ids is not None and set(file_ids) != set(snap_ids):
+            lines += ["", "⚠️ file and live snapshot DISAGREE — a whitelist write "
+                      "(panel → ⚡ Actions) syncs them, or restart the gateway."]
+    return "\n".join(x for x in lines if x)
 
 
 async def _bang_execute(adapter: Any, chat_id: str, text: str,
@@ -1704,8 +2079,14 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
                            f"<b>Chat:</b> <code>{_esc(target)}</code> · <b>Reset:</b> {n}")
     elif cmd == "!whitelist":
         reply = await _whitelist_cmd(adapter, arg)
+    elif cmd == "!auth":
+        reply = _auth_debug(arg.strip())
+    elif cmd == "!gs":
+        reply = await _gs_cmd(adapter, arg)
+    elif cmd == "!gate":
+        reply = await _gate_cmd(arg)
     else:
-        reply = f"Unknown command <code>{_esc(cmd)}</code> — try <code>!help</code>"
+        return (f"Unknown command <code>{_esc(cmd)}</code> — see <code>!help</code>.")
     return reply
 
 
@@ -1766,6 +2147,38 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
                     "<i>Type cancel to abort.</i>",
                     "📨 <b>Send a DM as the bot</b>\n\nStep 2/2 — send the message text."],
         "build": lambda d: f"!send {d[0]} {d[1]}"},
+    "wlperm": {
+        "prompts": ["🛡 <b>Friend permission level</b>\n\nStep 1/2 — send the whitelisted "
+                    "user id.\n<i>Type cancel to abort.</i>",
+                    "🛡 <b>Step 2/2</b> — send the level:\n"
+                    "  <b>talk</b> — safe tools only (web, vision, skills)\n"
+                    "  <b>gate</b> — same rules as the guest tool gate\n"
+                    "  <b>full</b> — no tool gating\n"
+                    "<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!whitelist perms {d[0]} {d[1]}"},
+    "authdbg": {
+        "prompts": ["🩺 <b>Auth debug</b>\n\nSend the user id to check — config file vs "
+                    "the live prefilter snapshot vs the plugin's route.\n"
+                    "<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!auth {d[0]}"},
+    "gsopen": {
+        "prompts": ["🔐 <b>Open a guest session</b>\n\nSend the guest's user id (the id they "
+                    "carry on the guest link). The session will accept plain mentions — no "
+                    "reply-to-ATRA needed.\n<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!gs open {d[0]}"},
+    "gslock": {
+        "prompts": ["🔐 <b>Lock a guest session</b>\n\nSend the user id whose session should "
+                    "be locked — works on auto-created sessions and on ones you opened.\n"
+                    "<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!gs lock {d[0]}"},
+    "gateallow": {
+        "prompts": ["🛡 <b>Allow a tool</b>\n\nSend the tool name to allow guests (prefix with "
+                    "<code>-</code> to remove it instead).\n<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!gate allow {d[0]}"},
+    "gatedeny": {
+        "prompts": ["🚫 <b>Deny a tool</b>\n\nSend the tool name to keep blocked (prefix with "
+                    "<code>-</code> to remove it instead).\n<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!gate deny {d[0]}"},
 }
 
 
@@ -2000,7 +2413,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                             "Tap a preset, or type <code>!setcooldown &lt;seconds&gt;</code>")
             elif action == "gate":
                 if sub == "list":
-                    view, body = "system", _gate_view(st)
+                    view, body = "safeguard", _gate_view(st)
                 elif sub == "mode":
                     order = ["strict", "balanced", "open"]
                     cur = str(st.get("guest_tool_mode") or "balanced")
@@ -2009,7 +2422,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     st = settings()
                     note = f"🛡 guest mode → <b>{_MODE_LABEL.get(nxt, nxt)}</b>"
                     body = _gate_view(st)
-                    view = "system"
+                    view = "safeguard"
                     await _log("🛡 Guest tool mode",
                                f"Mode set to <b>{nxt}</b> (owner {_esc(str(_owner_id()))})")
                 elif sub == "owner":
@@ -2019,7 +2432,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     note = ("🔓 owner access ON in unlocked guest chats" if on
                             else "🔒 owner access OFF — everyone is gated here, you included")
                     body = _gate_view(st)
-                    view = "system"
+                    view = "safeguard"
                     await _log("🛡 Guest owner access",
                                f"{'enabled' if on else 'disabled'} for unlocked guest chats")
                 elif sub and sub.startswith("grant:"):
@@ -2031,7 +2444,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     st = settings()
                     note = f"➕ unlocked <code>{_esc(chat_key)}</code> for your account"
                     body = _gate_view(st)
-                    view = "system"
+                    view = "safeguard"
                     await _log("🛡 Guest chat unlocked", f"Unlocked for owner: {chat_key}")
                 elif sub and sub.startswith("revoke:"):
                     chat_key = sub.split(":", 1)[1].strip()
@@ -2041,8 +2454,23 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     st = settings()
                     note = f"➖ revoked <code>{_esc(chat_key)}</code>"
                     body = _gate_view(st)
-                    view = "system"
+                    view = "safeguard"
                     await _log("🛡 Guest chat locked", f"Revoked owner unlock: {chat_key}")
+            elif action == "gslist":
+                view, body = "gsess", _gsess_view(st)
+            elif action == "gs":
+                # panel:gs:<open|lock|reset>:<uid> — same states as !gs
+                parts = data.split(":")
+                gact = parts[3] if len(parts) > 3 else ""
+                guid = parts[4] if len(parts) > 4 else ""
+                gstate = {"open": "open", "lock": "locked", "reset": "default"}.get(gact)
+                if guid and gstate:
+                    _set_guest_session(guid, gstate, by="owner")
+                    marks = {"open": "🔓 open", "locked": "🔒 locked", "default": "▫️ default"}
+                    note = f"🔐 <code>{_esc(guid)}</code> → <b>{marks[gstate]}</b>"
+                    await _log("🔐 Guest session",
+                               f"<code>{_esc(guid)}</code> → <b>{marks[gstate]}</b> (panel)")
+                view, body = "gsess", _gsess_view(st)
             elif action == "upd":
                 # Runs git + the test suite, so hand control back to the user
                 # with a "working" toast before it blocks.
@@ -2498,37 +2926,28 @@ def _guest_refusal(tool_name: str, info: Dict[str, Any], repeats: int = 0) -> st
         f"Answering questions, web search and simple analysis all work fine right here. {tail}"
     )
 
-def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = None, **_) -> Optional[Dict[str, str]]:
-    """Guest safety gate: refuse destructive/leaking tools, let the rest through."""
-    name = str(tool_name or "")
-    if name in GUEST_SAFE_TOOLS:
-        return None
-    info = _guest_session_info(session_id)
-    if info is None:
-        return None
-    st = settings()
-    # The owner has full access in their own DM, so gating them in their guest
-    # chat protects nothing and only breaks the guest link for the one person
-    # entitled to use it. That was a real bug. But the exemption stays OFF by
-    # default: it is only honoured for a session whose recorded guest id
-    # actually matches the owner, or one you explicitly unlocked.
-    if info.get("is_owner") and st.get("guest_owner_full_access", False):
-        return None
-    denied = _guest_allowed(frozenset())
-    danger = name in denied
-    if not danger and name in _GUEST_PATH_TOOLS and isinstance(args, dict):
+def _tripwire_danger(name: str, args: Any) -> bool:
+    """Argument/path tripwires — shared by the guest gate and the friend gate."""
+    if name in _GUEST_PATH_TOOLS and isinstance(args, dict):
         blob = " ".join(str(args.get(k, "")) for k in ("path", "file_path", "file"))
-        danger = bool(blob.strip() and _GUEST_FORBIDDEN_PATH_RE.search(blob))
-    if not danger and args is not None:
+        if blob.strip() and _GUEST_FORBIDDEN_PATH_RE.search(blob):
+            return True
+    if args is not None:
         try:
-            danger = bool(_GUEST_DANGER_ARG_RE.search(json.dumps(args, ensure_ascii=False, default=str)))
+            if _GUEST_DANGER_ARG_RE.search(json.dumps(args, ensure_ascii=False, default=str)):
+                return True
         except (TypeError, ValueError):
-            danger = False
-    if not danger:
-        return None
-    # A block is delivered to the model as a tool result, not as a turn
-    # terminator, so without a per-turn counter the model re-probes blocked
-    # tools for dozens of calls and the guest never gets an answer.
+            pass
+    return False
+
+
+def _bump_block(session_id: Any) -> int:
+    """One more refusal for this turn; bounded so a long gate cannot leak memory.
+
+    A block is delivered to the model as a tool result, not as a turn
+    terminator, so without a per-turn counter the model re-probes blocked
+    tools for dozens of calls and the guest never gets an answer.
+    """
     turn_key = str(session_id or "")
     count = _GUEST_BLOCK_COUNTS.get(turn_key, 0) + 1
     _GUEST_BLOCK_COUNTS[turn_key] = count
@@ -2539,6 +2958,65 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
             if now - last > _GUEST_BLOCK_TTL and k != turn_key:
                 _GUEST_BLOCK_COUNTS.pop(k, None)
                 _GUEST_BLOCK_LAST.pop(k, None)
+    return count
+
+
+def _friend_refusal(tool_name: str, uid: str, level: str, repeats: int = 0) -> str:
+    """Refusal for a whitelisted friend's gated tool — final, with a next step."""
+    if repeats:
+        tail = ("You have already been told this is not possible. Do not call any other "
+                "blocked tool and do not try again — answer NOW with what you already have.")
+    else:
+        tail = ("Do not call this or any other blocked tool again; answer with what you "
+                "already have, or say in one sentence that you cannot.")
+    lvl = _FRIEND_LEVEL_LABEL.get(level, level)
+    return (
+        f"BLOCKED in this chat (final, not a transient error): `{tool_name}` is not available "
+        f"at your access level ({lvl}). This is a permission setting, not a transient error, "
+        f"so retrying is pointless. Answer now without the tool, and ask the owner "
+        f"(https://t.me/user?id={_owner_id()}) to raise your level if you need it. {tail}"
+    )
+
+
+def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = None, **_) -> Optional[Dict[str, str]]:
+    """Safety gate: guest rules for guest chats, per-friend levels for whitelisted DMs."""
+    name = str(tool_name or "")
+    if name in GUEST_SAFE_TOOLS:
+        return None
+    info = _guest_session_info(session_id)
+    if info is None:
+        # Whitelisted friend in their OWN DM session (source telegram, chat = their
+        # id, no guest_ prefix): their permission level decides — not the guest gate,
+        # not nothing. Owner always passes.
+        row = _session_row(session_id)
+        if row and row[0] == "telegram" and not _is_guest_chat(row[1]):
+            uid = row[1]
+            owner = str(_owner_id() or "")
+            if uid and uid != owner and uid in _read_allow_from():
+                level = _friend_level(uid)
+                danger = level != "full" and (
+                    level == "talk"
+                    or name in _guest_allowed(frozenset())
+                    or _tripwire_danger(name, args))
+                if danger:
+                    count = _bump_block(session_id)
+                    logger.warning("[TGAhermes] friend tool refused: %s (uid=%s level=%s block#%d)",
+                                   name, uid, level, count)
+                    return {"action": "block",
+                            "message": _friend_refusal(name, uid, level, repeats=count - 1)}
+        return None
+    st = settings()
+    # The owner has full access in their own DM, so gating them in their guest
+    # chat protects nothing and only breaks the guest link for the one person
+    # entitled to use it. That was a real bug. But the exemption stays OFF by
+    # default: it is only honoured for a session whose recorded guest id
+    # actually matches the owner, or one you explicitly unlocked.
+    if info.get("is_owner") and st.get("guest_owner_full_access", False):
+        return None
+    danger = name in _guest_allowed(frozenset()) or _tripwire_danger(name, args)
+    if not danger:
+        return None
+    count = _bump_block(session_id)
     logger.warning("[TGAhermes] guest tool refused: %s (guest_is_owner=%s, block#%d)",
                    name, info.get("is_owner"), count)
     return {"action": "block", "message": _guest_refusal(name, info, repeats=count - 1)}
@@ -2767,6 +3245,17 @@ async def _tool_handler(args: Dict[str, Any], session_id: Any = None, **_) -> Di
 def _make_factory():
     def factory(native: Any, adapter: Any) -> None:
         _ADAPTER["adapter"] = adapter
+        # The adapter's config snapshot predates every config set made since it
+        # first wired; push the file's current allow_from into it so a plugin
+        # (re)load alone is enough for the core prefilter to agree with the file
+        # again — without this, a fresh whitelist write keeps getting blocked
+        # until a gateway restart.
+        try:
+            _ids = _read_allow_from()
+            if _ids:
+                _sync_allow_from_live(",".join(_ids))
+        except Exception:
+            logger.debug("[TGAhermes] startup allow_from sync failed", exc_info=True)
         try:
             _install_wraps(adapter)
         except Exception:
