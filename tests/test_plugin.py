@@ -613,7 +613,7 @@ print("\n[8] manifest + config")
 from pathlib import Path as P
 from hermes_cli.plugins_manifest import parse_manifest_file
 mf = parse_manifest_file(HERE / "plugin.yaml", HERE, "user", "")
-check(mf is not None and mf.name == "TGAhermes" and mf.version == "3.2.0", "manifest parses v3.2.0")
+check(mf is not None and mf.name == "TGAhermes" and mf.version == "3.3.0", "manifest parses v3.3.0")
 check(mf is not None and "telegram_admin" in (mf.provides_tools or []), "provides_tools declared")
 check(mf is not None and "pre_gateway_dispatch" in (mf.provides_hooks or []), "provides_hooks declared")
 
@@ -936,13 +936,27 @@ async def t12():
         return NS(from_user=NS(id=900000001), data=data,
                   message=NS(chat=NS(id="900000001"), edit_text=_edit), answer=_ans)
 
-    # live toggle flips the real setting and re-renders the dashboard
+    # v3.3: a settings flag no longer flips on the first tap. The tap renders
+    # the confirm screen; only the Apply callback writes.
     before = bool(mod.settings().get("auto_react"))
+    edited.clear()
     await mod._on_callback(NS(callback_query=_q("tgm:panel:toggle:react")))
     await asyncio.sleep(0.02)
-    check(bool(mod.settings().get("auto_react")) != before, "panel toggle flips the real setting")
-    check(edited and edited[0][1].get("parse_mode") == "HTML", "toggle re-render is HTML")
-    check(edited and "reactions" in edited[0][0], "toggle shows the dashboard back")
+    check(bool(mod.settings().get("auto_react")) == before,
+          "first tap on a flag does NOT write (confirm screen instead)")
+    _cfm_mk = edited[0][1].get("reply_markup") if edited else None
+    _apply = [b.callback_data for r in (_cfm_mk.inline_keyboard if _cfm_mk else [])
+              for b in r if "Apply" in b.text]
+    check(bool(_apply), "first tap lands on the confirm screen with Apply")
+    check(any(d.endswith("panel:cfmok:tg:settings:react") for d in _apply),
+          "Apply targets the single writer callback")
+    edited.clear()
+    await mod._on_callback(NS(callback_query=_q(_apply[0])))
+    await asyncio.sleep(0.02)
+    check(bool(mod.settings().get("auto_react")) != before,
+          "Apply is what flips the real setting")
+    check(edited and edited[0][1].get("parse_mode") == "HTML", "re-render is HTML")
+    check(edited and "reactions" in edited[0][0], "confirm shows the dashboard back")
     check(answered and "<b>" not in str(answered[-1][0]), "toast carries no raw markup")
     mod.save_settings({"auto_react": before})
 
@@ -1115,24 +1129,47 @@ async def t15():
                              reply_text=None),
                   answer=_ans)
 
-    # toggles beyond the original two
+    # v3.3: these flags also confirm first — tap lands on the confirm
+    # screen, and only the Apply callback flips the setting.
     before_tool = bool(mod.settings().get("tool_enabled"))
+    edits.clear()
     await mod._on_callback(NS(callback_query=_q("tgm:panel:toggle:tool")))
     await asyncio.sleep(0.02)
-    check(bool(mod.settings().get("tool_enabled")) != before_tool, "tool toggle flips tool_enabled")
+    check(bool(mod.settings().get("tool_enabled")) == before_tool,
+          "tool flag first tap does NOT write")
+    _mk = edits[-1][1].get("reply_markup")
+    _apply = [b.callback_data for row in _mk.inline_keyboard for b in row
+              if "Apply" in b.text]
+    await mod._on_callback(NS(callback_query=_q(_apply[0])))
+    await asyncio.sleep(0.02)
+    check(bool(mod.settings().get("tool_enabled")) != before_tool, "Apply flips tool_enabled")
     mod.save_settings({"tool_enabled": before_tool})
 
     before_g = bool(mod.settings().get("react_guests"))
+    edits.clear()
     await mod._on_callback(NS(callback_query=_q("tgm:panel:toggle:greact")))
     await asyncio.sleep(0.02)
-    check(bool(mod.settings().get("react_guests")) != before_g, "guest-react toggle flips react_guests")
+    check(bool(mod.settings().get("react_guests")) == before_g,
+          "guest-react first tap does NOT write")
+    _mk = edits[-1][1].get("reply_markup")
+    _apply = [b.callback_data for row in _mk.inline_keyboard for b in row
+              if "Apply" in b.text]
+    await mod._on_callback(NS(callback_query=_q(_apply[0])))
+    await asyncio.sleep(0.02)
+    check(bool(mod.settings().get("react_guests")) != before_g, "Apply flips react_guests")
     mod.save_settings({"react_guests": before_g})
 
-    # cooldown preset
+    # cooldown preset: first tap confirms, Apply writes
     edits.clear()
     await mod._on_callback(NS(callback_query=_q("tgm:panel:cool:300")))
     await asyncio.sleep(0.02)
-    check(mod.settings().get("unauthorized_cooldown_s") == 300, "cooldown preset applies")
+    check(mod.settings().get("unauthorized_cooldown_s") != 300, "cooldown preset first tap does NOT write")
+    _mk = edits[-1][1].get("reply_markup")
+    _apply = [b.callback_data for row in _mk.inline_keyboard for b in row
+              if "Apply" in b.text]
+    await mod._on_callback(NS(callback_query=_q(_apply[0])))
+    await asyncio.sleep(0.02)
+    check(mod.settings().get("unauthorized_cooldown_s") == 300, "cooldown preset applies on Apply")
     check(edits and "cooldown" in edits[-1][0], "cooldown preset re-renders the dashboard")
     mod.save_settings({"unauthorized_cooldown_s": 3600})
 
@@ -1276,7 +1313,17 @@ async def t16():
         answer=_a16,
         message=NS(chat=NS(id="900000001"), chat_id="900000001", message_id="5",
                    edit_message_text=_e16))))
-    check(mod.settings().get("log_channel") is None, "logoff button clears the log channel")
+    check(mod.settings().get("log_channel") is not None,
+          "logoff first tap does NOT clear (confirm screen instead)")
+    _mk = edit16[-1][1].get("reply_markup")
+    _apply = [b.callback_data for row in _mk.inline_keyboard for b in row
+              if "Apply" in b.text]
+    await mod._on_callback(NS(callback_query=NS(
+        from_user=NS(id=900000001), data=_apply[0],
+        answer=_a16,
+        message=NS(chat=NS(id="900000001"), chat_id="900000001", message_id="5",
+                   edit_message_text=_e16))))
+    check(mod.settings().get("log_channel") is None, "Apply clears the log channel")
     mod.save_settings({"log_channel": saved_log})
 
 asyncio.run(t16())
@@ -1750,7 +1797,7 @@ print("\n[23] v3: TGAhermes rename, !setlog here, Actions, wizard, update lock")
 # --- the rename landed where it matters
 _mf = (HERE / "plugin.yaml").read_text(encoding="utf-8")
 check("name: TGAhermes" in _mf, "manifest name is TGAhermes")
-check("version: 3.2.0" in _mf, "manifest version is 3.2.0")
+check("version: 3.3.0" in _mf, "manifest version is 3.3.0")
 check("telegram-guest-mode" not in Path(mod.__file__).read_text(encoding="utf-8"),
       "no old plugin name left in the module source")
 

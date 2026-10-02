@@ -1464,7 +1464,7 @@ def _system_view(st: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _gate_view(st: Dict[str, Any]) -> str:
+def _gate_view(st: Dict[str, Any], note: str = "") -> str:
     """Show exactly what a guest can and cannot do, per mode."""
     mode = str(st.get("guest_tool_mode") or "balanced")
     denied = _guest_allowed(frozenset())
@@ -1499,6 +1499,8 @@ def _gate_view(st: Dict[str, Any]) -> str:
         "<code>settings.json</code>: <code>guest_allow_tools</code> and "
         "<code>guest_deny_tools</code>. Takes effect on the next message.",
     ]
+    if note:
+        lines.insert(1, note)
     return "\n".join(lines)
 
 
@@ -1617,12 +1619,15 @@ def _actions_view(st: Dict[str, Any], note: str = "") -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------- rework bodies (v3.2.0)
+# ---------------------------------------------------------------- rework bodies (v3.3.0)
 # The panel used to be one home grid carrying every flag. It grew to eleven
 # rows and the owner could not find anything (new flows existed but sat one
 # level deep). v3.2.0: home is sections only, every mutation goes through a
 # confirm screen or a wizard, and the whitelist is a per-friend card instead
-# of three separate list pages.
+# of three separate list pages. v3.3.0: no destructive or time-spending
+# button applies on the first tap any more — the tap renders a confirm screen
+# and only the Apply callback writes (`panel:cfmok`; legacy `panel:tgy` is
+# normalised to it at parse time).
 
 # callback sub-key -> (settings key, button label) for confirm-screen toggles.
 # `mode` is special-cased (it cycles rather than flips) and is not listed here.
@@ -1668,6 +1673,155 @@ def _tg_view(sub: str, origin: str, st: Dict[str, Any]) -> str:
             f"now: <b>{'on' if st.get(key) else 'off'}</b> → "
             f"<b>{'on' if nxt else 'off'}</b>\n\n"
             "Tap ✅ Apply to change, ✖ Cancel to go back.")
+
+
+def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
+    """One confirm screen for every mutating button.
+
+    It states the CURRENT value and the NEXT one, plus the consequence, so a tap
+    is never a guess. It changes NOTHING — the Apply callback is the only writer.
+    """
+    if kind == "tg":                      # a settings flag / guest mode cycle
+        sub, _, _origin = (arg or "").partition(":")
+        if sub == "mode":
+            cur = str(st.get("guest_tool_mode") or "balanced")
+            nxt = str(_tg_next("mode", st))
+            return (f"<b>🛡 Guest tool mode</b>\n"
+                    f"now: <b>{_MODE_LABEL.get(cur, cur)}</b> → "
+                    f"<b>{_MODE_LABEL.get(nxt, nxt)}</b>\n\n"
+                    "<b>strict</b> nothing · <b>balanced</b> reads only · "
+                    "<b>open</b> anything — a stranger could act on this box.\n\n"
+                    "Tap ✅ Apply to change, ✖ Cancel to go back.")
+        ent = _TOGGLES.get(sub)
+        if not ent:
+            return "❌ unknown setting."
+        key, label = ent
+        nxt = _tg_next(sub, st)
+        return (f"<b>{label}</b>\n"
+                f"now: <b>{'on' if st.get(key) else 'off'}</b> → "
+                f"<b>{'on' if nxt else 'off'}</b>\n\n"
+                "Tap ✅ Apply to change, ✖ Cancel to go back.")
+
+    if kind == "gs":                      # panel:cfm:gs:<origin>:<uid>:<open|lock|reset>
+        guid, _, gact = (arg or "").partition(":")
+        verb = {"open": "🔓 open", "lock": "🔒 lock",
+                "reset": "▫️ reset to default"}.get(gact, gact or "change")
+        rec = (_guest_sessions() or {}).get(guid) or {}
+        cur = str(rec.get("state") or "default")
+        means = {"open": "may talk without replying to ATRA",
+                 "lock": "answers only the locked reply (cooldown applies)",
+                 "reset": "back to plain stranger rules"}.get(gact, "")
+        return "\n".join([
+            f"<b>{verb} the guest session of <code>{_esc(guid)}</code>?</b>",
+            f"now: <b>{cur}</b>",
+            "",
+            f"after this: <b>{means}</b>",
+            "",
+            "Tap ✅ Apply to change, ✖ Cancel to go back.",
+        ])
+
+    if kind == "log":
+        sub, _, _origin = (arg or "").partition(":")
+        cur = _esc(str(st.get("log_channel") or "off"))
+        if sub == "here":
+            return ("<b>📡 Log into THIS chat?</b>\n"
+                    f"now: <code>{cur}</code>\n\n"
+                    "Everything this plugin logs — guest activity, your own mirror, "
+                    "whitelist messages — lands here from now on. The bot has to be "
+                    "able to post in this chat.\n\n"
+                    "Tap ✅ Apply to change, ✖ Cancel to go back.")
+        return ("<b>📡 Turn the log off?</b>\n"
+                f"now: <code>{cur}</code> → <b>off</b>\n\n"
+                "Nothing is posted to the log chat any more. Guests keep working.\n\n"
+                "Tap ✅ Apply to change, ✖ Cancel to go back.")
+
+    if kind == "sup":                     # panel:cfm:sup:upd:lock
+        on = bool(st.get("update_enabled", True))
+        return ("<b>🔒 Update lock</b>\n"
+                f"now: <b>{'unlocked' if on else '🔒 locked'}</b> → "
+                f"<b>{'🔒 locked' if on else 'unlocked'}</b>\n\n"
+                + ("Locked: the panel's check/install buttons and the selfupdate "
+                   "tool both refuse to run.\n\n" if on else
+                   "Unlocked: check and install are re-enabled on the System page.\n\n")
+                + "Tap ✅ Apply to change, ✖ Cancel to go back.")
+
+    if kind == "upd":                     # panel:cfm:upd:<check|apply>
+        if arg == "apply":
+            return ("<b>⬆️ Install the update?</b>\n"
+                    "It backs up the current files, copies the newer ones, runs the "
+                    "test suite, then hot-reloads. Your settings and learned state "
+                    "are never touched, and if the tests fail nothing is swapped.\n\n"
+                    "This takes about a minute.\n\n"
+                    "Tap ✅ Apply to install, ✖ Cancel to go back.")
+        return ("<b>🔍 Check for an update?</b>\n"
+                "Compares the installed version against the source repo. "
+                "Changes nothing.\n\n"
+                "Tap ✅ Apply to check, ✖ Cancel to go back.")
+
+    if kind == "cool":                    # panel:cfm:cool:<seconds>
+        n = str(arg or "").strip()
+        cur = str(st.get("unauthorized_cooldown_s"))
+        if not n.isdigit():
+            return ("<b>⏱ Cooldown</b>\n"
+                    f"current: <b>{_esc(cur)}s</b>\n\n"
+                    "How long a stranger waits before the canned reply may repeat. "
+                    "Tap a preset below, or type <code>!setcooldown &lt;seconds&gt;</code>.")
+        return ("<b>⏱ Cooldown</b>\n"
+                f"now: <b>{_esc(cur)}s</b> → <b>{_esc(n)}s</b>\n\n"
+                "How long a stranger waits before the canned reply may repeat.\n\n"
+                "Tap ✅ Apply to change, ✖ Cancel to go back.")
+
+    if kind == "wl":                      # panel:cfm:wl:<uid>:<level>
+        uid, _, lvl = (arg or "").partition(":")
+        if lvl in _FRIEND_LEVELS:
+            cur = _friend_level(uid)
+            return ("<b>🛡 Permission level</b>\n"
+                    f"<code>{_esc(uid)}</code>: <b>"
+                    f"{_FRIEND_LEVEL_LABEL.get(cur, cur)}</b> → <b>"
+                    f"{_FRIEND_LEVEL_LABEL[lvl]}</b>\n\n"
+                    "<b>talk</b> safe read-only tools · <b>gate</b> the guest tool "
+                    "rules · <b>full</b> no tool gating.\n\n"
+                    "Tap ✅ Apply to change, ✖ Cancel to go back.")
+        return ("<b>🛡 Permission level</b>\n"
+                "Pick the level on this page.\n\n"
+                "<b>talk</b> safe read-only tools · <b>gate</b> the guest tool "
+                "rules · <b>full</b> no tool gating.")
+
+    if kind == "gate":                    # panel:cfm:gate:<origin>:<grant|revoke>:<chat>
+        word, _, chat = (arg or "").partition(":")
+        if word not in ("grant", "revoke") or not chat:
+            return ("<b>🛡 Guest tool gate</b>\n"
+                    f"mode: <b>"
+                    f"{_MODE_LABEL.get(str(st.get('guest_tool_mode') or 'balanced'), 'balanced')}</b>"
+                    "\n\nGuests are limited to the read-only tools on this box.\n\n"
+                    "Tap ✅ Apply to open the full rules.")
+        unlocked = str(chat) in {str(c) for c in (st.get("guest_owner_chats") or [])}
+        if word == "grant":
+            if unlocked:
+                return (f"<b>➕ <code>{_esc(chat)}</code></b>\n"
+                        "now: <b>already unlocked for your account</b>\n\n"
+                        "Nothing to do — tap ✖ Cancel to go back.")
+            return ("\n".join([
+                f"<b>Unlock <code>{_esc(chat)}</code> for your account?</b>",
+                "now: <b>locked</b> → <b>unlocked</b>",
+                "",
+                "In this chat a guest is not limited to the read-only tools — it gets "
+                "your owner's access. Treat anyone who can message there as yourself.",
+                "",
+                "Tap ✅ Apply to unlock, ✖ Cancel to go back."]))
+        if not unlocked:
+            return (f"<b>➖ <code>{_esc(chat)}</code></b>\n"
+                    "now: <b>not unlocked</b>\n\n"
+                    "Nothing to do — tap ✖ Cancel to go back.")
+        return ("\n".join([
+            f"<b>Revoke owner access in <code>{_esc(chat)}</code>?</b>",
+            "now: <b>unlocked</b> → <b>locked</b>",
+            "",
+            "A guest there goes back to the read-only tools.",
+            "",
+            "Tap ✅ Apply to lock, ✖ Cancel to go back."]))
+
+    return "❌ unknown action."
 
 
 def _settings_view(st: Dict[str, Any], note: str = "") -> str:
@@ -1745,7 +1899,8 @@ def _wlrm_view(uid: str, st: Dict[str, Any]) -> str:
     ])
 
 
-def _view_body(view: str, st: Dict[str, Any], note: str = "") -> str:
+def _view_body(view: str, st: Dict[str, Any], note: str = "",
+               arg: str = "") -> str:
     """Body for a view name — used after Apply/Cancel so every return lands
     back on the right page instead of dumping the owner on the home grid."""
     def _with(body: str) -> str:
@@ -1779,6 +1934,10 @@ def _view_body(view: str, st: Dict[str, Any], note: str = "") -> str:
                      f"canned reply may repeat\ncurrent: "
                      f"<b>{st.get('unauthorized_cooldown_s')}s</b>\n"
                      "Tap a preset, or type <code>!setcooldown &lt;seconds&gt;</code>")
+    if view == "cfm":
+        _o, _, _kp = (arg or "").partition(":")
+        _k, _, _p = _kp.partition(":")
+        return _with(_cfm_view(_k, _p, st))
     return _panel_text(st, note)
 
 
@@ -1879,8 +2038,16 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
                 add((f"\u25ab\ufe0f Default {_uid}", f"panel:gs:reset:{_uid}"))
         add(("\u2795 Open a new session", "panel:wiz:gsopen"))
         add(("\U0001f512 Lock by id", "panel:wiz:gslock"))
+    elif view == "cfm":
+        # arg is "<origin>:<kind>:<payload>". Apply is the ONLY writer, and it
+        # is rendered here rather than per-kind so no button can skip it.
+        _o, _, _kp = (arg or "").partition(":")
+        _k, _, _p = _kp.partition(":")
+        rows.insert(0, [
+            B("✅ Apply", callback_data=f"{_CB_PREFIX}panel:cfmok:{_k}:{_o}:{_p}"),
+            B("✖ Cancel", callback_data=f"{_CB_PREFIX}panel:view:{_o or 'panel'}")])
     elif view == "wiz":
-        add(("\u2716 Cancel the wizard", "panel:wizcancel"))
+        add(("✖ Cancel the wizard", "panel:wizcancel"))
     elif view == "status":
         add(("\u2699\ufe0f Settings", "panel:out:settings"), ("\U0001f4cb Users", "panel:out:users"))
         add((f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:tg:tool:status"),
@@ -1962,7 +2129,13 @@ _VIEW_LABEL = {"full": "📜 Full help", "panel": "🧩 Console", "out": "📋 O
                "cool": "⏱ Cooldown", "system": "🔧 System", "safeguard": "🛡 Safeguards",
                "actions": "⚡ Actions", "gsess": "🔐 Guest sessions", "wiz": "📝 Wizard",
                "settings": "⚙️ Settings", "wl": "🛡 Whitelist", "wlfr": "👤 Friend",
-               "wlrm": "🗑 Remove", "tg": "✅ Confirm"}
+               "wlrm": "🗑 Remove", "tg": "✅ Confirm", "cfm": "✅ Confirm"}
+
+# One confirm vocabulary: every mutating button first renders
+# `panel:cfm:<kind>:...` (read-only, states now → next), and only the Apply
+# button writes — `panel:tgy` for settings flags, `panel:upd` for updates,
+# `panel:cfmok` for the rest. Nothing else in the panel writes a setting.
+_CFM_KINDS = {"tg", "gs", "log", "upd", "sup", "cool", "wl", "gate"}
 
 
 def _msg_chat_id(msg: Any) -> Optional[str]:
@@ -2721,11 +2894,19 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             toggles = _TOGGLES   # one map, shared by legacy taps + confirm flow
             view, note, body = "panel", "", ""
             arg = ""   # card target for wlfr/wlrm, "sub:origin" for a confirm screen
+            if action == "tgy" and len(bits) > 3:
+                # Pre-v3.3 panels still show this Apply name. Normalise it here
+                # so there is exactly one writer to audit: panel:cfmok.
+                _legacy_origin = bits[4] if len(bits) > 4 else "settings"
+                action, sub, bits = ("cfmok", "tg",
+                                     ["tgm", "panel", "cfmok", "tg",
+                                      _legacy_origin, bits[3]])
             if action == "toggle" and sub in toggles:
-                key, label = toggles[sub]
-                save_settings({key: not bool(st.get(key))})
-                st = settings()
-                note = f"{label} → <b>{'on' if st.get(key) else 'off'}</b>"
+                # v3.3: legacy callback name, kept so panels rendered before the
+                # reload keep working — but it routes through the confirm screen
+                # like every other flag, it does not flip anything itself.
+                view, arg = "cfm", f"settings:tg:{sub}"
+                body = _cfm_view("tg", f"{sub}:settings", st)
             elif action == "settings":
                 view, body = "settings", _settings_view(st)
             elif action == "wl":
@@ -2733,20 +2914,17 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             elif action == "wlfr" and sub:
                 view, body, arg = "wlfr", _wlfr_view(sub, st), sub
             elif action == "wllvl":
-                # panel:wllvl:<uid>:<level> — one tap on a friend card
+                # v3.3: changing a friend's permission level confirms first.
                 lvl = bits[4] if len(bits) > 4 else ""
-                view = "wl"
                 if sub and lvl in _FRIEND_LEVELS:
-                    out = await _bang_execute(ad, _msg_chat_id(q.message) or "",
-                                              f"!whitelist perms {sub} {lvl}")
-                    st = settings()
-                    body = _wl_view(st, note=out or (
-                        f"✅ <code>{_esc(sub)}</code> → {_FRIEND_LEVEL_LABEL[lvl]}"))
+                    view, arg = "cfm", f"wl:wl:{sub}:{lvl}"
+                    body = _cfm_view("wl", f"{sub}:{lvl}", st)
                 else:
-                    body = _wl_view(st)
+                    view, body = "wl", _wl_view(st)
             elif action == "wlrm" and sub:
                 view, body, arg = "wlrm", _wlrm_view(sub, st), sub
             elif action == "wlrm2" and sub:
+                # v3.3: the second tap is the confirm — removal happens here.
                 view = "wl"
                 out = await _bang_execute(ad, _msg_chat_id(q.message) or "",
                                           f"!whitelist remove {sub}")
@@ -2757,146 +2935,212 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                 origin = bits[4] if len(bits) > 4 else "settings"
                 view, arg = "tg", f"{sub}:{origin}"
                 body = _tg_view(sub, origin, st)
-            elif action == "tgy" and sub:
-                # apply from the confirm screen, land back on the origin page
-                origin = bits[4] if len(bits) > 4 else "settings"
-                if sub == "mode":
-                    nxt = _tg_next("mode", st)
-                    save_settings({"guest_tool_mode": nxt})
-                    st = settings()
-                    note = f"🛡 guest mode → <b>{_MODE_LABEL.get(nxt, nxt)}</b>"
-                    await _log("🛡 Guest tool mode",
-                               f"Mode set to <b>{nxt}</b> (owner {_esc(str(_owner_id()))})")
-                elif sub in _TOGGLES:
-                    key, label = _TOGGLES[sub]
-                    on = bool(_tg_next(sub, st))
-                    save_settings({key: on})
-                    st = settings()
-                    note = f"{label} → <b>{'on' if on else 'off'}</b>"
-                    if sub == "owner":
-                        await _log("🛡 Guest owner access",
-                                   f"{'enabled' if on else 'disabled'} for "
-                                   "unlocked guest chats")
-                view = origin if origin in _VIEW_LABEL else "settings"
-                body = _view_body(view, st, note)
             elif action == "view" and sub:
                 # generic landing (Cancel buttons): panel:view:<name>
                 view = sub if sub in _VIEW_LABEL else "panel"
                 body = _view_body(view, st, note)
             elif action == "cool":
                 if sub.isdigit():
-                    save_settings({"unauthorized_cooldown_s": int(sub)})
-                    st = settings()
-                    note = f"⏱ cooldown → <b>{st.get('unauthorized_cooldown_s')}s</b>"
+                    # v3.3: a cooldown preset is a mutation, so it gets a confirm
+                    # screen too. The bare number no longer writes on first tap.
+                    view, arg = "cfm", f"cool:cool:{sub}"
+                    body = _cfm_view("cool", sub, st)
                 else:
                     view = "cool"
                     body = (f"<b>⏱ Cooldown</b> — how long a stranger waits before the "
                             f"canned reply may repeat\ncurrent: <b>{st.get('unauthorized_cooldown_s')}s</b>\n"
                             "Tap a preset, or type <code>!setcooldown &lt;seconds&gt;</code>")
             elif action == "gate":
-                if sub == "list":
+                # v3.3: `panel:gate` with no sub used to match no branch at all and
+                # land back on the home grid with no body — the reported bug. An
+                # empty sub now opens the gate page itself (it is read-only).
+                if not sub:
                     view, body = "safeguard", _gate_view(st)
-                elif sub == "mode":
-                    order = ["strict", "balanced", "open"]
-                    cur = str(st.get("guest_tool_mode") or "balanced")
-                    nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "balanced"
-                    save_settings({"guest_tool_mode": nxt})
-                    st = settings()
-                    note = f"🛡 guest mode → <b>{_MODE_LABEL.get(nxt, nxt)}</b>"
-                    body = _gate_view(st)
-                    view = "safeguard"
-                    await _log("🛡 Guest tool mode",
-                               f"Mode set to <b>{nxt}</b> (owner {_esc(str(_owner_id()))})")
-                elif sub == "owner":
-                    on = not bool(st.get("guest_owner_full_access", False))
-                    save_settings({"guest_owner_full_access": on})
-                    st = settings()
-                    note = ("🔓 owner access ON in unlocked guest chats" if on
-                            else "🔒 owner access OFF — everyone is gated here, you included")
-                    body = _gate_view(st)
-                    view = "safeguard"
-                    await _log("🛡 Guest owner access",
-                               f"{'enabled' if on else 'disabled'} for unlocked guest chats")
-                elif sub and sub.startswith("grant:"):
-                    chat_key = sub.split(":", 1)[1].strip()
-                    cur_list = [str(c) for c in (st.get("guest_owner_chats") or [])]
-                    if chat_key and chat_key not in cur_list:
-                        cur_list.append(chat_key)
-                        save_settings({"guest_owner_chats": cur_list})
-                    st = settings()
-                    note = f"➕ unlocked <code>{_esc(chat_key)}</code> for your account"
-                    body = _gate_view(st)
-                    view = "safeguard"
-                    await _log("🛡 Guest chat unlocked", f"Unlocked for owner: {chat_key}")
-                elif sub and sub.startswith("revoke:"):
-                    chat_key = sub.split(":", 1)[1].strip()
-                    cur_list = [str(c) for c in (st.get("guest_owner_chats") or [])
-                                if str(c) != chat_key]
-                    save_settings({"guest_owner_chats": cur_list})
-                    st = settings()
-                    note = f"➖ revoked <code>{_esc(chat_key)}</code>"
-                    body = _gate_view(st)
-                    view = "safeguard"
-                    await _log("🛡 Guest chat locked", f"Revoked owner unlock: {chat_key}")
+                elif sub == "list":
+                    view, body = "safeguard", _gate_view(st)
+                elif sub == "mode" or sub == "owner":
+                    # cycles a setting, so it goes behind the confirm screen
+                    view, arg = "cfm", f"safeguard:tg:{sub}"
+                    body = _cfm_view("tg", f"{sub}:safeguard", st)
+                elif sub.startswith("grant:") or sub.startswith("revoke:"):
+                    # v3.3: unlocking a chat for the owner's account grants real
+                    # access, so it confirms first — it is not a navigation tap.
+                    _w, chat_key = sub.split(":", 1)[0], sub.split(":", 1)[-1]
+                    cur = [str(c) for c in (st.get("guest_owner_chats") or [])]
+                    view, arg = "cfm", f"safeguard:gate:{_w}:{chat_key}"
+                    body = _cfm_view("gate", f"{_w}:{chat_key}", st)
             elif action == "gslist":
                 view, body = "gsess", _gsess_view(st)
             elif action == "gs":
-                # panel:gs:<open|lock|reset>:<uid> — same states as !gs
+                # v3.3: guest-session flips used to apply on the first tap. They
+                # now land on the confirm screen; panel:cfmok is the only writer.
                 parts = data.split(":")
                 gact = parts[3] if len(parts) > 3 else ""
                 guid = parts[4] if len(parts) > 4 else ""
-                gstate = {"open": "open", "lock": "locked", "reset": "default"}.get(gact)
-                if guid and gstate:
-                    _set_guest_session(guid, gstate, by="owner")
-                    marks = {"open": "🔓 open", "locked": "🔒 locked", "default": "▫️ default"}
-                    note = f"🔐 <code>{_esc(guid)}</code> → <b>{marks[gstate]}</b>"
-                    await _log("🔐 Guest session",
-                               f"<code>{_esc(guid)}</code> → <b>{marks[gstate]}</b> (panel)")
-                view, body = "gsess", _gsess_view(st)
-            elif action == "upd":
-                # Runs git + the test suite, so hand control back to the user
-                # with a "working" toast before it blocks.
-                report = None
-                if sub == "lock":
+                _gpay = f"{guid}:{gact}"
+                view, arg = "cfm", f"gsess:gs:{_gpay}"
+                body = _cfm_view("gs", _gpay, st)
+            elif action == "cfm" and sub in _CFM_KINDS:
+                # read-only confirm screen. Layout is panel:cfm:<kind>:<origin>:
+                # <payload>, and the payload may itself contain colons (chat
+                # keys, uid:level), so the tail is rejoined, never read as one bit.
+                _k2 = sub
+                _o2 = bits[4] if len(bits) > 4 else ""
+                _p2 = ":".join(bits[5:])
+                view, arg = "cfm", f"{_o2}:{_k2}:{_p2}"
+                body = _cfm_view(_k2, _p2, st)
+            elif action == "cfmok" and sub in _CFM_KINDS:
+                # THE writer — one place where Apply changes a setting. The
+                # callback is `cfmok:<kind>:<origin>:<payload>`; the origin is
+                # stripped first so each kind parses only its own payload.
+                _kind = sub
+                _origin, _, _pay = (":".join(bits[4:])).partition(":")
+                st = settings()
+                if _kind == "tg":
+                    _ts, _to = _pay, (_origin or "settings")
+                    # Land back on the page the tap came from, not on the home
+                    # grid — otherwise a mode change from Safeguards dumps you
+                    # out of the section you were working in.
+                    view = _to if _to in _VIEW_LABEL else "settings"
+                    if _ts == "mode":
+                        nxt = _tg_next("mode", st)
+                        save_settings({"guest_tool_mode": nxt})
+                        st = settings()
+                        note = f"🛡 guest mode → <b>{_MODE_LABEL.get(nxt, nxt)}</b>"
+                        await _log("🛡 Guest tool mode",
+                                   f"Mode set to <b>{nxt}</b> (owner {_esc(str(_owner_id()))})")
+                    elif _ts in _TOGGLES:
+                        key, label = _TOGGLES[_ts]
+                        on = bool(_tg_next(_ts, st))
+                        save_settings({key: on})
+                        st = settings()
+                        note = f"{label} → <b>{'on' if on else 'off'}</b>"
+                        if _ts == "owner":
+                            await _log("🛡 Guest owner access",
+                                       f"{'enabled' if on else 'disabled'} for "
+                                       "unlocked guest chats")
+                    else:
+                        note = "❌ unknown setting."
+                        view = "settings"
+                    view, body = view, _view_body(view, st, note, arg=f"{_ts}:{view}")
+                elif _kind == "gs":
+                    _guid, _, _gact = _pay.partition(":")
+                    gstate = {"open": "open", "lock": "locked",
+                              "reset": "default"}.get(_gact)
+                    if _guid and gstate:
+                        _set_guest_session(_guid, gstate, by="owner")
+                        marks = {"open": "🔓 open", "locked": "🔒 locked",
+                                 "default": "▫️ default"}
+                        note = f"🔐 <code>{_esc(_guid)}</code> → <b>{marks[gstate]}</b>"
+                        await _log("🔐 Guest session",
+                                   f"<code>{_esc(_guid)}</code> → <b>{marks[gstate]}</b> (panel)")
+                    else:
+                        note = "❌ unknown session action."
+                    view, body = "gsess", _gsess_view(st)
+                elif _kind == "cool" and _pay.isdigit():
+                    save_settings({"unauthorized_cooldown_s": int(_pay)})
+                    st = settings()
+                    note = f"⏱ cooldown → <b>{st.get('unauthorized_cooldown_s')}s</b>"
+                    view, body = "cool", _view_body("cool", st, note)
+                elif _kind == "sup" and _pay == "lock":
                     on = not bool(st.get("update_enabled", True))
                     save_settings({"update_enabled": on})
                     st = settings()
                     note = ("🔓 updates unlocked — check/install re-enabled" if on
                             else "🔒 updates locked — check, install and the "
                                  "selfupdate tool now refuse")
+                    view, body = "system", _view_body("system", st, note)
                     await _log("🔧 Updates",
                                f"Updates {'unlocked' if on else 'locked'} by owner")
-                elif sub == "apply":
-                    await q.answer("⬆️ updating… this takes a minute", show_alert=False)
-                    report = await _run_selfupdate(apply=True, force=False)
-                    note = _update_note(report)
+                elif _kind == "upd" and _pay in ("check", "apply"):
+                    # Runs git + the test suite, so hand control back to the user
+                    # with a "working" toast before it blocks.
+                    await q.answer("⬆️ updating… this takes a minute"
+                                   if _pay == "apply" else "🔍 checking…",
+                                   show_alert=False)
+                    report = await _run_selfupdate(apply=(_pay == "apply"), force=False)
+                    st = settings()
+                    view, note = "system", _update_note(report)
+                    body = _view_body("system", st) + (f"\n\n{_update_note(report)}"
+                                                     if report else "")
+                elif _kind == "log" and _pay in ("here", "off"):
+                    if _pay == "off":
+                        prev = st.get("log_channel")
+                        save_settings({"log_channel": None})
+                        st = settings()
+                        view = "log"
+                        note = (f"\U0001f4e1 log → <b>off</b> "
+                                f"(was <code>{_esc(str(prev))}</code>)")
+                        body = _view_body("log", st, note)
+                    else:
+                        cid = _msg_chat_id(q.message) or ""
+                        view = "actions"
+                        if not cid or str(cid).startswith(GUEST_CHAT_PREFIX):
+                            note = ("❌ open the panel inside the chat you want to log, "
+                                    "then tap Log here")
+                            body = _actions_view(st, note)
+                        else:
+                            save_settings({"log_channel": str(cid)})
+                            st = settings()
+                            await _log("🧭 Log channel configured",
+                                       "Log channel set — guest-mode activity will "
+                                       "be posted here.")
+                            body = _actions_view(
+                                st, f"✅ now logging into <code>{_esc(cid)}</code>")
+                elif _kind == "gate":
+                    _gword, _, _gchat = _pay.partition(":")
+                    cur_list = [str(c) for c in (st.get("guest_owner_chats") or [])]
+                    view = "safeguard"
+                    if _gword == "grant" and _gchat and _gchat not in cur_list:
+                        cur_list.append(_gchat)
+                        save_settings({"guest_owner_chats": cur_list})
+                        st = settings()
+                        note = f"➕ unlocked <code>{_esc(_gchat)}</code> for your account"
+                        await _log("🛡 Guest chat unlocked",
+                                   f"Unlocked for owner: {_esc(_gchat)}")
+                    elif _gword == "revoke" and _gchat:
+                        cur_list = [c for c in cur_list if c != _gchat]
+                        save_settings({"guest_owner_chats": cur_list})
+                        st = settings()
+                        note = f"➖ revoked <code>{_esc(_gchat)}</code>"
+                        await _log("🛡 Guest chat locked",
+                                   f"Revoked owner unlock: {_esc(_gchat)}")
+                    else:
+                        note = "❌ unknown action."
+                    body = _gate_view(st, note)
+                elif _kind == "wl":
+                    _wuid, _, _wlvl = _pay.partition(":")
+                    view = "wl"
+                    if _wuid and _wlvl in _FRIEND_LEVELS:
+                        out = await _bang_execute(ad, _msg_chat_id(q.message) or "",
+                                                  f"!whitelist perms {_wuid} {_wlvl}")
+                        st = settings()
+                        body = _wl_view(st, note=out or (
+                            f"✅ <code>{_esc(_wuid)}</code> → {_FRIEND_LEVEL_LABEL[_wlvl]}"))
+                    else:
+                        body = _wl_view(st)
                 else:
-                    await q.answer("🔍 checking…", show_alert=False)
-                    report = await _run_selfupdate(apply=False)
-                    note = _update_note(report)
-                st = settings()
-                view = "system"
-                body = _system_view(st) + (f"\n\n{_update_note(report)}" if report else "")
+                    # unknown kind — refuse, never guess a target page
+                    note = "❌ unknown action."
+                    view = "panel"
+                    body = _panel_text(st, note)
+            elif action == "upd":
+                # v3.3: check/install/lock all spend real time or change a
+                # setting, so none of them runs on the first tap any more.
+                if sub in ("check", "apply", "lock"):
+                    _kind = "sup" if sub == "lock" else "upd"
+                    view, arg = "cfm", f"system:{_kind}:{sub}"
+                    body = _cfm_view(_kind, sub, st)
             elif action == "logoff" and st.get("log_channel"):
-                prev = st.get("log_channel")
-                save_settings({"log_channel": None})
-                st = settings()
-                note = f"\U0001f4e1 log \u2192 <b>off</b> (was <code>{_esc(prev)}</code>)"
+                # v3.3: turning the log off is a confirm screen, not a tap.
+                view, arg = "cfm", "log:log:off"
+                body = _cfm_view("log", "off", st)
             elif action == "actions":
                 view, body = "actions", _actions_view(st)
             elif action == "sethere":
-                view = "actions"
-                cid = _msg_chat_id(q.message) or ""
-                if not cid or str(cid).startswith(GUEST_CHAT_PREFIX):
-                    note = ("❌ open the panel inside the chat you want to log, "
-                            "then tap Log here")
-                    body = _actions_view(st, note)
-                else:
-                    save_settings({"log_channel": str(cid)})
-                    st = settings()
-                    await _log("🧭 Log channel configured",
-                               "Log channel set — guest-mode activity will be posted here.")
-                    body = _actions_view(st, f"✅ now logging into <code>{_esc(cid)}</code>")
+                # v3.3: same — the confirm states which chat will be logged.
+                view, arg = "cfm", "actions:log:here"
+                body = _cfm_view("log", "here", st)
             elif action == "wizcancel":
                 _wizard_cancel(_msg_chat_id(q.message) or "")
                 view, body = "actions", _actions_view(st, "✖ wizard cancelled")
