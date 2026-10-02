@@ -1577,6 +1577,8 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
             (f"\U0001f5e8 Other msgs {_mark('log_other_messages')}", "panel:toggle:omsgs"))
         add(("\U0001f4cb Users", "panel:out:users"), ("⚙️ Settings", "panel:out:settings"),
             ("\U0001f6e1 Whitelist", "panel:out:whitelist"))
+        add(("\U0001f510 Friend perms", "panel:wiz:wlperm"), ("\U0001f6e1 Safeguards", "panel:gate"),
+            ("\U0001f510 Guest sessions", "panel:gslist"))
         add(("\U0001f47b Guest texts", "panel:out:guests"),
             (f"⏱ Cooldown {st.get('unauthorized_cooldown_s')}s", "panel:cool"))
     elif view == "actions":
