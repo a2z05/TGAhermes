@@ -1044,14 +1044,89 @@ def _read_allow_from() -> List[str]:
     return [x.strip() for x in str(raw or "").split(",") if x.strip()]
 
 
+def _gate_allow_raw() -> str:
+    """What the CORE gate sees: this process's TELEGRAM_ALLOWED_USERS env value.
+
+    Deliberately separate from adapter.extra.allow_from — the authz mixin reads
+    the env var first, and when it is non-empty it never consults the plugin's
+    list. !auth shows this next to the other two so a divergence is visible.
+    """
+    return str(os.environ.get("TELEGRAM_ALLOWED_USERS") or "").strip()
+
+
+def _sync_gate_allowlists(csv: str, *, env_path: Any = None,
+                          environ: Any = None) -> bool:
+    """Mirror allow_from into the CORE gate's own allowlists (.env + os.environ).
+
+    Why this exists (2026-10-02): the gateway's authz mixin has its own
+    allowlist tier. ``_principal_authorized`` reads TELEGRAM_ALLOWED_USERS from
+    the environment and, because that var is non-empty, it NEVER consults
+    ``telegram.extra.allow_from`` — the list the panel edits. So a friend added
+    in the panel was still dropped by the core as "Dropped a message from
+    unrecognized telegram user".
+
+    Semantics: UNION, not mirror — ids already approved in .env (operator
+    hand-entries) survive, the owner id is always kept, and only then come the
+    config's ids. Revoking someone means removing them from BOTH sides, which
+    the plugin's own prefilter still enforces either way; this tier is
+    admission plumbing, not the reply gate.
+
+    Two writes, deliberately: ``.env`` survives a gateway restart (this var is
+    not re-read for per-turn rotated keys), while the environ dict (defaults to
+    os.environ) is what the running process reads today. Both are best-effort;
+    ``env_path``/``environ`` exist so the harness can test this without ever
+    touching the real .env.
+    """
+    if not csv:
+        return False
+    env_path = Path(env_path) if env_path else Path(_hermes_home()) / ".env"
+    environ = os.environ if environ is None else environ
+    owner = str(_owner_id() or "")
+    new_ids = [x.strip() for x in str(csv).split(",") if x.strip()]
+    try:
+        lines = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as e:
+        logger.warning("[TGAhermes] .env allowlist read failed: %s", e)
+        lines = None
+    prev: List[str] = []
+    if lines is not None:
+        for raw in lines:
+            s = raw.strip()
+            if s.startswith("TELEGRAM_ALLOWED_USERS=") and not s.startswith("#"):
+                prev = [x.strip() for x in s.split("=", 1)[1].split(",") if x.strip()]
+                break
+    merged = list(dict.fromkeys(
+        [x for x in [owner] + prev + new_ids if x]))
+    value = ",".join(merged)
+    if lines is not None:
+        try:
+            done = False
+            for idx, raw in enumerate(lines):
+                s = raw.strip()
+                if s.startswith("TELEGRAM_ALLOWED_USERS=") and not s.startswith("#"):
+                    lines[idx] = raw[:raw.index("=") + 1] + value
+                    done = True
+            if not done:
+                lines.append(f"TELEGRAM_ALLOWED_USERS={value}")
+            env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            os.chmod(env_path, 0o600)
+            logger.info("[TGAhermes] .env allowlist synced: %s", value)
+        except OSError as e:
+            logger.warning("[TGAhermes] .env allowlist write failed: %s", e)
+    environ["TELEGRAM_ALLOWED_USERS"] = value
+    return True
+
+
 def _write_allow_from(ids: List[str]) -> bool:
     """Persist telegram.extra.allow_from via the hermes CLI (subprocess — safe from the gateway).
 
-    Two hard lessons encoded here: the owner id is always merged back in
-    (_allow_csv), and the file alone is not enough — the running adapter keeps
+    Three hard lessons encoded here: the owner id is always merged back in
+    (_allow_csv), the file alone is not enough — the running adapter keeps
     its own snapshot, so the new value is pushed into it directly
     (_sync_allow_from_live) instead of trusting the plugin reload to do it
-    (it does not; measured 2026-10-02).
+    (it does not; measured 2026-10-02), and the core gate keeps a THIRD copy
+    in .env / os.environ that also has to move (_sync_gate_allowlists) or the
+    owner watches friends get dropped by the gateway as unrecognized senders.
     """
     csv = _allow_csv(ids)
     if not csv:
@@ -1072,10 +1147,11 @@ def _write_allow_from(ids: List[str]) -> bool:
             logger.error("[TGAhermes] config set failed: %s",
                          (proc.stderr or proc.stdout or "")[:400])
             return False
+        _sync_gate_allowlists(csv)   # the core gate's own tier (.env + this process)
         _sync_allow_from_live(csv)   # immediate: the very next message already passes
         _nudge_gateway_reload()      # + rewire the plugin handlers
-        logger.info("[TGAhermes] allow_from write verified: file=%s adapter=%s",
-                    _read_allow_from(), _adapter_allow_raw())
+        logger.info("[TGAhermes] allow_from write verified: file=%s adapter=%s gate=%s",
+                    _read_allow_from(), _adapter_allow_raw(), _gate_allow_raw())
         return True
     except Exception:
         logger.exception("[TGAhermes] whitelist write failed")
@@ -1174,6 +1250,7 @@ def _sync_allow_from_live(csv: str) -> bool:
             return False
         extra["allow_from"] = csv
         logger.info("[TGAhermes] live allow_from synced: %s", csv)
+        _sync_gate_allowlists(csv)   # keep the core gate's env tier in step too
         return True
     except Exception:
         logger.exception("[TGAhermes] live allow_from sync failed")
@@ -1476,31 +1553,26 @@ def _panel_text(st: Optional[Dict[str, Any]] = None, note: str = "") -> str:
     """Dashboard for !panel — live status lines + the glass buttons beneath it."""
     st = st or settings()
     wl = _read_allow_from()
-
-    def _flag(key: str) -> str:
-        return "<b>on</b>" if st.get(key) else "<b>off</b>"
+    friends = [u for u in wl if u != str(_owner_id() or "")]
 
     lines = [
-        f"🧩 <b>ATRA console</b> v{_plugin_version()} — owner only",
-        f"📡 log: <code>{_esc(st.get('log_channel') or 'off')}</code> · "
-        f"🛡 whitelist: <b>{len(wl)}</b> · 👑 owner: <code>{_esc(_owner_id() or 'unset')}</code>",
-        f"🔁 reactions: {_flag('auto_react')} · 👥 guest reacts: {_flag('react_guests')} · "
-        f"🖼 guest media: {_flag('media_to_guests')}",
-        f"⏱ cooldown: <b>{_esc(st.get('unauthorized_cooldown_s'))}s</b> · "
-        f"👑 mirror: {_flag('log_owner_messages')} · 📣 mentions: {_flag('log_group_mentions')} · "
-        f"🛠 tool: {_flag('tool_enabled')}",
-        f"💬 whitelisted msgs: {_flag('log_whitelisted_messages')} · "
-        f"🗨 other msgs: {_flag('log_other_messages')}",
+        f"\U0001f9e9 <b>ATRA console</b> v{_plugin_version()}",
+        "",
+        f"\U0001f4e1 log: <code>{_esc(st.get('log_channel') or 'off')}</code> · "
+        f"\U0001f451 owner: <code>{_esc(_owner_id() or 'unset')}</code>",
+        f"\U0001f6e1 friends: <b>{len(friends)}</b> · "
+        f"\u23f1 stranger cooldown: <b>{_esc(st.get('unauthorized_cooldown_s'))}s</b>",
+        f"\U0001f6e1 guest tool mode: <b>"
+        f"{_MODE_LABEL.get(str(st.get('guest_tool_mode') or 'balanced'), 'balanced')}</b> · "
+        f"\U0001f6e0 admin tool: <b>{'on' if st.get('tool_enabled') else 'off'}</b>",
     ]
     if note:
         lines.append(note)
     lines += [
         "",
-        "<b>⚡ Actions</b> — tap it for guided flows (log here, whitelist, send DM, "
-        "wipe, updates): answer a prompt instead of typing a command.",
-        "<b>Sections</b> — tap a button, or type a command:",
-        "<code>!panel</code> · <code>!help</code> · <code>!setlog here</code> · "
-        "<code>!wipe &lt;chat_id&gt;</code> · <code>!whitelist add &lt;id&gt;</code>",
+        "<b>Pick a section below</b> — everything lives in there.",
+        "For a one-step job tap <b>⚡ Actions</b>: it asks you, you just answer.",
+        "<code>!panel</code> reloads this · <code>!help</code> the command list",
     ]
     return "\n".join(lines)
 
@@ -1545,9 +1617,177 @@ def _actions_view(st: Dict[str, Any], note: str = "") -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- rework bodies (v3.2.0)
+# The panel used to be one home grid carrying every flag. It grew to eleven
+# rows and the owner could not find anything (new flows existed but sat one
+# level deep). v3.2.0: home is sections only, every mutation goes through a
+# confirm screen or a wizard, and the whitelist is a per-friend card instead
+# of three separate list pages.
+
+# callback sub-key -> (settings key, button label) for confirm-screen toggles.
+# `mode` is special-cased (it cycles rather than flips) and is not listed here.
+_TOGGLES: Dict[str, Tuple[str, str]] = {
+    "react": ("auto_react", "🔁 reactions"),
+    "greact": ("react_guests", "👥 guest reacts"),
+    "media": ("media_to_guests", "🖼 guest media"),
+    "mirror": ("log_owner_messages", "👑 mirror"),
+    "mentions": ("log_group_mentions", "📣 group mentions"),
+    "tool": ("tool_enabled", "🛠 admin tool"),
+    "wmsgs": ("log_whitelisted_messages", "💬 whitelisted msgs"),
+    "omsgs": ("log_other_messages", "🗨 other msgs"),
+    "owner": ("guest_owner_full_access", "🔓 owner access in unlocked guest chats"),
+}
+
+
+def _tg_next(sub: str, st: Dict[str, Any]) -> Any:
+    """Next value behind a confirm screen: booleans flip, guest mode cycles."""
+    if sub == "mode":
+        order = ["strict", "balanced", "open"]
+        cur = str(st.get("guest_tool_mode") or "balanced")
+        return order[(order.index(cur) + 1) % len(order)] if cur in order else "balanced"
+    ent = _TOGGLES.get(sub)
+    if not ent:
+        return None
+    return not bool(st.get(ent[0]))
+
+
+def _tg_view(sub: str, origin: str, st: Dict[str, Any]) -> str:
+    """Confirm screen body — now → next, nothing applied until Apply."""
+    if sub == "mode":
+        cur = str(st.get("guest_tool_mode") or "balanced")
+        nxt = str(_tg_next("mode", st))
+        return ("<b>🛡 Guest tool mode</b>\n"
+                f"now: <b>{_MODE_LABEL.get(cur, cur)}</b> → <b>{_MODE_LABEL.get(nxt, nxt)}</b>\n\n"
+                "Tap ✅ Apply to change, ✖ Cancel to go back.")
+    ent = _TOGGLES.get(sub)
+    if not ent:
+        return "❌ unknown setting."
+    key, label = ent
+    nxt = _tg_next(sub, st)
+    return (f"<b>{label}</b>\n"
+            f"now: <b>{'on' if st.get(key) else 'off'}</b> → "
+            f"<b>{'on' if nxt else 'off'}</b>\n\n"
+            "Tap ✅ Apply to change, ✖ Cancel to go back.")
+
+
+def _settings_view(st: Dict[str, Any], note: str = "") -> str:
+    """All flags in one place — each with its own confirm screen."""
+    def _f(k: str) -> str:
+        return "<b>on</b>" if st.get(k) else "<b>off</b>"
+    lines = [
+        "<b>⚙️ Settings</b> — tap a flag → confirm screen → applied",
+        f"🔁 reactions: {_f('auto_react')} · 👥 guest reacts: {_f('react_guests')} · "
+        f"🖼 guest media: {_f('media_to_guests')}",
+        f"👑 mirror: {_f('log_owner_messages')} · 📣 mentions: {_f('log_group_mentions')} · "
+        f"🛠 tool: {_f('tool_enabled')}",
+        f"💬 whitelisted msgs: {_f('log_whitelisted_messages')} · "
+        f"🗨 other msgs: {_f('log_other_messages')}",
+        f"⏱ cooldown: <b>{_esc(str(st.get('unauthorized_cooldown_s')))}s</b>",
+        "",
+        "Nothing applies on the first tap — the confirm screen shows now → next.",
+    ]
+    if note:
+        lines.insert(1, note)
+    return "\n".join(lines)
+
+
+def _wl_view(st: Dict[str, Any], note: str = "") -> str:
+    """Whitelist as a list of friend cards — one button each, one tap per level."""
+    owner = str(_owner_id() or "")
+    wl = _read_allow_from()
+    lines = [
+        "<b>🛡 Whitelist & friends</b> — these ids talk to the real brain",
+        f"👑 owner: <code>{_esc(owner or 'unset')}</code> (always full access)",
+    ]
+    friends = [u for u in wl if u != owner]
+    if not friends:
+        lines += ["", "No friends yet — tap ➕ Add a friend; the wizard asks for the id."]
+    for uid in friends:
+        lvl = str((st.get("whitelist_perms") or {}).get(uid) or "gate")
+        lines.append(f"• <code>{_esc(uid)}</code> — {_FRIEND_LEVEL_LABEL.get(lvl, lvl)} "
+                     f"— tap to change level or remove")
+    lines += [
+        "",
+        "The core gateway tier (<code>TELEGRAM_ALLOWED_USERS</code>) is synced "
+        "automatically — someone added here passes the gateway too, no restart.",
+        "Command twin: <code>!whitelist add|remove|perms &lt;id&gt; [level]</code>",
+    ]
+    if note:
+        lines.insert(1, note)
+    return "\n".join(lines)
+
+
+def _wlfr_view(uid: str, st: Dict[str, Any]) -> str:
+    """One friend's card: current level, what each level means, how to remove."""
+    lvl = _friend_level(uid)
+    return "\n".join([
+        f"<b>👤 Friend <code>{_esc(uid)}</code></b>",
+        f"level: <b>{_FRIEND_LEVEL_LABEL.get(lvl, lvl)}</b>",
+        "",
+        "<b>talk</b> — safe read-only tools (web, vision, skills)",
+        "<b>gate</b> — same rules as the guest tool gate",
+        "<b>full</b> — no tool gating",
+        "",
+        "Tap a level to apply immediately (same code as "
+        "<code>!whitelist perms</code>). Removing asks for a confirm.",
+    ])
+
+
+def _wlrm_view(uid: str, st: Dict[str, Any]) -> str:
+    """Remove confirm — names the consequence instead of just the action."""
+    return "\n".join([
+        f"🗑 <b>Remove <code>{_esc(uid)}</code> from the whitelist?</b>",
+        "",
+        "He stops talking to the real brain and falls back to guest rules.",
+        "The core gate stays synced — his messages would be ignored, not answered.",
+        "",
+        "✅ Yes, remove · ✖ No, keep",
+    ])
+
+
+def _view_body(view: str, st: Dict[str, Any], note: str = "") -> str:
+    """Body for a view name — used after Apply/Cancel so every return lands
+    back on the right page instead of dumping the owner on the home grid."""
+    def _with(body: str) -> str:
+        return f"{body}\n\n{note}" if note else body
+    if view == "settings":
+        return _settings_view(st, note)
+    if view == "wl":
+        return _wl_view(st, note)
+    if view == "log":
+        return _help_view("log", st)
+    if view == "guests":
+        return _help_view("guests", st)
+    if view == "bot":
+        return _help_view("bot", st)
+    if view == "status":
+        return _help_view("status", st)
+    if view == "access":
+        return _help_view("access", st)
+    if view == "sessions":
+        return _help_view("sessions", st)
+    if view == "actions":
+        return _actions_view(st, note)
+    if view == "safeguard":
+        return _with(_gate_view(st))
+    if view == "gsess":
+        return _with(_gsess_view(st))
+    if view == "system":
+        return _with(_system_view(st))
+    if view == "cool":
+        return _with(f"<b>⏱ Cooldown</b> — how long a stranger waits before the "
+                     f"canned reply may repeat\ncurrent: "
+                     f"<b>{st.get('unauthorized_cooldown_s')}s</b>\n"
+                     "Tap a preset, or type <code>!setcooldown &lt;seconds&gt;</code>")
+    return _panel_text(st, note)
+
+
 def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
-                   chat_id: Optional[str] = None) -> list:
-    """Per-tab button sets: the full console grid at home, contextual actions inside a tab."""
+                   chat_id: Optional[str] = None, arg: str = "") -> list:
+    """Per-tab button sets: sections at home, contextual actions inside a tab.
+
+    `arg` carries the target for card views (wlfr/wlrm uid, "sub:origin" for a
+    confirm screen) — the view string stays a plain label for routing/labels."""
     from telegram import InlineKeyboardButton as B
     st = st or settings()
     log = str(st.get("log_channel") or "")
@@ -1561,26 +1801,50 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
             rows.append([B(lbl, callback_data=f"{_CB_PREFIX}{path}") for lbl, path in pairs])
 
     if view == "panel":
+        add(("📡 Log", "help:log"), ("🛡 Access", "help:access"),
+            ("🧹 Sessions", "help:sessions"))
+        add(("👾 Guests", "help:guests"), ("🤖 Bot", "help:bot"),
+            ("🔧 System", "help:system"))
+        add(("⚙️ Settings", "panel:settings"), ("🛡 Whitelist", "panel:wl"))
         add(("⚡ Actions — do things", "panel:actions"))
-        add(("\U0001f4e1 Log", "help:log"),
-            ("\U0001f6e1 Access", "help:access"), ("\U0001f9f9 Sessions", "help:sessions"))
-        add(("\U0001f47e Guests", "help:guests"), ("\U0001f916 Bot", "help:bot"),
-            ("\U0001f527 System", "help:system"))
-        add(("\U0001f4dc Full help", "help:full"))
-        add((f"\U0001f501 Reactions {_mark('auto_react')}", "panel:toggle:react"),
-            (f"\U0001f465 Guest reacts {_mark('react_guests')}", "panel:toggle:greact"),
-            (f"\U0001f5bc Guest media {_mark('media_to_guests')}", "panel:toggle:media"))
-        add((f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:toggle:mirror"),
-            (f"\U0001f4e3 Mentions {_mark('log_group_mentions')}", "panel:toggle:mentions"),
-            (f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:toggle:tool"))
-        add((f"\U0001f4ac WL msgs {_mark('log_whitelisted_messages')}", "panel:toggle:wmsgs"),
-            (f"\U0001f5e8 Other msgs {_mark('log_other_messages')}", "panel:toggle:omsgs"))
-        add(("\U0001f4cb Users", "panel:out:users"), ("⚙️ Settings", "panel:out:settings"),
-            ("\U0001f6e1 Whitelist", "panel:out:whitelist"))
-        add(("\U0001f510 Friend perms", "panel:wiz:wlperm"), ("\U0001f6e1 Safeguards", "panel:gate"),
-            ("\U0001f510 Guest sessions", "panel:gslist"))
-        add(("\U0001f47b Guest texts", "panel:out:guests"),
-            (f"⏱ Cooldown {st.get('unauthorized_cooldown_s')}s", "panel:cool"))
+        add(("📜 Full help", "help:full"))
+    elif view == "settings":
+        add((f"🔁 Reactions {_mark('auto_react')}", "panel:tg:react:settings"),
+            (f"👥 Guest reacts {_mark('react_guests')}", "panel:tg:greact:settings"),
+            (f"🖼 Guest media {_mark('media_to_guests')}", "panel:tg:media:settings"))
+        add((f"👑 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:settings"),
+            (f"📣 Mentions {_mark('log_group_mentions')}", "panel:tg:mentions:settings"),
+            (f"🛠 Tool {_mark('tool_enabled')}", "panel:tg:tool:settings"))
+        add((f"💬 WL msgs {_mark('log_whitelisted_messages')}", "panel:tg:wmsgs:settings"),
+            (f"🗨 Other msgs {_mark('log_other_messages')}", "panel:tg:omsgs:settings"))
+        add((f"⏱ Cooldown {st.get('unauthorized_cooldown_s')}s", "panel:cool"),
+            ("👾 Stranger reply", "panel:wiz:unauth"))
+        add(("👻 Guest texts", "panel:out:guests"), ("📋 Users", "panel:out:users"),
+            ("🔍 Auth debug", "panel:wiz:authdbg"))
+    elif view == "wl":
+        _wowner = str(_owner_id() or "")
+        for _wuid in _read_allow_from():
+            if _wuid == _wowner:
+                continue
+            _wlvl = str((st.get("whitelist_perms") or {}).get(_wuid) or "gate")
+            add((f"{_FRIEND_LEVEL_LABEL.get(_wlvl, _wlvl)} · {_wuid}",
+                 f"panel:wlfr:{_wuid}"))
+        add(("➕ Add a friend — wizard", "panel:wiz:wladd"))
+        add(("📋 Users", "panel:out:users"), ("🛡 Whitelist text", "panel:out:whitelist"))
+        add(("🔍 Auth debug", "panel:wiz:authdbg"))
+    elif view == "wlfr":
+        _frlvl = str((st.get("whitelist_perms") or {}).get(arg or "") or "gate")
+        for _fl in _FRIEND_LEVELS:
+            add(((f"✅ " if _fl == _frlvl else "") + _FRIEND_LEVEL_LABEL[_fl],
+                 f"panel:wllvl:{arg}:{_fl}"))
+        add((f"🗑 Remove {arg}", f"panel:wlrm:{arg}"))
+    elif view == "wlrm":
+        add((f"🗑 Yes, remove {arg}", f"panel:wlrm2:{arg}"),
+            ("✖ No, keep", f"panel:wlfr:{arg}"))
+    elif view == "tg":
+        _tsub, _, _torigin = (arg or "").partition(":")
+        add(("✅ Apply", f"panel:tgy:{_tsub}:{_torigin or 'settings'}"),
+            ("✖ Cancel", f"panel:view:{_torigin or 'settings'}"))
     elif view == "actions":
         add(("\U0001f4e1 Log here — log into THIS chat", "panel:sethere"))
         add(("\U0001f6e1 Whitelist add", "panel:wiz:wladd"),
@@ -1596,9 +1860,9 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         add(("\U0001f527 System + updates", "help:system"))
     elif view == "safeguard":
         add((f"\U0001f6e1 Mode: {_MODE_LABEL.get(str(st.get('guest_tool_mode') or 'balanced'), 'balanced')}",
-             "panel:gate"))
+             "panel:tg:mode:safeguard"))
         add(("\U0001f513 Owner access" + (" ON" if st.get("guest_owner_full_access") else " OFF"),
-             "panel:gate:owner"))
+             "panel:tg:owner:safeguard"))
         add(("\u270f\ufe0f Allow a tool", "panel:wiz:gateallow"),
             ("\U0001f6ab Deny a tool", "panel:wiz:gatedeny"))
         add(("\U0001f6e1 Friend levels", "panel:wiz:wlperm"),
@@ -1619,13 +1883,13 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         add(("\u2716 Cancel the wizard", "panel:wizcancel"))
     elif view == "status":
         add(("\u2699\ufe0f Settings", "panel:out:settings"), ("\U0001f4cb Users", "panel:out:users"))
-        add((f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:toggle:tool"),
-            (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:toggle:mirror"))
+        add((f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:tg:tool:status"),
+            (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:status"))
     elif view == "log":
-        add((f"\U0001f4e3 Mentions {_mark('log_group_mentions')}", "panel:toggle:mentions"),
-            (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:toggle:mirror"))
-        add((f"\U0001f4ac WL msgs {_mark('log_whitelisted_messages')}", "panel:toggle:wmsgs"),
-            (f"\U0001f5e8 Other msgs {_mark('log_other_messages')}", "panel:toggle:omsgs"))
+        add((f"\U0001f4e3 Mentions {_mark('log_group_mentions')}", "panel:tg:mentions:log"),
+            (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:log"))
+        add((f"\U0001f4ac WL msgs {_mark('log_whitelisted_messages')}", "panel:tg:wmsgs:log"),
+            (f"\U0001f5e8 Other msgs {_mark('log_other_messages')}", "panel:tg:omsgs:log"))
         if log:
             add(("\U0001f4e1 Turn log off", "panel:logoff"), (f"\U0001f9f9 Wipe log chat", f"wipe:{log}"))
         else:
@@ -1643,12 +1907,12 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
     elif view == "guests":
         add((f"\u23f1 Cooldown {st.get('unauthorized_cooldown_s')}s", "panel:cool"),
             ("\U0001f47b Guest texts", "panel:out:guests"))
-        add((f"\U0001f465 Guest reacts {_mark('react_guests')}", "panel:toggle:greact"),
-            (f"\U0001f5bc Guest media {_mark('media_to_guests')}", "panel:toggle:media"))
-        add(("👤 Who is on the link", "help:who"))
+        add((f"\U0001f465 Guest reacts {_mark('react_guests')}", "panel:tg:greact:guests"),
+            (f"\U0001f5bc Guest media {_mark('media_to_guests')}", "panel:tg:media:guests"))
+        add(("\U0001f464 Who is on the link", "help:who"))
     elif view == "bot":
-        add((f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:toggle:tool"),
-            (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:toggle:mirror"))
+        add((f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:tg:tool:bot"),
+            (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:bot"))
         add(("\u2699\ufe0f Settings", "panel:out:settings"), ("\U0001f4cb Users", "panel:out:users"))
     elif view == "system":
         add((f"🛡 Guest mode: {_MODE_LABEL.get(str(st.get('guest_tool_mode') or 'balanced'), 'balanced')}",
@@ -1670,9 +1934,19 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         add(("\U0001f9f9 Sessions", "help:sessions"), ("\U0001f47e Guests", "help:guests"),
             ("\U0001f916 Bot", "help:bot"))
 
-    if view != "panel":
+    if view == "wlfr":
+        rows.insert(0, [B("\u2b05\ufe0f Whitelist", callback_data=f"{_CB_PREFIX}panel:wl")])
+        add(("📜 Full help", "help:full"))
+    elif view == "wlrm":
+        rows.insert(0, [B("\u2b05\ufe0f Friend", callback_data=f"{_CB_PREFIX}panel:wlfr:{arg}")])
+        add(("📜 Full help", "help:full"))
+    elif view == "tg":
+        _corigin = (arg or "").partition(":")[2] or "settings"
+        rows.insert(0, [B("\u2b05\ufe0f Back", callback_data=f"{_CB_PREFIX}panel:view:{_corigin}")])
+        add(("📜 Full help", "help:full"))
+    elif view != "panel":
         rows.insert(0, [B("\u2b05\ufe0f Console", callback_data=f"{_CB_PREFIX}panel:back")])
-        add(("\U0001f4dc Full help", "help:full"))
+        add(("📜 Full help", "help:full"))
     if view == "cool":
         add(*[(f"{n}s", f"panel:cool:{n}") for n in (0, 60, 300, 3600)])
     if chat_id and view in ("panel", "sessions", "access"):
@@ -1686,7 +1960,9 @@ _VIEW_LABEL = {"full": "📜 Full help", "panel": "🧩 Console", "out": "📋 O
                "status": "ℹ️ Status", "log": "📡 Log", "access": "🛡 Access",
                "sessions": "🧹 Sessions", "bot": "🤖 Bot", "guests": "👾 Guests",
                "cool": "⏱ Cooldown", "system": "🔧 System", "safeguard": "🛡 Safeguards",
-               "actions": "⚡ Actions", "gsess": "🔐 Guest sessions", "wiz": "📝 Wizard"}
+               "actions": "⚡ Actions", "gsess": "🔐 Guest sessions", "wiz": "📝 Wizard",
+               "settings": "⚙️ Settings", "wl": "🛡 Whitelist", "wlfr": "👤 Friend",
+               "wlrm": "🗑 Remove", "tg": "✅ Confirm"}
 
 
 def _msg_chat_id(msg: Any) -> Optional[str]:
@@ -1694,7 +1970,8 @@ def _msg_chat_id(msg: Any) -> Optional[str]:
     return str(cid) if cid is not None else None
 
 
-async def _panel_edit(q: Any, body: str, view: str, st: Dict[str, Any]) -> str:
+async def _panel_edit(q: Any, body: str, view: str, st: Dict[str, Any],
+                      arg: str = "") -> str:
     """Swap a panel message in place.
 
     Returns "ok" when Telegram accepted the edit, "same" when the tap would not change
@@ -1703,7 +1980,7 @@ async def _panel_edit(q: Any, body: str, view: str, st: Dict[str, Any]) -> str:
     """
     from telegram import InlineKeyboardMarkup
     msg = q.message
-    mk = InlineKeyboardMarkup(_help_keyboard(view, st, chat_id=_msg_chat_id(msg)))
+    mk = InlineKeyboardMarkup(_help_keyboard(view, st, chat_id=_msg_chat_id(msg), arg=arg))
     try:
         # PTB 22 renamed Message.edit_message_text -> edit_text; older builds keep the old name.
         edit = getattr(msg, "edit_text", None) or getattr(msg, "edit_message_text", None)
@@ -1894,7 +2171,15 @@ async def _gate_cmd(arg: str) -> str:
 
 
 def _auth_debug(uid: str = "") -> str:
-    """Whose config wins where: file vs the live prefilter snapshot vs the plugin."""
+    """Whose config wins where: file vs the live prefilter snapshot vs the plugin.
+
+    Four tiers, checked in this order by the real gateway: config file (panel
+    writes here), live adapter snapshot (the prefilter), core gate env
+    (TELEGRAM_ALLOWED_USERS — the authz mixin reads it first and, while it is
+    non-empty, never consults the plugin's list), and the plugin's own route
+    decision. The gate line is the tier that dropped whitelisted friends as
+    "unrecognized" before 2026-10-02; it is shown so a divergence is visible.
+    """
     file_ids = _read_allow_from()
     raw = _adapter_allow_raw()
     if raw is None:
@@ -1906,6 +2191,7 @@ def _auth_debug(uid: str = "") -> str:
         else:
             snap_ids = [x.strip() for x in str(raw).split(",") if x.strip()]
         snap = ", ".join(snap_ids) or "(empty)"
+    gate_ids = [x.strip() for x in _gate_allow_raw().split(",") if x.strip()]
     owner = str(_owner_id() or "")
     lines = [
         "<b>🩺 Auth debug</b>",
@@ -1914,6 +2200,9 @@ def _auth_debug(uid: str = "") -> str:
         ("  <i>← this is what the core prefilter checks; a write to the file does "
          "not change it until it is synced or the gateway restarts</i>"
          if raw is not None else ""),
+        f"<b>core gate env:</b> <code>{_esc(','.join(gate_ids)) or '(empty)'}</code>",
+        ("  <i>← TELEGRAM_ALLOWED_USERS: the gateway checks this first; while it is "
+         "non-empty the plugin's list is never consulted</i>"),
         f"<b>owner:</b> <code>{_esc(owner or 'unset')}</code>",
     ]
 
@@ -1926,11 +2215,13 @@ def _auth_debug(uid: str = "") -> str:
 
     if uid:
         plugin_ok = _is_authorized_user(uid, owner)
+        gate_v = _verdict(gate_ids) if gate_ids else _verdict(snap_ids)
         lines += [
             "",
             f"<b>for <code>{_esc(uid)}</code>:</b>",
             f"  prefilter with file: <b>{_verdict(file_ids)}</b> · "
-            f"with live snapshot: <b>{_verdict(snap_ids)}</b>",
+            f"with live snapshot: <b>{_verdict(snap_ids)}</b> · "
+            f"core gate env: <b>{gate_v}</b>",
             "  plugin route: "
             + ("owner/whitelisted → real brain" if plugin_ok else "stranger → canned reply")
             + (f" · level {_FRIEND_LEVEL_LABEL.get(_friend_level(uid), _friend_level(uid))}"
@@ -2295,7 +2586,13 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
                 _cur = str(_extra.get("allow_from") or "") if isinstance(_extra, dict) else ""
                 _want = _allow_csv(_ids)
                 if _cur != _want:
-                    _sync_allow_from_live(_want)
+                    _sync_allow_from_live(_want)   # adapter + core-gate tiers
+                elif _gate_allow_raw() != _want:
+                    # adapter already agrees; only the core gate's env tier is
+                    # behind (e.g. .env edited at startup before this module
+                    # existed) — this is the tier that drops friends as
+                    # "unrecognized", so it is worth its own check.
+                    _sync_gate_allowlists(_want)
         except Exception:
             logger.debug("[TGAhermes] opportunistic allow_from sync failed", exc_info=True)
         src = event.source
@@ -2421,20 +2718,71 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             bits = data.split(":")
             action = bits[2] if len(bits) > 2 else "back"
             sub = bits[3] if len(bits) > 3 else ""
-            toggles = {"react": ("auto_react", "🔁 reactions"),
-                       "greact": ("react_guests", "👥 guest reacts"),
-                       "media": ("media_to_guests", "🖼 guest media"),
-                       "mirror": ("log_owner_messages", "👑 mirror"),
-                       "mentions": ("log_group_mentions", "📣 group mentions"),
-                       "tool": ("tool_enabled", "🛠 admin tool"),
-                       "wmsgs": ("log_whitelisted_messages", "💬 whitelisted msgs"),
-                       "omsgs": ("log_other_messages", "🗨 other msgs")}
+            toggles = _TOGGLES   # one map, shared by legacy taps + confirm flow
             view, note, body = "panel", "", ""
+            arg = ""   # card target for wlfr/wlrm, "sub:origin" for a confirm screen
             if action == "toggle" and sub in toggles:
                 key, label = toggles[sub]
                 save_settings({key: not bool(st.get(key))})
                 st = settings()
                 note = f"{label} → <b>{'on' if st.get(key) else 'off'}</b>"
+            elif action == "settings":
+                view, body = "settings", _settings_view(st)
+            elif action == "wl":
+                view, body = "wl", _wl_view(st)
+            elif action == "wlfr" and sub:
+                view, body, arg = "wlfr", _wlfr_view(sub, st), sub
+            elif action == "wllvl":
+                # panel:wllvl:<uid>:<level> — one tap on a friend card
+                lvl = bits[4] if len(bits) > 4 else ""
+                view = "wl"
+                if sub and lvl in _FRIEND_LEVELS:
+                    out = await _bang_execute(ad, _msg_chat_id(q.message) or "",
+                                              f"!whitelist perms {sub} {lvl}")
+                    st = settings()
+                    body = _wl_view(st, note=out or (
+                        f"✅ <code>{_esc(sub)}</code> → {_FRIEND_LEVEL_LABEL[lvl]}"))
+                else:
+                    body = _wl_view(st)
+            elif action == "wlrm" and sub:
+                view, body, arg = "wlrm", _wlrm_view(sub, st), sub
+            elif action == "wlrm2" and sub:
+                view = "wl"
+                out = await _bang_execute(ad, _msg_chat_id(q.message) or "",
+                                          f"!whitelist remove {sub}")
+                st = settings()
+                body = _wl_view(st, note=out or f"🗑 removed <code>{_esc(sub)}</code>")
+            elif action == "tg" and sub:
+                # confirm screen: panel:tg:<sub-key>:<origin> — changes nothing yet
+                origin = bits[4] if len(bits) > 4 else "settings"
+                view, arg = "tg", f"{sub}:{origin}"
+                body = _tg_view(sub, origin, st)
+            elif action == "tgy" and sub:
+                # apply from the confirm screen, land back on the origin page
+                origin = bits[4] if len(bits) > 4 else "settings"
+                if sub == "mode":
+                    nxt = _tg_next("mode", st)
+                    save_settings({"guest_tool_mode": nxt})
+                    st = settings()
+                    note = f"🛡 guest mode → <b>{_MODE_LABEL.get(nxt, nxt)}</b>"
+                    await _log("🛡 Guest tool mode",
+                               f"Mode set to <b>{nxt}</b> (owner {_esc(str(_owner_id()))})")
+                elif sub in _TOGGLES:
+                    key, label = _TOGGLES[sub]
+                    on = bool(_tg_next(sub, st))
+                    save_settings({key: on})
+                    st = settings()
+                    note = f"{label} → <b>{'on' if on else 'off'}</b>"
+                    if sub == "owner":
+                        await _log("🛡 Guest owner access",
+                                   f"{'enabled' if on else 'disabled'} for "
+                                   "unlocked guest chats")
+                view = origin if origin in _VIEW_LABEL else "settings"
+                body = _view_body(view, st, note)
+            elif action == "view" and sub:
+                # generic landing (Cancel buttons): panel:view:<name>
+                view = sub if sub in _VIEW_LABEL else "panel"
+                body = _view_body(view, st, note)
             elif action == "cool":
                 if sub.isdigit():
                     save_settings({"unauthorized_cooldown_s": int(sub)})
@@ -2566,7 +2914,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                             ad, _msg_chat_id(q.message) or "", bang)
             if not body:
                 body = _panel_text(st, note)
-            res = await _panel_edit(q, body, view, st)
+            res = await _panel_edit(q, body, view, st, arg=arg)
             if res == "failed":
                 await q.answer("⚠️ couldn't update the panel", show_alert=True)
                 return

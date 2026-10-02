@@ -1,5 +1,5 @@
 name: TGAhermes
-version: 3.1.1
+version: 3.2.0
 description: "All-in-one Telegram guest mode for Hermes: Bot API 10 guest replies via answerGuestQuery, stranger handling with editable replies, a log-channel console with ! commands, an owner-gated telegram_admin tool, reaction feedback and URL-media delivery to guests."
 author: "a2z05"
 provides_hooks:

@@ -32,6 +32,8 @@ CONFIG_YAML = os.environ.get("TGM_CONFIG", os.path.join(HERMES_HOME, "config.yam
 # host data (live sessions / installed config) only exists on the author's box
 HAVE_HOST = os.path.exists(STATE_DB) and os.path.exists(CONFIG_YAML)
 
+
+
 PASS = 0
 FAIL = 0
 
@@ -53,6 +55,22 @@ spec.loader.exec_module(mod)
 print("module loaded")
 
 TMP = Path(tempfile.mkdtemp(prefix="tgm_test_"))
+
+# The plugin mirrors telegram.extra.allow_from into the CORE gate's own
+# allowlist (.env + os.environ). The suite must never do that to the live file:
+# earlier runs leaked fake ids (900000001, 555, 555555) into the real .env and
+# handed a stranger access by accident. [24] exercises the real function with
+# an explicit env_path/environ; everywhere else it is a no-op recorder.
+GATE_SYNC_CALLS = []
+_real_gate_sync = mod._sync_gate_allowlists
+def _fake_gate_sync(csv, *, env_path=None, environ=None):
+    if env_path is not None and environ is not None:
+        # explicitly sandboxed call ([24]) — safe, run it for real
+        return _real_gate_sync(csv, env_path=env_path, environ=environ)
+    GATE_SYNC_CALLS.append((csv, env_path, environ))
+    return True
+mod._sync_gate_allowlists = _fake_gate_sync
+
 mod.SETTINGS_PATH = TMP / "settings.json"
 mod.STATE_PATH = TMP / "state.json"
 PERSONA = TMP / "persona.md"
@@ -595,7 +613,7 @@ print("\n[8] manifest + config")
 from pathlib import Path as P
 from hermes_cli.plugins_manifest import parse_manifest_file
 mf = parse_manifest_file(HERE / "plugin.yaml", HERE, "user", "")
-check(mf is not None and mf.name == "TGAhermes" and mf.version == "3.1.1", "manifest parses v3.1.1")
+check(mf is not None and mf.name == "TGAhermes" and mf.version == "3.2.0", "manifest parses v3.2.0")
 check(mf is not None and "telegram_admin" in (mf.provides_tools or []), "provides_tools declared")
 check(mf is not None and "pre_gateway_dispatch" in (mf.provides_hooks or []), "provides_hooks declared")
 
@@ -887,13 +905,16 @@ mod._CTX["gateway"] = None
 
 r12 = asyncio.run(mod._bang_execute(ad12, "900000001", "!panel"))
 check(r12 and "ATRA console" in r12 and "!panel" in r12, "!panel serves the dashboard")
-check(r12 and "reactions" in r12 and "whitelist" in r12 and "!wipe" in r12,
-      "dashboard carries live status + quick commands")
+check(r12 and "friends" in r12 and "cooldown" in r12 and "guest tool mode" in r12,
+      "dashboard carries live status only — flags moved to Settings")
 
 kb = mod._help_keyboard("panel")
 datas = [b.callback_data for row in kb for b in row]
-check(any(d.endswith("panel:toggle:react") for d in datas), "panel has a reaction toggle")
-check(any(d.endswith("panel:out:settings") for d in datas), "panel has an output button")
+check(any(d.endswith("panel:settings") for d in datas), "panel has a settings section")
+check(any(d.endswith("panel:wl") for d in datas), "panel has a whitelist section")
+check(not any("panel:toggle:" in d for d in datas),
+      "home carries no bare toggles — every flag goes through a confirm screen")
+
 check(any(d.endswith("help:sessions") for d in datas), "panel keeps section buttons")
 check(not any(d.endswith("panel:back") for d in datas), "dashboard has no self-back button")
 check(any(d.endswith("panel:back") for d in
@@ -1058,10 +1079,15 @@ check(r15 and "v" in r15.split("\n")[0] and "ATRA console" in r15, "dashboard ca
 
 kb = mod._help_keyboard("panel", chat_id="-100777")
 datas = [b.callback_data for row in kb for b in row]
-for want in ("panel:toggle:greact", "panel:toggle:mirror", "panel:toggle:mentions",
-             "panel:toggle:tool", "panel:out:guests", "panel:cool", "help:guests",
-             "wipe:-100777"):
+for want in ("panel:settings", "panel:wl", "panel:actions", "help:log",
+             "help:system", "wipe:-100777"):
     check(any(d.endswith(want) for d in datas), f"panel exposes {want}")
+skeys = [b.callback_data for row in mod._help_keyboard("settings") for b in row]
+for want in ("panel:tg:react:settings", "panel:tg:tool:settings", "panel:cool",
+             "panel:wiz:unauth", "panel:out:guests"):
+    check(any(d.endswith(want) for d in skeys), f"settings exposes {want}")
+check(not any("panel:toggle:" in d for d in skeys),
+      "settings routes flags through the confirm screen, not bare toggles")
 check(not any(d.endswith("wipe:") for d in [b.callback_data for row in mod._help_keyboard("panel") for b in row]),
       "no wipe button when the chat is unknown")
 check(any(b.callback_data.endswith("panel:cool:300") for b in mod._help_keyboard("cool")[-1]
@@ -1226,12 +1252,13 @@ async def t16():
     # per-tab keyboards really differ
     keys = lambda v, cid=None: [b.callback_data for row in mod._help_keyboard(v, chat_id=cid) for b in row]
     check(any("panel:logoff" in d for d in keys("log")), "Log tab offers turn-off")
-    check(any("panel:toggle:wmsgs" in d for d in keys("log")), "Log tab carries WL msgs toggle")
-    check(any("panel:toggle:omsgs" in d for d in keys("log")), "Log tab carries other-msgs toggle")
+    check(any("panel:tg:wmsgs:log" in d for d in keys("log")), "Log tab carries WL msgs (confirm)")
+    check(any("panel:tg:omsgs:log" in d for d in keys("log")), "Log tab carries other-msgs (confirm)")
     check(any("panel:out:settings" in d for d in keys("status")) and
           not any("panel:logoff" in d for d in keys("status")), "Status tab is contextual")
-    check(any("panel:toggle:wmsgs" in d for d in keys("panel")) and
-          any("panel:toggle:omsgs" in d for d in keys("panel")), "dashboard exposes both mirrors")
+    check(any("panel:tg:wmsgs:settings" in d for d in keys("settings")) and
+          any("panel:tg:omsgs:settings" in d for d in keys("settings")),
+          "Settings tab exposes both mirrors")
     check(keys("log") != keys("status"), "tabs hand out different buttons")
 
     # turning the log off from the Log tab
@@ -1723,7 +1750,7 @@ print("\n[23] v3: TGAhermes rename, !setlog here, Actions, wizard, update lock")
 # --- the rename landed where it matters
 _mf = (HERE / "plugin.yaml").read_text(encoding="utf-8")
 check("name: TGAhermes" in _mf, "manifest name is TGAhermes")
-check("version: 3.1.1" in _mf, "manifest version is 3.1.1")
+check("version: 3.2.0" in _mf, "manifest version is 3.2.0")
 check("telegram-guest-mode" not in Path(mod.__file__).read_text(encoding="utf-8"),
       "no old plugin name left in the module source")
 
@@ -1891,6 +1918,91 @@ check(len(_fn.handlers[0]) == 2 and _mine_h in _fn.handlers[0]
 check(mod._make_factory().__qualname__.startswith("factory.m"),
       "factory qualname is unique per deployed file (rewire dedup key)")
 
+# ---------------------------------------------------------------- core-gate env tier (the "Dropped ... unrecognized" tier)
+# The authz mixin reads TELEGRAM_ALLOWED_USERS from the environment first; when
+# non-empty it never consults telegram.extra.allow_from. These tests use
+# injected env_path/environ — the real .env is never touched by the harness.
+print("\n[24] core gate env tier: union sync that survives hand-entries")
+_tmp_env = TMP / "dot.env"
+_tmp_env.write_text("OTHER=1\nTELEGRAM_ALLOWED_USERS=900000001,111111111\n", encoding="utf-8")
+_own = str(mod._owner_id() or "") or "900000001"
+_fake_environ: dict = {}
+ok24 = mod._sync_gate_allowlists(f"{_own},900000002", env_path=_tmp_env,
+                                 environ=_fake_environ)
+check(ok24 is True, "gate sync returns True")
+_env_val = _tmp_env.read_text(encoding="utf-8")
+check("900000002" in _env_val, "new id lands in the fake .env")
+check("111111111" in _env_val, "pre-existing hand-entry survives (union, not replace)")
+check(_own in _env_val and _own in (_fake_environ.get("TELEGRAM_ALLOWED_USERS") or ""),
+      "owner id kept in both tiers")
+check("111111111" in (_fake_environ.get("TELEGRAM_ALLOWED_USERS") or ""),
+      "hand-entry also lands in the environ tier")
+check("OTHER=1" in _env_val, "unrelated .env lines untouched")
+
+# same sync, .env without the key yet → the key is appended
+_tmp_env2 = TMP / "dot2.env"
+_tmp_env2.write_text("OTHER=2\n", encoding="utf-8")
+_fake_environ2: dict = {}
+ok24b = mod._sync_gate_allowlists(_own, env_path=_tmp_env2, environ=_fake_environ2)
+check(ok24b is True and "TELEGRAM_ALLOWED_USERS=" in _tmp_env2.read_text(encoding="utf-8"),
+      "missing key is appended to the fake .env")
+check(_own in (_fake_environ2.get("TELEGRAM_ALLOWED_USERS") or ""),
+      "environ tier still synced when the key was missing")
+
+# _auth_debug renders the gate tier; verdict is made deterministic by setting
+# the harness process env and restoring it after.
+_prev_env24 = os.environ.get("TELEGRAM_ALLOWED_USERS")
+os.environ["TELEGRAM_ALLOWED_USERS"] = f"{_own},900000002"
+try:
+    dbg24 = mod._auth_debug("900000002")
+finally:
+    if _prev_env24 is None:
+        os.environ.pop("TELEGRAM_ALLOWED_USERS", None)
+    else:
+        os.environ["TELEGRAM_ALLOWED_USERS"] = _prev_env24
+check("core gate env" in dbg24, "auth debug shows the gate tier")
+check("900000002" in dbg24 and "PASS" in dbg24,
+      "auth debug verdict passes for an id in the gate tier")
+
+# _sync_allow_from_live carries the gate tier along on the same call
+_ad24 = FakeAdapter()
+_ad24.config = NS(extra={"allow_from": "x"})
+mod._ADAPTER["adapter"] = _ad24
+_fake_environ3: dict = {}
+_prev_sync = mod._sync_gate_allowlists
+try:
+    mod._sync_gate_allowlists = lambda csv, **kw: (_fake_environ3.update(gate=csv) or True)
+    mod._sync_allow_from_live("900000005")
+finally:
+    mod._sync_gate_allowlists = _prev_sync
+check(_fake_environ3.get("gate") == "900000005",
+      "live adapter sync also carries the gate tier")
+
+
+print("\n[25] panel rework: sections at home, confirm screens, friend cards")
+# section landing pages render for every new view
+for _v in ("settings", "wl", "cool"):
+    _kb = mod._help_keyboard(_v)
+    check(bool(_kb) and all(hasattr(b, "callback_data") for r in _kb for b in r),
+          f"section keyboard renders: {_v}")
+_tg = mod._help_keyboard("tg", arg="react:settings")
+check(any(d.endswith("panel:tgy:react:settings") for r in _tg
+          for b in r for d in [b.callback_data]),
+      "confirm screen offers Apply for the reacting flag")
+_fr = mod._help_keyboard("wlfr", arg="900000004")
+_fr_d = [b.callback_data for r in _fr for b in r]
+check(any(d.endswith("panel:wllvl:900000004:full") for d in _fr_d),
+      "friend card offers the full level")
+check(any(d.endswith("panel:wlrm:900000004") for d in _fr_d),
+      "friend card offers removal (behind a confirm)")
+_body = mod._wl_view({"whitelist_perms": {}}, note="")
+check("TELEGRAM_ALLOWED_USERS" in _body and "no restart" in _body,
+      "whitelist page names the core gate tier doing the real gating")
+# confirm screen for mode cycles like the old bare button did
+_st = dict(mod.settings()); _st["guest_tool_mode"] = "balanced"
+check(mod._tg_next("mode", _st) == "open", "mode confirm shows the same next mode")
+check("open" in mod._tg_view("mode", "safeguard", _st),
+      "mode confirm names the next mode before applying")
 
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)
