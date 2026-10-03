@@ -4234,8 +4234,19 @@ def _drop_stale_handlers(native: Any) -> int:
     handler registered under this plugin's module names (current, or the
     pre-rename ``telegram_guest_mode``) before adding ours makes a reload an
     actual swap.
+
+    Identity is decided by TWO signals, because ``__module__`` alone missed the
+    orphan left when the pre-rename directory was deleted out from under a live
+    gateway: (a) the module name, and (b) the callback's own ``^tgm:`` pattern,
+    which no other plugin claims. A handler bound to a different module dict is
+    stale by either signal. Removal failures used to log at DEBUG (filtered by
+    default), which is exactly how an orphan stayed invisible — they are
+    WARNING now, and the modules we saw are logged so a surviving orphan can be
+    named instead of guessed at.
     """
     removed = 0
+    stale_modules: set = set()
+    failures = 0
     try:
         table = getattr(native, "handlers", None)
         if not isinstance(table, dict):
@@ -4246,18 +4257,31 @@ def _drop_stale_handlers(native: Any) -> int:
                 cb = getattr(h, "callback", None)
                 if not callable(cb):
                     continue
-                mod = getattr(cb, "__module__", "") or ""
-                if mod != __name__ and "telegram_guest_mode" not in mod:
-                    continue
                 if getattr(cb, "__globals__", None) is mine:
                     continue  # registered by THIS very instance — keep it
+                mod = getattr(cb, "__module__", "") or ""
+                # ours by module name (current or pre-rename), OR ours by the
+                # callback prefix this plugin owns and no other plugin claims.
+                pattern = getattr(h, "pattern", None)
+                by_pattern = pattern is not None and str(pattern).startswith("^tgm:")
+                if not (mod == __name__ or "telegram_guest_mode" in mod or by_pattern):
+                    continue
+                stale_modules.add(mod or "<no __module__>")
                 try:
                     native.remove_handler(h, group=group)
                     removed += 1
                 except Exception:
-                    logger.debug("[TGAhermes] stale handler remove failed", exc_info=True)
+                    failures += 1
+                    logger.warning("[TGAhermes] stale handler remove FAILED for %s",
+                                   mod or "<no __module__>", exc_info=True)
     except Exception:
-        logger.debug("[TGAhermes] stale handler sweep failed", exc_info=True)
+        logger.warning("[TGAhermes] stale handler sweep FAILED", exc_info=True)
+    if stale_modules:
+        logger.info(
+            "[TGAhermes] stale handlers seen=%d dropped=%d failed=%d modules=%s",
+            len(stale_modules), removed, failures,
+            ",".join(sorted(stale_modules)),
+        )
     if removed:
         logger.info("[TGAhermes] dropped %d stale handler(s) from a previous load", removed)
     return removed
