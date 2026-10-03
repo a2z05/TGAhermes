@@ -3034,6 +3034,33 @@ def _live_adapter(gateway: Any) -> Any:
         return None
 
 
+def _maybe_rewire() -> None:
+    """Run the post-reload rewire the first time we touch the live adapter.
+
+    A reload alone never swaps the PTB handlers (the gateway dedups factories
+    by (plugin, qualname), and an unchanged file mtime keeps that key stable),
+    so the previous load's closures keep serving the panel until something
+    forces a rewire. Only the dispatch hook used to do that — which meant a
+    button tap answered from the OLD code until the owner happened to send a
+    plain message. Any tool call in this session reaches here too, so a reload
+    takes effect on the very next turn instead of waiting for a text message.
+    """
+    ad = _ADAPTER.get("adapter")
+    if ad is None:
+        ad = _live_adapter(_CTX.get("gateway"))
+        if ad is None:
+            return
+        _ADAPTER["adapter"] = ad
+    if getattr(ad, "_tga_instance", None) is _INSTANCE:
+        return
+    ad._tga_instance = _INSTANCE
+    try:
+        ad.rewire_plugin_handlers()
+        logger.info("[TGAhermes] post-reload rewire requested")
+    except Exception:
+        logger.debug("[TGAhermes] post-reload rewire failed", exc_info=True)
+
+
 async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **_) -> Optional[dict]:
     """Observe + console: bang commands (skip), owner reactions, group mentions, owner mirror."""
     chat_for_error: Any = None
@@ -3058,19 +3085,11 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
                 _ADAPTER["adapter"] = ad
         if ad is None:
             return None
-        # Hot-reload rewire trigger: the gateway only re-wires adapters for
-        # plugins it had never loaded before, so after a reload the OLD module's
-        # PTB callbacks would keep serving the panel/guest flow forever. One
-        # sentinel check on the first dispatched message makes the adapter rewire;
-        # the factory's per-deploy qualname key is then unknown to the wired set,
-        # so it runs, sweeps the stale handlers and re-syncs allow_from.
-        if getattr(ad, "_tga_instance", None) is not _INSTANCE:
-            ad._tga_instance = _INSTANCE
-            try:
-                ad.rewire_plugin_handlers()
-                logger.info("[TGAhermes] post-reload rewire requested")
-            except Exception:
-                logger.debug("[TGAhermes] post-reload rewire failed", exc_info=True)
+        # Hot-reload rewire trigger: see _maybe_rewire — one check on the first
+        # dispatched message makes the adapter rewire, the factory's per-deploy
+        # qualname key is then unknown to the wired set, so it runs, sweeps the
+        # stale handlers and re-syncs allow_from.
+        _maybe_rewire()
         # Push file-side allow_from into the adapter's wire-time snapshot. A CLI
         # `hermes config set` writes the file but never reaches the running
         # prefilter, so without this a freshly whitelisted user keeps bouncing
@@ -3942,6 +3961,7 @@ def _friend_refusal(tool_name: str, uid: str, level: str, repeats: int = 0) -> s
 
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = None, **_) -> Optional[Dict[str, str]]:
     """Safety gate: guest rules for guest chats, per-friend levels for whitelisted DMs."""
+    _maybe_rewire()
     name = str(tool_name or "")
     if name in GUEST_SAFE_TOOLS:
         return None
@@ -4262,9 +4282,36 @@ def _drop_stale_handlers(native: Any) -> int:
                 mod = getattr(cb, "__module__", "") or ""
                 # ours by module name (current or pre-rename), OR ours by the
                 # callback prefix this plugin owns and no other plugin claims.
+                # NOTE: PTB compiles a str pattern to re.Pattern, so
+                # str(pattern) is "re.compile('^tgm:')" which never
+                # startswith '^tgm:'. Match on the inner regex text instead.
                 pattern = getattr(h, "pattern", None)
-                by_pattern = pattern is not None and str(pattern).startswith("^tgm:")
-                if not (mod == __name__ or "telegram_guest_mode" in mod or by_pattern):
+                by_pattern = False
+                if pattern is not None:
+                    try:
+                        inner = getattr(pattern, "pattern", pattern)
+                        if isinstance(inner, str) and "tgm:" in inner:
+                            by_pattern = True
+                        elif "tgm:" in str(pattern):
+                            by_pattern = True
+                    except Exception:
+                        pass
+                mod_norm = (mod or "").replace("-", "_")
+                by_module = (mod == __name__ or "telegram_guest_mode" in mod_norm)
+                by_file = False
+                try:
+                    cb_file = (getattr(cb, "__globals__", None) or {}).get("__file__", "") or ""
+                    cb_norm = cb_file.replace("-", "_")
+                    if "telegram_guest_mode" in cb_norm:
+                        by_file = True
+                    if not by_file:
+                        code = getattr(cb, "__code__", None)
+                        co_file = (getattr(code, "co_filename", "") or "").replace("-", "_")
+                        if "telegram_guest_mode" in co_file:
+                            by_file = True
+                except Exception:
+                    pass
+                if not (by_module or by_file or by_pattern):
                     continue
                 stale_modules.add(mod or "<no __module__>")
                 try:
