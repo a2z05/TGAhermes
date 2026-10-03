@@ -613,7 +613,7 @@ print("\n[8] manifest + config")
 from pathlib import Path as P
 from hermes_cli.plugins_manifest import parse_manifest_file
 mf = parse_manifest_file(HERE / "plugin.yaml", HERE, "user", "")
-check(mf is not None and mf.name == "TGAhermes" and mf.version == "3.3.0", "manifest parses v3.3.0")
+check(mf is not None and mf.name == "TGAhermes" and mf.version == "4.0.0", "manifest parses v4.0.0")
 check(mf is not None and "telegram_admin" in (mf.provides_tools or []), "provides_tools declared")
 check(mf is not None and "pre_gateway_dispatch" in (mf.provides_hooks or []), "provides_hooks declared")
 
@@ -1797,7 +1797,7 @@ print("\n[23] v3: TGAhermes rename, !setlog here, Actions, wizard, update lock")
 # --- the rename landed where it matters
 _mf = (HERE / "plugin.yaml").read_text(encoding="utf-8")
 check("name: TGAhermes" in _mf, "manifest name is TGAhermes")
-check("version: 3.3.0" in _mf, "manifest version is 3.3.0")
+check("version: 4.0.0" in _mf, "manifest version is 4.0.0")
 check("telegram-guest-mode" not in Path(mod.__file__).read_text(encoding="utf-8"),
       "no old plugin name left in the module source")
 

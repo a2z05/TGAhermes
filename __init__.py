@@ -1436,32 +1436,16 @@ def _help_view(key: str, st: Optional[Dict[str, Any]] = None) -> str:
     st = st or settings()
     if key == "full":
         return _help_text(st)
-    if key == "system":
-        return _system_view(st)
+    if key in _CATS:
+        # v4.0.0: the section pages ARE the categories — every setting with
+        # its live value, instead of a read-only list of command names.
+        return _cat_body(key, st)
     if key == "who":
         return _known_guests_view(st)
     for k, title, body in _help_sections(st):
         if k == key:
             return f"<b>{title}</b>\n{body}"
     return _help_text(st)
-
-
-def _system_view(st: Dict[str, Any]) -> str:
-    """Body text for the System tab."""
-    cfg = _update_settings()
-    lines = [
-        "<b>🔧 System</b>",
-        f"<b>Installed version:</b> <code>{_esc(_plugin_version())}</code>",
-        f"<b>Updates:</b> {'enabled' if st.get('update_enabled', True) else '🔒 locked'}",
-        f"<b>Source:</b> <code>{_esc(cfg['repo'])}</code> "
-        f"<code>({_esc(str(cfg['branch']))})</code>",
-        "",
-        "Checking compares the installed version against the source. Installing "
-        "backs up the current files, copies the newer ones, runs the test suite, "
-        "and only then hot-reloads. Your settings and learned state are never "
-        "touched.",
-    ]
-    return "\n".join(lines)
 
 
 def _gate_view(st: Dict[str, Any], note: str = "") -> str:
@@ -1552,10 +1536,14 @@ def _gsess_view(st: Dict[str, Any]) -> str:
 
 
 def _panel_text(st: Optional[Dict[str, Any]] = None, note: str = "") -> str:
-    """Dashboard for !panel — live status lines + the glass buttons beneath it."""
+    """Home board for !panel — a live readout of every category, so the first
+    screen answers "what is on?" instead of just listing section names."""
     st = st or settings()
     wl = _read_allow_from()
     friends = [u for u in wl if u != str(_owner_id() or "")]
+
+    def _b(k: str) -> str:
+        return "on" if st.get(k) else "off"
 
     lines = [
         f"\U0001f9e9 <b>ATRA console</b> v{_plugin_version()}",
@@ -1566,14 +1554,24 @@ def _panel_text(st: Optional[Dict[str, Any]] = None, note: str = "") -> str:
         f"\u23f1 stranger cooldown: <b>{_esc(st.get('unauthorized_cooldown_s'))}s</b>",
         f"\U0001f6e1 guest tool mode: <b>"
         f"{_MODE_LABEL.get(str(st.get('guest_tool_mode') or 'balanced'), 'balanced')}</b> · "
-        f"\U0001f6e0 admin tool: <b>{'on' if st.get('tool_enabled') else 'off'}</b>",
+        f"\U0001f6e0 admin tool: <b>{_b('tool_enabled')}</b>",
+        f"\U0001f501 reactions: <b>{_b('auto_react')}</b> · "
+        f"\U0001f465 guest reacts: <b>{_b('react_guests')}</b> · "
+        f"\U0001f5bc guest media: <b>{_b('media_to_guests')}</b>",
+        f"\U0001f4ac mirrored: 👑 <b>{_b('log_owner_messages')}</b> · "
+        f"\U0001f4ac wl <b>{_b('log_whitelisted_messages')}</b> · "
+        f"\U0001f5e8 other <b>{_b('log_other_messages')}</b> · "
+        f"\U0001f4e3 mentions <b>{_b('log_group_mentions')}</b>",
+        f"\U0001f4e6 updates: <b>{'on' if st.get('update_enabled', True) else 'locked'}</b> · "
+        f"\U0001f3ad persona: <b>{'custom' if st.get('persona_path') else 'default'}</b>",
     ]
     if note:
         lines.append(note)
     lines += [
         "",
-        "<b>Pick a section below</b> — everything lives in there.",
-        "For a one-step job tap <b>⚡ Actions</b>: it asks you, you just answer.",
+        "<b>Tap a category</b> — every setting inside it shows its live value, "
+        "and every change is a prompt or a confirm screen. No commands needed.",
+        "\u21a9\ufe0f Back returns to the page you came from.",
         "<code>!panel</code> reloads this · <code>!help</code> the command list",
     ]
     return "\n".join(lines)
@@ -1619,7 +1617,7 @@ def _actions_view(st: Dict[str, Any], note: str = "") -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------- rework bodies (v3.3.0)
+# ---------------------------------------------------------------- rework bodies (v3.3.0 → v4.0.0)
 # The panel used to be one home grid carrying every flag. It grew to eleven
 # rows and the owner could not find anything (new flows existed but sat one
 # level deep). v3.2.0: home is sections only, every mutation goes through a
@@ -1628,6 +1626,17 @@ def _actions_view(st: Dict[str, Any], note: str = "") -> str:
 # button applies on the first tap any more — the tap renders a confirm screen
 # and only the Apply callback writes (`panel:cfmok`; legacy `panel:tgy` is
 # normalised to it at parse time).
+#
+# v4.0.0 rebuilt the navigation layer on top of that:
+#   * `_CATS` is the single registry — every one of the 29 settings keys sits
+#     in exactly one category, the body renders each with its LIVE value, and
+#     the keyboard emits one button per item. A test asserts the coverage, so
+#     a new settings key cannot become unreachable by accident.
+#   * text settings open a prompt-driven wizard (flows may carry `build`, a
+#     bang-command twin, or `save`, a settings patch) — nothing is typed as a
+#     command; `validate` re-prompts instead of killing the flow.
+#   * Back is a per-panel-message history (`_NAV`), not a jump to the console.
+#     Confirm screens and the wizard are transient and never enter the stack.
 
 # callback sub-key -> (settings key, button label) for confirm-screen toggles.
 # `mode` is special-cased (it cycles rather than flips) and is not listed here.
@@ -1824,25 +1833,255 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
     return "❌ unknown action."
 
 
+# ---------------------------------------------------------------------------
+# v4.0.0 — one registry drives every settings page.
+#
+# The body lists each item with its LIVE value, the keyboard offers exactly
+# one button per item, and a test asserts that all 29 DEFAULT_SETTINGS keys
+# appear here — so "every changeable setting is reachable from the panel, in
+# a category, with no command" is a checked property rather than a claim.
+#
+# kinds: bool | enum | int | text | chan | list | cmd
+#   bool  -> confirm screen (panel:cfmok is still the only writer)
+#   enum  -> guest-tool-mode cycle behind the same confirm
+#   int   -> presets page
+#   text  -> prompt-driven wizard (no arguments to type)
+#   chan  -> log channel: here / off / by id
+#   list  -> count + an edit button
+#   cmd   -> a plain button with no value line
+_CATS: Dict[str, List[Dict[str, Any]]] = {
+    "log": [
+        {"kind": "chan", "key": "log_channel", "label": "Log channel"},
+        {"kind": "bool", "key": "log_owner_messages", "sub": "mirror",
+         "label": "👑 Mirror own messages"},
+        {"kind": "bool", "key": "log_whitelisted_messages", "sub": "wmsgs",
+         "label": "💬 Whitelisted messages"},
+        {"kind": "bool", "key": "log_other_messages", "sub": "omsgs",
+         "label": "🗨 Other messages"},
+        {"kind": "bool", "key": "log_group_mentions", "sub": "mentions",
+         "label": "📣 Group mentions"},
+        {"kind": "cmd", "label": "🧹 Wipe the log chat", "cb": "wipe:LOG"},
+    ],
+    "guests": [
+        {"kind": "text", "key": "unauthorized_reply", "flow": "unauth",
+         "label": "👾 Canned stranger reply"},
+        {"kind": "int", "key": "unauthorized_cooldown_s", "page": "cool",
+         "label": "⏱ Stranger cooldown"},
+        {"kind": "text", "key": "guest_error_reply_en", "flow": "err_en",
+         "label": "⚠️ Error reply (EN)"},
+        {"kind": "text", "key": "guest_error_reply_fa", "flow": "err_fa",
+         "label": "⚠️ Error reply (FA)"},
+        {"kind": "text", "key": "guest_locked_reply", "flow": "lockreply",
+         "label": "🔒 Locked-session reply"},
+        {"kind": "bool", "key": "media_to_guests", "sub": "media",
+         "label": "🖼 Media to guests"},
+        {"kind": "cmd", "label": "🔐 Guest sessions", "cb": "panel:gslist"},
+        {"kind": "cmd", "label": "👤 Who is on the link", "cb": "help:who"},
+    ],
+    "react": [
+        {"kind": "bool", "key": "auto_react", "sub": "react",
+         "label": "🔁 React to messages"},
+        {"kind": "bool", "key": "react_guests", "sub": "greact",
+         "label": "👥 React to guest messages"},
+        {"kind": "text", "key": "react_emoji_receive", "flow": "emoji_recv",
+         "label": "👀 Received emoji"},
+        {"kind": "text", "key": "react_emoji_done", "flow": "emoji_done",
+         "label": "✅ Done emoji"},
+        {"kind": "text", "key": "react_emoji_error", "flow": "emoji_err",
+         "label": "❌ Error emoji"},
+    ],
+    "tool": [
+        {"kind": "bool", "key": "tool_enabled", "sub": "tool",
+         "label": "🛠 Admin tool"},
+        {"kind": "enum", "key": "guest_tool_mode", "sub": "mode",
+         "label": "🛡 Guest tool mode"},
+        {"kind": "bool", "key": "guest_owner_full_access", "sub": "owner",
+         "label": "🔓 Owner access in unlocked chats"},
+        {"kind": "list", "key": "guest_allow_tools", "label": "✏️ Guest allowed tools",
+         "cb": "panel:wiz:gateallow"},
+        {"kind": "list", "key": "guest_deny_tools", "label": "🚫 Guest denied tools",
+         "cb": "panel:wiz:gatedeny"},
+        {"kind": "list", "key": "guest_owner_chats", "label": "🔓 Chats unlocked for you",
+         "cb": "panel:gate"},
+        {"kind": "text", "key": "persona_path", "flow": "persona",
+         "label": "🎭 Guest persona file"},
+    ],
+    "access": [
+        {"kind": "text", "key": "owner_id", "flow": "owner", "label": "👑 Owner id"},
+        {"kind": "list", "key": "whitelist_perms", "label": "🛡 Friend permission levels",
+         "cb": "panel:wl"},
+        {"kind": "cmd", "label": "➕ Add a friend", "cb": "panel:wiz:wladd"},
+        {"kind": "cmd", "label": "➖ Remove a friend", "cb": "panel:wiz:wldel"},
+        {"kind": "cmd", "label": "🎚 Set a friend's level", "cb": "panel:wiz:wlperm"},
+        {"kind": "cmd", "label": "🩺 Auth debug", "cb": "panel:wiz:authdbg"},
+    ],
+    "system": [
+        {"kind": "lock", "key": "update_enabled", "label": "🔒 Update lock",
+         "cb": "panel:upd:lock"},
+        {"kind": "text", "key": "update_repo", "flow": "uprepo",
+         "label": "📦 Update source"},
+        {"kind": "text", "key": "update_branch", "flow": "upbranch",
+         "label": "🌿 Update branch"},
+        {"kind": "text", "key": "update_timeout_s", "flow": "uptimeout",
+         "label": "⌛ Update timeout"},
+        {"kind": "cmd", "label": "🔍 Check for update", "cb": "panel:upd:check"},
+        {"kind": "cmd", "label": "⬆️ Install update", "cb": "panel:upd:apply"},
+        {"kind": "cmd", "label": "🛡 Guest mode & gate rules", "cb": "panel:gate"},
+        {"kind": "cmd", "label": "📋 Dump settings", "cb": "panel:out:settings"},
+        {"kind": "cmd", "label": "🧹 Wipe a session", "cb": "panel:wiz:wipe"},
+        {"kind": "cmd", "label": "📨 Send a DM", "cb": "panel:wiz:send"},
+    ],
+    # "settings" is the flat all-flags page kept for one-tap scanning; its
+    # items deliberately overlap the categories above.
+    "settings": [
+        {"kind": "bool", "key": "auto_react", "sub": "react", "label": "🔁 Reactions"},
+        {"kind": "bool", "key": "react_guests", "sub": "greact", "label": "👥 Guest reacts"},
+        {"kind": "bool", "key": "media_to_guests", "sub": "media", "label": "🖼 Guest media"},
+        {"kind": "bool", "key": "log_owner_messages", "sub": "mirror", "label": "👑 Mirror"},
+        {"kind": "bool", "key": "log_group_mentions", "sub": "mentions", "label": "📣 Mentions"},
+        {"kind": "bool", "key": "tool_enabled", "sub": "tool", "label": "🛠 Tool"},
+        {"kind": "bool", "key": "log_whitelisted_messages", "sub": "wmsgs",
+         "label": "💬 Whitelisted msgs"},
+        {"kind": "bool", "key": "log_other_messages", "sub": "omsgs", "label": "🗨 Other msgs"},
+        {"kind": "int", "key": "unauthorized_cooldown_s", "page": "cool",
+         "label": "⏱ Cooldown"},
+        {"kind": "text", "key": "unauthorized_reply", "flow": "unauth",
+         "label": "👾 Stranger reply"},
+        {"kind": "cmd", "label": "👻 Guest texts", "cb": "panel:out:guests"},
+        {"kind": "cmd", "label": "📋 Users", "cb": "panel:out:users"},
+        {"kind": "cmd", "label": "🔍 Auth debug", "cb": "panel:wiz:authdbg"},
+    ],
+}
+
+_CAT_LABEL = {"log": "📡 Logging", "guests": "👾 Guests", "react": "🔁 Reactions",
+              "tool": "🤖 Tool & gate", "access": "🛡 Access", "system": "🔧 System",
+              "settings": "⚙️ All flags"}
+
+# One line under each title, so a category page says what it is for before it
+# lists values. `system` doubles as the version readout the panel used to show.
+_CAT_BLURB = {
+    "log": "Where activity lands — the channel, and which messages get mirrored.",
+    "guests": "canned reply, cooldown, error texts — everything a stranger hears.",
+    "react": "Which emoji ATRA drops, and on whose messages.",
+    "tool": "What a guest session may run, and which chats you unlocked for yourself.",
+    "access": "Who talks to the real brain, and at which tool level.",
+    "system": "",
+    "settings": "Every flag in one column, for a fast scan before you leave.",
+}
+
+
+def _cat_value(it: Dict[str, Any], st: Dict[str, Any]) -> str:
+    """The live value shown beside a setting, already HTML-safe."""
+    k = it["kind"]
+    key = str(it.get("key") or "")
+    if k == "bool":
+        return "<b>on</b>" if st.get(key) else "<b>off</b>"
+    if k == "enum":
+        m = str(st.get(key) or "balanced")
+        return f"<b>{_MODE_LABEL.get(m, m)}</b>"
+    if k == "int":
+        return f"<b>{_esc(str(st.get(key)))}s</b>"
+    if k == "chan":
+        return f"<code>{_esc(str(st.get('log_channel') or 'off'))}</code>"
+    if k == "list":
+        v = st.get(key)
+        if key == "whitelist_perms":
+            return f"<b>{len(v or {})} set</b>"
+        return f"<b>{len(v or [])} set</b>"
+    if k == "lock":
+        return "<b>unlocked</b>" if st.get(key, True) else "<b>🔒 locked</b>"
+    if k == "text":
+        # show what is actually in effect, not just what settings.json holds:
+        # owner_id and update_repo both fall back to config/origin at read time.
+        if key == "owner_id":
+            v = _owner_id()
+            return f"<code>{_esc(str(v or 'unset'))}</code>"
+        if key == "update_repo":
+            return f"<code>{_esc(_repo_display(_update_settings()['repo']))}</code>"
+        if key == "persona_path":
+            p = st.get("persona_path")
+            return (f"<code>{_esc(str(p))}</code>" if p
+                    else "<i>default</i>")
+        v = st.get(key)
+        v = str(v) if v is not None else ""
+        v = v.strip() or "(empty)"
+        return f"<i>{_esc(v[:80])}</i>"
+    return ""
+
+
+def _cat_body(cat: str, st: Dict[str, Any], note: str = "") -> str:
+    """Category page: title, every setting with its live value, how to edit."""
+    items = _CATS.get(cat) or []
+    lines = [f"<b>{_CAT_LABEL.get(cat, cat)}</b>"]
+    if note:
+        lines.append(note)
+    blurbs = _CAT_BLURB.get(cat) or ""
+    if cat == "system":
+        cfg = _update_settings()
+        blurbs = (f"Installed <b>v{_esc(_plugin_version())}</b> · source "
+                  f"<code>{_esc(_repo_display(cfg['repo']))}</code> "
+                  f"({_esc(str(cfg['branch']))})")
+    if blurbs:
+        lines.append(blurbs)
+    lines.append("")
+    for it in items:
+        if it["kind"] == "cmd":
+            lines.append(f"• <b>{it['label']}</b>")
+            continue
+        lines.append(f"• <b>{it['label']}</b>: {_cat_value(it, st)}")
+    lines += ["",
+              "Tap a button below — text settings open a prompt, flags open a "
+              "confirm screen. Nothing is typed as a command.",
+              "↩ Back returns to the page you came from."]
+    return "\n".join(lines)
+
+
+def _cat_buttons(cat: str, st: Dict[str, Any], chat_id: Optional[str] = None) -> list:
+    """(label, callback) pairs for one category — one per setting."""
+    out: List[Tuple[str, str]] = []
+    for it in _CATS.get(cat) or []:
+        k = it["kind"]
+        if k == "bool":
+            mark = "✅" if st.get(it["key"]) else "⏸"
+            out.append((f"{mark} {it['label']}", f"panel:tg:{it['sub']}:{cat}"))
+        elif k == "enum":
+            m = str(st.get(it["key"]) or "balanced")
+            out.append((f"{_MODE_LABEL.get(m, m)} {it['label']}", f"panel:tg:{it['sub']}:{cat}"))
+        elif k == "int":
+            out.append((f"✏️ {it['label']} ({st.get(it['key'])}s)",
+                        f"panel:{it['page']}"))
+        elif k == "text":
+            out.append((f"✏️ {it['label']}", f"panel:wiz:{it['flow']}"))
+        elif k == "chan":
+            if str(st.get("log_channel") or ""):
+                out.append(("📍 Log here", "panel:sethere"))
+                out.append(("⚔️ Turn log off", "panel:logoff"))
+            else:
+                out.append(("📍 Log here", "panel:sethere"))
+            out.append(("✏️ Set the channel by id", "panel:wiz:logid"))
+        elif k == "list":
+            out.append((f"{it['label']}", str(it["cb"])))
+        elif k == "lock":
+            # a state line, not a value: the button says what tapping it does
+            if st.get(it["key"], True):
+                out.append((f"{it['label']} — tap to lock", str(it["cb"])))
+            else:
+                out.append(("🔓 Updates locked — tap to unlock", str(it["cb"])))
+        else:  # cmd
+            cb = str(it["cb"])
+            if cb == "wipe:LOG" and str(st.get("log_channel") or ""):
+                out.append((it["label"], f"wipe:{st['log_channel']}"))
+            elif cb != "wipe:LOG":
+                out.append((it["label"], cb))
+    if cat == "system":
+        # the System page doubles as the version readout
+        out.append((f"v{_plugin_version()}", "panel:upd:check"))
+    return out
+
+
 def _settings_view(st: Dict[str, Any], note: str = "") -> str:
     """All flags in one place — each with its own confirm screen."""
-    def _f(k: str) -> str:
-        return "<b>on</b>" if st.get(k) else "<b>off</b>"
-    lines = [
-        "<b>⚙️ Settings</b> — tap a flag → confirm screen → applied",
-        f"🔁 reactions: {_f('auto_react')} · 👥 guest reacts: {_f('react_guests')} · "
-        f"🖼 guest media: {_f('media_to_guests')}",
-        f"👑 mirror: {_f('log_owner_messages')} · 📣 mentions: {_f('log_group_mentions')} · "
-        f"🛠 tool: {_f('tool_enabled')}",
-        f"💬 whitelisted msgs: {_f('log_whitelisted_messages')} · "
-        f"🗨 other msgs: {_f('log_other_messages')}",
-        f"⏱ cooldown: <b>{_esc(str(st.get('unauthorized_cooldown_s')))}s</b>",
-        "",
-        "Nothing applies on the first tap — the confirm screen shows now → next.",
-    ]
-    if note:
-        lines.insert(1, note)
-    return "\n".join(lines)
+    return _cat_body("settings", st, note)
 
 
 def _wl_view(st: Dict[str, Any], note: str = "") -> str:
@@ -1905,20 +2144,13 @@ def _view_body(view: str, st: Dict[str, Any], note: str = "",
     back on the right page instead of dumping the owner on the home grid."""
     def _with(body: str) -> str:
         return f"{body}\n\n{note}" if note else body
-    if view == "settings":
-        return _settings_view(st, note)
+    if view in _CATS:
+        # v4.0.0 categories: log, guests, react, tool, access, system, settings
+        return _cat_body(view, st, note)
     if view == "wl":
         return _wl_view(st, note)
-    if view == "log":
-        return _help_view("log", st)
-    if view == "guests":
-        return _help_view("guests", st)
-    if view == "bot":
-        return _help_view("bot", st)
     if view == "status":
         return _help_view("status", st)
-    if view == "access":
-        return _help_view("access", st)
     if view == "sessions":
         return _help_view("sessions", st)
     if view == "actions":
@@ -1927,8 +2159,6 @@ def _view_body(view: str, st: Dict[str, Any], note: str = "",
         return _with(_gate_view(st))
     if view == "gsess":
         return _with(_gsess_view(st))
-    if view == "system":
-        return _with(_system_view(st))
     if view == "cool":
         return _with(f"<b>⏱ Cooldown</b> — how long a stranger waits before the "
                      f"canned reply may repeat\ncurrent: "
@@ -1938,6 +2168,11 @@ def _view_body(view: str, st: Dict[str, Any], note: str = "",
         _o, _, _kp = (arg or "").partition(":")
         _k, _, _p = _kp.partition(":")
         return _with(_cfm_view(_k, _p, st))
+    if view in ("full", "bot", "who", "status", "sessions", "log", "guests",
+                "access", "system"):
+        # help pages a Back pop can land on — render the real section, never
+        # the console, so the body always matches the keyboard.
+        return _help_view(view, st)
     return _panel_text(st, note)
 
 
@@ -1959,27 +2194,20 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         if pairs:
             rows.append([B(lbl, callback_data=f"{_CB_PREFIX}{path}") for lbl, path in pairs])
 
-    if view == "panel":
-        add(("📡 Log", "help:log"), ("🛡 Access", "help:access"),
-            ("🧹 Sessions", "help:sessions"))
-        add(("👾 Guests", "help:guests"), ("🤖 Bot", "help:bot"),
-            ("🔧 System", "help:system"))
+    if view in _CATS:
+        # v4.0.0 category page — one button per setting, values in the body.
+        _pairs = _cat_buttons(view, st, chat_id)
+        for _ci in range(0, len(_pairs), 2):
+            add(*_pairs[_ci:_ci + 2])
+    elif view == "panel":
+        # Home: a status board plus the six categories, everything one tap away.
+        add(("📡 Log", "help:log"), ("👾 Guests", "help:guests"))
+        add(("🔁 Reactions", "help:react"), ("🤖 Tool", "help:tool"))
+        add(("🛡 Access", "help:access"), ("🔧 System", "help:system"))
         add(("⚙️ Settings", "panel:settings"), ("🛡 Whitelist", "panel:wl"))
-        add(("⚡ Actions — do things", "panel:actions"))
-        add(("📜 Full help", "help:full"))
-    elif view == "settings":
-        add((f"🔁 Reactions {_mark('auto_react')}", "panel:tg:react:settings"),
-            (f"👥 Guest reacts {_mark('react_guests')}", "panel:tg:greact:settings"),
-            (f"🖼 Guest media {_mark('media_to_guests')}", "panel:tg:media:settings"))
-        add((f"👑 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:settings"),
-            (f"📣 Mentions {_mark('log_group_mentions')}", "panel:tg:mentions:settings"),
-            (f"🛠 Tool {_mark('tool_enabled')}", "panel:tg:tool:settings"))
-        add((f"💬 WL msgs {_mark('log_whitelisted_messages')}", "panel:tg:wmsgs:settings"),
-            (f"🗨 Other msgs {_mark('log_other_messages')}", "panel:tg:omsgs:settings"))
-        add((f"⏱ Cooldown {st.get('unauthorized_cooldown_s')}s", "panel:cool"),
-            ("👾 Stranger reply", "panel:wiz:unauth"))
-        add(("👻 Guest texts", "panel:out:guests"), ("📋 Users", "panel:out:users"),
-            ("🔍 Auth debug", "panel:wiz:authdbg"))
+        add(("⚡ Actions — do things", "panel:actions"),
+            ("📜 Full help", "help:full"))
+        add(("🧹 Sessions", "help:sessions"))
     elif view == "wl":
         _wowner = str(_owner_id() or "")
         for _wuid in _read_allow_from():
@@ -2049,49 +2277,19 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
     elif view == "wiz":
         add(("✖ Cancel the wizard", "panel:wizcancel"))
     elif view == "status":
-        add(("\u2699\ufe0f Settings", "panel:out:settings"), ("\U0001f4cb Users", "panel:out:users"))
-        add((f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:tg:tool:status"),
-            (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:status"))
-    elif view == "log":
-        add((f"\U0001f4e3 Mentions {_mark('log_group_mentions')}", "panel:tg:mentions:log"),
-            (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:log"))
-        add((f"\U0001f4ac WL msgs {_mark('log_whitelisted_messages')}", "panel:tg:wmsgs:log"),
-            (f"\U0001f5e8 Other msgs {_mark('log_other_messages')}", "panel:tg:omsgs:log"))
-        if log:
-            add(("\U0001f4e1 Turn log off", "panel:logoff"), (f"\U0001f9f9 Wipe log chat", f"wipe:{log}"))
-        else:
-            add(("\U0001f4e1 Log is off", "panel:out:settings"))
-    elif view == "access":
-        add(("\U0001f6e1 Whitelist", "panel:out:whitelist"), ("\U0001f4cb Users", "panel:out:users"))
-        if chat_id:
-            add((f"\U0001f9f9 Wipe this chat", f"wipe:{chat_id}"))
+        add(("⚙️ Settings", "panel:out:settings"), ("📋 Users", "panel:out:users"))
+        add((f"🛠 Tool {_mark('tool_enabled')}", "panel:tg:tool:status"),
+            (f"👑 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:status"))
     elif view == "sessions":
         if chat_id:
-            add((f"\U0001f9f9 Wipe this chat", f"wipe:{chat_id}"))
+            add((f"🧹 Wipe this chat", f"wipe:{chat_id}"))
         if log:
-            add((f"\U0001f9f9 Wipe log chat", f"wipe:{log}"))
-        add(("\u2699\ufe0f Settings", "panel:out:settings"))
-    elif view == "guests":
-        add((f"\u23f1 Cooldown {st.get('unauthorized_cooldown_s')}s", "panel:cool"),
-            ("\U0001f47b Guest texts", "panel:out:guests"))
-        add((f"\U0001f465 Guest reacts {_mark('react_guests')}", "panel:tg:greact:guests"),
-            (f"\U0001f5bc Guest media {_mark('media_to_guests')}", "panel:tg:media:guests"))
-        add(("\U0001f464 Who is on the link", "help:who"))
+            add((f"🧹 Wipe log chat", f"wipe:{log}"))
+        add(("⚙️ Settings", "panel:out:settings"))
     elif view == "bot":
-        add((f"\U0001f6e0 Tool {_mark('tool_enabled')}", "panel:tg:tool:bot"),
-            (f"\U0001f451 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:bot"))
-        add(("\u2699\ufe0f Settings", "panel:out:settings"), ("\U0001f4cb Users", "panel:out:users"))
-    elif view == "system":
-        add((f"🛡 Guest mode: {_MODE_LABEL.get(str(st.get('guest_tool_mode') or 'balanced'), 'balanced')}",
-             "panel:gate"))
-        add(("⬇️ Guest tool rules", "panel:gate:list"))
-        if st.get("update_enabled", True):
-            add(("🔍 Check for update", "panel:upd:check"))
-            add(("⬆️ Install update", "panel:upd:apply"))
-            add(("🔓 Updates on — tap to lock", "panel:upd:lock"))
-        else:
-            add(("🔒 Updates locked — tap to unlock", "panel:upd:lock"))
-        add((f"v{_plugin_version()}", "panel:upd:check"))
+        add((f"🛠 Tool {_mark('tool_enabled')}", "panel:tg:tool:bot"),
+            (f"👑 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:bot"))
+        add(("⚙️ Settings", "panel:out:settings"), ("📋 Users", "panel:out:users"))
     elif view == "out":
         add(("\U0001f4cb Users", "panel:out:users"), ("\u2699\ufe0f Settings", "panel:out:settings"),
             ("\U0001f6e1 Whitelist", "panel:out:whitelist"))
@@ -2102,22 +2300,24 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
             ("\U0001f916 Bot", "help:bot"))
 
     if view == "wlfr":
-        rows.insert(0, [B("\u2b05\ufe0f Whitelist", callback_data=f"{_CB_PREFIX}panel:wl")])
+        rows.insert(0, [B("⬅️ Whitelist", callback_data=f"{_CB_PREFIX}panel:wl")])
         add(("📜 Full help", "help:full"))
     elif view == "wlrm":
-        rows.insert(0, [B("\u2b05\ufe0f Friend", callback_data=f"{_CB_PREFIX}panel:wlfr:{arg}")])
+        rows.insert(0, [B("⬅️ Friend", callback_data=f"{_CB_PREFIX}panel:wlfr:{arg}")])
         add(("📜 Full help", "help:full"))
     elif view == "tg":
         _corigin = (arg or "").partition(":")[2] or "settings"
-        rows.insert(0, [B("\u2b05\ufe0f Back", callback_data=f"{_CB_PREFIX}panel:view:{_corigin}")])
+        rows.insert(0, [B("⬅️ Back", callback_data=f"{_CB_PREFIX}panel:view:{_corigin}")])
         add(("📜 Full help", "help:full"))
     elif view != "panel":
-        rows.insert(0, [B("\u2b05\ufe0f Console", callback_data=f"{_CB_PREFIX}panel:back")])
+        # pops one level of history — from a category it lands on the console,
+        # from a sub-page it lands on the category you came from.
+        rows.insert(0, [B("⬅️ Back", callback_data=f"{_CB_PREFIX}panel:back")])
         add(("📜 Full help", "help:full"))
     if view == "cool":
         add(*[(f"{n}s", f"panel:cool:{n}") for n in (0, 60, 300, 3600)])
     if chat_id and view in ("panel", "sessions", "access"):
-        add(("\U0001f9f9 Wipe this chat", f"wipe:{chat_id}"))
+        add((f"🧹 Wipe this chat", f"wipe:{chat_id}"))
     return rows
 
 
@@ -2126,6 +2326,7 @@ _MODE_LABEL = {"strict": "🔒 strict", "balanced": "⚖️ balanced", "open": "
 _VIEW_LABEL = {"full": "📜 Full help", "panel": "🧩 Console", "out": "📋 Output",
                "status": "ℹ️ Status", "log": "📡 Log", "access": "🛡 Access",
                "sessions": "🧹 Sessions", "bot": "🤖 Bot", "guests": "👾 Guests",
+               "react": "🔁 Reactions", "tool": "🤖 Tool & gate",
                "cool": "⏱ Cooldown", "system": "🔧 System", "safeguard": "🛡 Safeguards",
                "actions": "⚡ Actions", "gsess": "🔐 Guest sessions", "wiz": "📝 Wizard",
                "settings": "⚙️ Settings", "wl": "🛡 Whitelist", "wlfr": "👤 Friend",
@@ -2136,6 +2337,44 @@ _VIEW_LABEL = {"full": "📜 Full help", "panel": "🧩 Console", "out": "📋 O
 # button writes — `panel:tgy` for settings flags, `panel:upd` for updates,
 # `panel:cfmok` for the rest. Nothing else in the panel writes a setting.
 _CFM_KINDS = {"tg", "gs", "log", "upd", "sup", "cool", "wl", "gate"}
+
+# v4.0.0 — Back returns to the page you came from, not always to the console.
+# A per-panel-message history: navigate truncates/appends, `panel:back` pops.
+# Confirm screens and the wizard are transient, so they never enter the stack.
+_NAV: Dict[str, List[str]] = {}
+_NAV_MAX = 16
+_NAV_TRANSIENT = frozenset({"cfm", "tg", "wiz"})
+
+
+def _nav_key(q: Any) -> str:
+    """One history per panel message — two open panels do not share a stack."""
+    msg = getattr(q, "message", None)
+    return f"{_msg_chat_id(msg)}:{getattr(msg, 'message_id', None) or getattr(msg, 'id', None)}"
+
+
+def _nav_push(key: str, view: str) -> None:
+    """Record a landing. Revisiting an ancestor truncates back to it, so
+    leaving a confirm screen lands exactly where the tap came from."""
+    if view in _NAV_TRANSIENT or not view:
+        return
+    st = _NAV.setdefault(key, ["panel"])
+    if st and st[-1] == view:
+        return
+    if view in st:
+        del st[st.index(view) + 1:]
+    else:
+        st.append(view)
+        del st[:-_NAV_MAX]
+
+
+def _nav_back(key: str) -> str:
+    """Pop one level. Empty or single-entry history falls back to home."""
+    st = _NAV.get(key) or ["panel"]
+    if len(st) > 1:
+        st.pop()
+        _NAV[key] = st
+        return st[-1]
+    return "panel"
 
 
 def _msg_chat_id(msg: Any) -> Optional[str]:
@@ -2650,6 +2889,78 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
         "prompts": ["🚫 <b>Deny a tool</b>\n\nSend the tool name to keep blocked (prefix with "
                     "<code>-</code> to remove it instead).\n<i>Type cancel to abort.</i>"],
         "build": lambda d: f"!gate deny {d[0]}"},
+    # --- v4.0.0: every changeable setting is reachable from the panel alone.
+    # A flow either carries a `build` (a bang command twin, so button and
+    # command share one code path) or a `save` (a settings patch) for the
+    # keys that never had a command. `validate` re-prompts instead of dying.
+    "logid": {
+        "prompts": ["📡 <b>Log channel</b>\n\nSend the chat id (or @username) to log into. "
+                    "Send <code>off</code> to turn logging off.\n"
+                    "<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!setlog {d[0]}"},
+    "err_en": {
+        "prompts": ["👾 <b>Guest error reply — English</b>\n\nSend the exact text a guest gets "
+                    "when a run fails.\n<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!seterror {d[0]}"},
+    "err_fa": {
+        "prompts": ["👾 <b>Guest error reply — Persian</b>\n\nSend the exact text a guest gets "
+                    "when a run fails in Persian.\n<i>Type cancel to abort.</i>"],
+        "build": lambda d: f"!seterrorfa {d[0]}"},
+    "lockreply": {
+        "prompts": ["🔒 <b>Locked session reply</b>\n\nSend the exact text a locked guest "
+                    "session answers with.\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"guest_locked_reply": d[0][:400]},
+        "validate": lambda d: "" if d[0].strip() else "send some text",
+        "done": "✅ locked reply updated."},
+    "emoji_recv": {
+        "prompts": ["🔁 <b>Reaction — message received</b>\n\nSend the emoji ATRA drops when "
+                    "your message arrives.\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"react_emoji_receive": d[0][:32]},
+        "validate": lambda d: "" if d[0].strip() else "send an emoji",
+        "done": "✅ receive reaction updated."},
+    "emoji_done": {
+        "prompts": ["✅ <b>Reaction — done</b>\n\nSend the emoji ATRA drops when a run "
+                    "succeeds.\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"react_emoji_done": d[0][:32]},
+        "validate": lambda d: "" if d[0].strip() else "send an emoji",
+        "done": "✅ done reaction updated."},
+    "emoji_err": {
+        "prompts": ["❌ <b>Reaction — error</b>\n\nSend the emoji ATRA drops when a run "
+                    "fails.\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"react_emoji_error": d[0][:32]},
+        "validate": lambda d: "" if d[0].strip() else "send an emoji",
+        "done": "✅ error reaction updated."},
+    "persona": {
+        "prompts": ["🎭 <b>Guest persona file</b>\n\nSend the path to the persona markdown "
+                    "guest sessions answer with, or <code>default</code> to reset.\n"
+                    "<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"persona_path": (None if d[0].strip().lower() in ("default", "reset", "auto")
+                                            else d[0].strip()[:400])},
+        "validate": lambda d: "" if d[0].strip() else "send a path, or 'default'",
+        "done": "✅ persona path updated — used on the next guest message."},
+    "uprepo": {
+        "prompts": ["📦 <b>Update source repository</b>\n\nSend <code>owner/repo</code> or a full "
+                    "git URL, or <code>auto</code> to follow this plugin's own origin.\n"
+                    "<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"update_repo": (None if d[0].strip().lower() in ("auto", "default", "origin")
+                                           else d[0].strip()[:300])},
+        "validate": lambda d: ("" if d[0].strip().lower() in ("auto", "default", "origin")
+                               or "/" in d[0].strip() else "send owner/repo, a git URL, or 'auto'"),
+        "done": "✅ update source updated."},
+    "upbranch": {
+        "prompts": ["🌿 <b>Update branch</b>\n\nSend the branch name to track "
+                    "(default <code>master</code>).\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"update_branch": d[0].strip()[:120] or "master"},
+        "validate": lambda d: ("" if d[0].strip() and " " not in d[0].strip()
+                               else "send a single branch name with no spaces"),
+        "done": "✅ update branch updated."},
+    "uptimeout": {
+        "prompts": ["⌛ <b>Update timeout</b>\n\nSend the seconds git plus the test suite may "
+                    "take (10–1800).\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"update_timeout_s": int(d[0].strip())},
+        "validate": lambda d: ("" if d[0].strip().isdigit() and 10 <= int(d[0].strip()) <= 1800
+                               else "send a whole number of seconds between 10 and 1800"),
+        "done": "✅ update timeout updated."},
 }
 
 
@@ -2688,8 +2999,20 @@ async def _wizard_feed(adapter: Any, chat_id: Any, text: str,
     w["data"].append(text.strip()[:4000])
     if len(w["data"]) < len(f["prompts"]):
         return f["prompts"][len(w["data"])]
+    # A flow either builds a command string (so the panel button and its
+    # command twin run the same code) or carries a settings patch directly.
+    # Validation runs BEFORE the flow is cleared, so a bad answer re-prompts
+    # instead of silently killing the wizard.
+    if f.get("validate"):
+        err = f["validate"](w["data"])
+        if err:
+            w["data"].pop()
+            return f"⚠️ {_esc(str(err))}\n\n{f['prompts'][len(w['data'])]}"
     _WIZARD.pop(key, None)
     try:
+        if f.get("save") is not None:
+            save_settings(f["save"](w["data"]))
+            return f.get("done") or "✅ saved."
         out = await _bang_execute(adapter, key, f["build"](w["data"]),
                                   session_store=session_store)
     except Exception:
@@ -2877,6 +3200,8 @@ async def _on_callback(update: Any, context: Any = None) -> None:
         if data.startswith(f"{_CB_PREFIX}help:"):
             key = data.split(":", 2)[2] if data.count(":") >= 2 else "full"
             st = settings()
+            _nk = _nav_key(q)
+            _nav_push(_nk, key)   # v4.0.0: Back from a section returns to where you were
             res = await _panel_edit(q, _help_view(key, st), key, st)  # keyboard gets chat_id inside
             if res == "same":
                 await q.answer(f"{_VIEW_LABEL.get(key, '🧩')} — already showing", show_alert=False)
@@ -2894,6 +3219,11 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             toggles = _TOGGLES   # one map, shared by legacy taps + confirm flow
             view, note, body = "panel", "", ""
             arg = ""   # card target for wlfr/wlrm, "sub:origin" for a confirm screen
+            _nk = _nav_key(q)
+            if action == "back":
+                # v4.0.0: pop one level instead of dumping the owner on the console.
+                view = _nav_back(_nk)
+                body = _view_body(view, st, note)
             if action == "tgy" and len(bits) > 3:
                 # Pre-v3.3 panels still show this Apply name. Normalise it here
                 # so there is exactly one writer to audit: panel:cfmok.
@@ -3158,6 +3488,12 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                             ad, _msg_chat_id(q.message) or "", bang)
             if not body:
                 body = _panel_text(st, note)
+            # v4.0.0: record the landing so ⬅️ Back returns one level, not home.
+            # The console resets the stack — it is the root of every path.
+            if view == "panel":
+                _NAV.pop(_nk, None)
+            else:
+                _nav_push(_nk, view)
             res = await _panel_edit(q, body, view, st, arg=arg)
             if res == "failed":
                 await q.answer("⚠️ couldn't update the panel", show_alert=True)
@@ -3703,6 +4039,22 @@ def _update_settings() -> Dict[str, Any]:
         "home": home,
         "backup_root": home / "cache" / "scratch" / "guest_restore",
     }
+
+
+def _repo_display(repo: Any) -> str:
+    """Strip credentials from a repo URL before it reaches a screen or a log.
+
+    `git config remote.origin.url` on a token-authenticated checkout returns
+    `https://x-access-token:ghp_…@github.com/…`, and that origin is what
+    `_plugin_origin()` falls back to — so anything rendering cfg["repo"] would
+    otherwise print a live PAT into the panel, which is sent to Telegram.
+    """
+    s = str(repo or "")
+    if "@" in s and "://" in s:
+        head, _, tail = s.partition("://")
+        if "@" in tail:
+            return f"{head}://…@{tail.rsplit('@', 1)[1]}"
+    return s
 
 
 def _plugin_origin() -> str:
