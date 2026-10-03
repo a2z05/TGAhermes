@@ -236,7 +236,19 @@ def _hermes_home() -> Path:
 
 def _persona_path() -> Path:
     p = settings().get("persona_path")
-    return Path(p) if p else _hermes_home() / "assets" / "guest_persona.md"
+    if p:
+        return Path(p)
+    bundled = PLUGIN_DIR / "assets" / "guest_persona.md"
+    home_copy = _hermes_home() / "assets" / "guest_persona.md"
+    try:
+        if home_copy.is_file() and bundled.is_file():
+            if home_copy.read_bytes() != bundled.read_bytes():
+                return home_copy
+        elif home_copy.is_file():
+            return home_copy
+    except OSError:
+        pass
+    return bundled if bundled.is_file() else home_copy
 
 
 # ---------------------------------------------------------------- identity / guest helpers
