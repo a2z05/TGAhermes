@@ -4044,10 +4044,12 @@ def _update_settings() -> Dict[str, Any]:
 def _repo_display(repo: Any) -> str:
     """Strip credentials from a repo URL before it reaches a screen or a log.
 
-    `git config remote.origin.url` on a token-authenticated checkout returns
-    `https://x-access-token:ghp_…@github.com/…`, and that origin is what
-    `_plugin_origin()` falls back to — so anything rendering cfg["repo"] would
-    otherwise print a live PAT into the panel, which is sent to Telegram.
+    A token-authenticated checkout stores a credential-bearing URL in
+    `git config remote.origin.url`, and that origin is what `_plugin_origin()`
+    falls back to — so anything rendering cfg["repo"] would otherwise print a
+    live personal access token into the panel, which is sent to Telegram.
+    Everything from the scheme up to and including the last at-sign is
+    replaced; only the host-and-path tail is kept.
     """
     s = str(repo or "")
     if "@" in s and "://" in s:

@@ -2051,5 +2051,79 @@ check(mod._tg_next("mode", _st) == "open", "mode confirm shows the same next mod
 check("open" in mod._tg_view("mode", "safeguard", _st),
       "mode confirm names the next mode before applying")
 
+print("\n[26] panel v4.0.0: categorized settings, prompt wizards, history Back")
+# every one of the 29 settings keys sits in exactly one category, so a new
+# key cannot silently become unreachable from the panel.
+_placed = {it["key"] for items in mod._CATS.values() for it in items
+           if it.get("key")}
+_missing = sorted(set(mod.DEFAULT_SETTINGS) - _placed)
+check(not _missing, f"all settings keys are categorized (missing: {_missing})")
+
+for _c in mod._CATS:
+    check(mod._CAT_LABEL[_c] in mod._cat_body(_c, mod.settings()),
+          f"category body renders: {_c}")
+
+# every callback a category emits must be one the router understands
+_cat_cbs = {_cb for _c in mod._CATS
+            for _lbl, _cb in mod._cat_buttons(_c, mod.settings(), chat_id="-100777")}
+_flows = {_c[len("panel:wiz:"):] for _c in _cat_cbs if _c.startswith("panel:wiz:")}
+check(not [f for f in _flows if f not in mod._WIZ_FLOWS],
+      "every wizard flow a category offers exists")
+_subs = {_c.split(":")[2] for _c in _cat_cbs if _c.startswith("panel:tg:")}
+check(not [s for s in _subs if s not in ("mode", *mod._TOGGLES)],
+      "every confirm sub-key a category offers resolves")
+check(all(len(_c.encode()) <= 64 for _c in _cat_cbs),
+      "category callbacks inside Telegram's 64-byte cap")
+
+# a save-flow wizard writes the setting without running any command
+_prev_branch = mod.settings().get("update_branch")
+mod._WIZARD["-100555"] = {"flow": "upbranch", "data": []}
+_out = asyncio.run(mod._wizard_feed(None, "-100555", "  dev  "))
+check("✅" in (_out or "") and mod.settings().get("update_branch") == "dev",
+      "save-flow writes the setting with no command")
+# bad input re-prompts instead of killing the flow
+mod._WIZARD["-100555"] = {"flow": "uptimeout", "data": []}
+_out = asyncio.run(mod._wizard_feed(None, "-100555", "5"))
+check("⚠️" in (_out or "") and "-100555" in mod._WIZARD,
+      "failed validation re-prompts and keeps the wizard open")
+mod.save_settings({"update_branch": _prev_branch, "update_timeout_s": 300})
+mod._WIZARD.clear()
+
+# Back is a per-message history; confirm screens and the wizard never enter it
+class _M:
+    chat_id = -100555
+    message_id = 77
+class _Q:
+    message = _M()
+_q = _Q()
+_nk = mod._nav_key(_q)
+mod._NAV.pop(_nk, None)
+for _v in ("panel", "log", "settings", "cfm"):
+    mod._nav_push(_nk, _v)
+check(mod._NAV[_nk] == ["panel", "log", "settings"],
+      "transient confirm screen does not enter history")
+check(mod._nav_back(_nk) == "log", "Back from a category returns the console's child")
+check(mod._nav_back(_nk) == "panel", "Back again returns the console")
+check(mod._nav_back(_nk) == "panel", "Back at the console stays home")
+mod._NAV.pop(_nk, None)
+
+# credentials must never reach a panel body: git origin on a token checkout
+# is a credential-bearing URL, and that is what _plugin_origin falls back to.
+import subprocess as _sp
+_raw_origin = _sp.run(["git", "config", "--get", "remote.origin.url"],
+                      cwd=str(HERE), capture_output=True,
+                      text=True).stdout.strip()
+_shown = mod._repo_display(_raw_origin)
+# the kept tail must be host/path only — no colon means no password survived
+_tail = _shown.split("://")[-1] if "://" in _shown else _shown
+check(":" not in _tail.rsplit("@", 1)[-1],
+      "git origin loses its credential when displayed")
+check("github.com" in _shown or not _raw_origin,
+      "host survives redaction")
+check("ghp_" not in mod._cat_body("system", mod.settings()),
+      "System category body carries no token")
+check("ghp_" not in mod._panel_text(mod.settings()),
+      "home board carries no token")
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)
