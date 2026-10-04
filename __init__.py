@@ -57,6 +57,28 @@ SETTINGS_PATH = PLUGIN_DIR / "settings.json"
 STATE_PATH = PLUGIN_DIR / "state.json"
 GUEST_CHAT_PREFIX = "guest_"
 
+# --- Chat Automation: language catalog + connection store (bizauto) ---------
+# Loaded from the package in production, or straight from disk when the test
+# harness imports this file by path. A missing file degrades, never crashes.
+bizauto: Any = None
+try:
+    from . import bizauto as _bizauto_mod  # type: ignore
+    bizauto = _bizauto_mod
+except Exception:
+    try:
+        import importlib.util as _ilu
+        _ba_path = Path(__file__).parent / "bizauto.py"
+        if _ba_path.exists():
+            _ba_spec = _ilu.spec_from_file_location("tga_bizauto", _ba_path)
+            if _ba_spec is not None and _ba_spec.loader is not None:
+                _ba_mod = _ilu.module_from_spec(_ba_spec)
+                _ba_spec.loader.exec_module(_ba_mod)
+                bizauto = _ba_mod
+    except Exception:
+        logger.debug("[TGAhermes] bizauto language module unavailable", exc_info=True)
+if bizauto is None:
+    logger.warning("[TGAhermes] bizauto.py not loaded - Chat Automation degrades to off")
+
 # session_id -> how many tools the gate has refused for it in this turn.
 # A block comes back as a tool result, so the model will otherwise keep probing.
 _GUEST_BLOCK_COUNTS: Dict[str, int] = {}
@@ -124,6 +146,18 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "update_repo": None,             # git URL; None = use the plugin's own origin
     "update_branch": "master",       # branch to track
     "update_timeout_s": 300,         # git/test budget per attempt
+    # --- Chat Automation (Telegram business / Secretary Mode) ----------------
+    "biz_mode": "assistant",         # assistant | mimic | off - who answers customer chats
+    "biz_warn_first": True,          # first-contact warning before the first auto-reply
+    "biz_lang": "auto",              # auto = detect per message; else a pinned lang code
+    "biz_warn_text": "",             # "" = per-language default (bizauto catalog)
+    "biz_react": True,               # drop the emoji on the automation reply
+    "biz_react_emoji": "\U0001f47e",
+    "biz_larp": False,               # imitate the owner's style from history
+    "biz_persona_path": "",          # mimic persona file; "" = built-in mimic prompt
+    "biz_scope": [],                 # [] = every business chat; else only these ids
+    "biz_deny_tools": [],            # extra tools locked on automation chats
+
 }
 
 _FALLBACK_PERSONA = """I'm ATRA — named after Atropos, the Greek Fate who cuts the thread.
@@ -817,6 +851,420 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
 
 # ---------------------------------------------------------------- outbound wraps
 
+# --- Chat Automation wiring: connection map + owner presence ---------------
+_BIZ_CONN: Dict[str, str] = {}             # chat_id -> business_connection_id (live)
+_OWNER_LAST_SEEN: Dict[str, float] = {"t": 0.0}   # monotonic ts of owner's last event
+
+
+def _owner_idle() -> bool:
+    """Warn-first gate: True when the owner has not talked to ATRA for 15 min.
+
+    The Bot API exposes no online status, so presence is inferred from the
+    owner's own inbound traffic; a cold process starts idle (warn on)."""
+    last = _OWNER_LAST_SEEN.get("t") or 0.0
+    if not last:
+        return True
+    return (time.monotonic() - last) > 900.0
+
+
+def _bump_owner_seen(event: Any) -> None:
+    """Remember the owner just spoke (called from the dispatch hook)."""
+    try:
+        if event is None:
+            return
+        _src_ev = getattr(event, "source", None)
+        _uid = str(getattr(_src_ev, "user_id", "") or "")
+        if _uid and _uid == str(_owner_id() or "") and not getattr(event, "internal", False):
+            _OWNER_LAST_SEEN["t"] = time.monotonic()
+    except Exception:
+        logger.debug("[TGAhermes] owner presence update failed", exc_info=True)
+
+
+# ---------------------------------------------------------------- chat automation (bizauto)
+# Telegram Secretary Mode: the owner's account holds a business connection to
+# this bot, so customer DMs arrive as business_message updates and replies go
+# out with business_connection_id (they appear as the owner's own messages).
+# Everything below is best-effort: no connection -> no replies, never an
+# exception in the handler path. All user-visible warn texts live in bizauto
+# (Persian/Arabic from the local untracked JSON), keeping this file audit-clean.
+
+_BIZ_MODE_ORDER = ("assistant", "mimic", "off")
+
+
+def _biz_db_path() -> Path:
+    _cand = PLUGIN_DIR / "bizauto.db"
+    try:
+        _cand.touch()
+        return _cand
+    except Exception:
+        pass
+    _fb = _hermes_home() / "cache" / "bizauto.db"
+    try:
+        _fb.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        logger.debug("[TGAhermes] bizauto fallback dir creation failed", exc_info=True)
+    return _fb
+
+
+_BIZ_STORE: Any = None
+
+
+def _biz_store() -> Any:
+    """Lazy SQLite store; None when bizauto or the path is unavailable."""
+    global _BIZ_STORE
+    if _BIZ_STORE is not None:
+        return _BIZ_STORE
+    if bizauto is None:
+        return None
+    try:
+        _BIZ_STORE = bizauto.biz_store(_biz_db_path())
+    except Exception:
+        logger.warning("[TGAhermes] chat automation store unavailable", exc_info=True)
+        _BIZ_STORE = False
+    return _BIZ_STORE if _BIZ_STORE else None
+
+
+def _biz_denied(st: Dict[str, Any]) -> set:
+    """Tools locked for automation chats: the dangerous set, plus owner extras."""
+    extra = {str(t).strip() for t in (st.get("biz_deny_tools") or []) if str(t).strip()}
+    return set(GUEST_BLOCKED_TOOLS) | set(GUEST_NEVER_TOOLS) | extra
+
+
+def _biz_refusal(name: str, repeats: int = 0) -> str:
+    base = (f"🔒 <b>{_esc(name)}</b> is locked in automation chats — this conversation "
+            "runs with the customer-safe tool set. Ask the owner directly for anything else.")
+    if repeats:
+        base += f" <i>(blocked {repeats + 1}&#215;)</i>"
+    return base
+
+
+def _biz_chat_known(chat_id: Any) -> bool:
+    store = _biz_store()
+    if store is None or not chat_id:
+        return False
+    try:
+        return store.chat_state(chat_id) is not None
+    except Exception:
+        return False
+
+
+def _biz_list_patch(key: str, raw: str) -> list:
+    """Wizard input -> updated list: 'all' clears, '-x' removes, 'x' adds."""
+    cur = [str(x) for x in (settings().get(key) or [])]
+    v = str(raw or "").strip()
+    if v.lower() in ("all", "clear", "reset", "*"):
+        return []
+    if v.startswith("-"):
+        t = v[1:].strip()
+        return [x for x in cur if x != t]
+    if v and v not in cur:
+        cur.append(v)
+    return cur
+
+
+async def _biz_send(adapter: Any, chat_id: Any, text: str) -> bool:
+    """Best-effort text delivery over the business connection."""
+    bcid = _BIZ_CONN.get(str(chat_id) or "")
+    if not bcid or not text:
+        return False
+    try:
+        await adapter._bot.send_message(chat_id=chat_id, text=str(text)[:4000],
+                                        business_connection_id=bcid)
+        return True
+    except Exception:
+        logger.warning("[TGAhermes] automation send failed (chat=%s)", chat_id, exc_info=True)
+        return False
+
+
+async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -> Any:
+    """Final reply of an automation turn: deliver via the business connection
+    (it appears as the owner's message), remember the reply, and drop the
+    configured reaction on it when enabled."""
+    from gateway.platforms.base import SendResult
+    md = getattr(event, "metadata", None) or {}
+    src = getattr(event, "source", None)
+    chat_id = str(md.get("business_chat_id") or getattr(src, "chat_id", "") or "")
+    try:
+        await adapter._release_turn_marker(event)
+    except Exception:
+        logger.debug("[TGAhermes] turn marker release failed", exc_info=True)
+    ok = False
+    if chat_id and text_content and str(text_content).strip():
+        if not bcid:
+            bcid = _BIZ_CONN.get(chat_id, "")
+        if bcid:
+            try:
+                sent = await adapter._bot.send_message(
+                    chat_id=chat_id, text=str(text_content)[:4000],
+                    business_connection_id=bcid)
+                ok = True
+                mid = getattr(sent, "message_id", None)
+                st0 = settings()
+                if mid and st0.get("biz_react") and st0.get("auto_react"):
+                    _spawn(_react(chat_id, mid, st0.get("biz_react_emoji") or "\U0001f47e"))
+            except Exception as e:
+                logger.warning("[TGAhermes] automation reply failed (chat=%s): %s",
+                               chat_id, e, exc_info=True)
+        else:
+            logger.warning("[TGAhermes] automation reply dropped, no business "
+                           "connection (chat=%s)", chat_id)
+    store = _biz_store()
+    if store is not None and chat_id:
+        try:
+            store.mark_replied(chat_id, "ok" if ok else "fail")
+        except Exception:
+            logger.debug("[TGAhermes] mark_replied failed", exc_info=True)
+    return SendResult(success=ok, message_id=None), adapter
+
+
+_BIZ_MIMIC_PROMPT = (
+    "You are Ar(t)an's Telegram account answering a customer directly. "
+    "Write AS him: first person, his voice — concise, casual, practical, "
+    "no corporate tone, no emoji spam. Never claim to be an AI unless the "
+    "customer asks outright; if asked, say an assistant wrote it on his behalf."
+)
+
+
+def _biz_persona(st: Dict[str, Any], mode: str) -> str:
+    p = str(st.get("biz_persona_path") or "").strip()
+    if p:
+        try:
+            txt = Path(p).read_text(encoding="utf-8", errors="replace")[:8000]
+            if txt.strip():
+                return txt
+        except Exception:
+            logger.warning("[TGAhermes] mimic persona unreadable: %s", p)
+    if mode == "mimic":
+        return _BIZ_MIMIC_PROMPT
+    return _load_persona()
+
+
+async def _handle_business_message(adapter: Any, update: Any, context: Any = None,
+                                   edited: bool = False) -> None:
+    """One business message: log it under its OWN title (never the Stranger-DM
+    log), send the first-contact warning once per chat, then hand the turn to
+    the brain with the reply routed back over the business connection."""
+    msg = (getattr(update, "edited_business_message", None) if edited
+           else getattr(update, "business_message", None))
+    if msg is None:
+        return
+    user = getattr(msg, "from_user", None)
+    if user is not None and getattr(user, "is_bot", False):
+        return  # bots never trigger a reply
+    uid = str(getattr(user, "id", "") or "")
+    owner = _owner_id(adapter)
+    if uid and owner and owner not in ("", "*") and uid == owner:
+        return  # the owner's own traffic is not automation
+    st = settings()
+    mode = str(st.get("biz_mode") or "assistant")
+    bcid = str(getattr(msg, "business_connection_id", "") or "")
+    chat_id = str(getattr(getattr(msg, "chat", None), "id", "") or "")
+    text = str(getattr(msg, "text", "") or getattr(msg, "caption", "") or "")
+    if not chat_id:
+        return
+    scope = [str(c) for c in (st.get("biz_scope") or [])]
+    if scope and chat_id not in scope:
+        return  # out of scope: not answered, not logged
+    if bcid:
+        _BIZ_CONN[chat_id] = bcid
+    cfg_lang = str(st.get("biz_lang") or "auto")
+    detect = bizauto.detect_language(text) if (bizauto and text) else "en"
+    lang = detect if cfg_lang in ("", "auto") else cfg_lang
+    lang_label = bizauto.language_label(lang) if bizauto else lang
+    store = _biz_store()
+    if store is not None:
+        try:
+            store.remember_chat(chat_id, detect)
+        except Exception:
+            logger.debug("[TGAhermes] remember_chat failed", exc_info=True)
+    msg_id = str(getattr(msg, "message_id", "") or "") or None
+    prof = _profile_buttons(user, chat_id, msg_id)
+    if edited or mode == "off":
+        action = "edited — log only" if edited else "observed (mode off)"
+        await _log("🤖 Chat Automation — " + ("edit" if edited else "message"),
+                   f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code> "
+                   f"(automation)\n<b>Language:</b> {_esc(lang_label)}"
+                   f"\n<b>Text:</b> <i>{_esc(text[:500])}</i>"
+                   f"\n<b>Action:</b> {_esc(action)}", buttons=prof)
+        return
+    # --- first-contact warning: once per chat, before ATRA's first reply ----
+    warned = False
+    if store is not None:
+        try:
+            warned = bool((store.chat_state(chat_id) or {}).get("warned_at"))
+        except Exception:
+            warned = False
+    if (st.get("biz_warn_first") and not warned and bcid
+            and _owner_idle()):
+        warn = str(st.get("biz_warn_text") or "").strip() or (
+            bizauto.warn_text(lang) if bizauto else "")
+        sent_warn = False
+        if warn:
+            try:
+                await adapter._bot.send_message(chat_id=chat_id, text=warn[:4000],
+                                                business_connection_id=bcid)
+                sent_warn = True
+            except Exception:
+                logger.warning("[TGAhermes] first-contact warning failed", exc_info=True)
+        if sent_warn and store is not None:
+            try:
+                store.mark_warned(chat_id, lang)
+            except Exception:
+                logger.debug("[TGAhermes] mark_warned failed", exc_info=True)
+    # --- build the event the same way the guest path does -------------------
+    try:
+        from gateway.platforms.event import MessageType
+        event = adapter._build_message_event(
+            msg, MessageType.TEXT, update_id=getattr(update, "update_id", None))
+    except Exception:
+        logger.exception("[TGAhermes] failed to build automation event")
+        await _biz_send(adapter, chat_id, "⚠️ Something went wrong — please try again.")
+        return
+    event.text = adapter._clean_bot_trigger_text(event.text or "") or ""
+    persona = _biz_persona(st, mode)
+    first = str(getattr(user, "first_name", "") or "")
+    last = str(getattr(user, "last_name", "") or "")
+    uname = str(getattr(user, "username", "") or "")
+    user_name = (first + " " + last).strip() or (f"@{uname}" if uname else "customer")
+    lang_line = ("mirror the sender's language (detected: %s)" % lang_label
+                 if cfg_lang in ("", "auto") else "always reply in %s" % lang_label)
+    mode_line = {
+        "mimic": ("Mode: MIMIC — you reply AS THE OWNER (first person, his voice, "
+                  "short and casual). Do not mention being an AI unless asked directly."),
+        "assistant": "Mode: ASSISTANT — you reply as ATRA, the owner's AI assistant.",
+        "off": "Mode: OFF — observation only.",
+    }.get(mode, "")
+    identity = (
+        "\n\n---\n"
+        "Chat Automation turn — customer DM reaching the owner's Telegram account.\n"
+        f"Sender: {user_name} ({uid or 'unknown'}) · chat {chat_id} · language {lang_line}\n"
+        f"{mode_line}\n"
+        "Reply directly to their message; no commands, no panel talk."
+    )
+    if st.get("biz_larp"):
+        identity += ("\nStyle: imitate the owner's tone from the conversation history "
+                     "above (LARP) — match vocabulary, length and rhythm.")
+    event.channel_prompt = f"{persona}{identity}"
+    md = event.metadata
+    if isinstance(md, dict):
+        if "chat_id" in md:
+            md["chat_id"] = event.source.chat_id
+        md["business_connection_id"] = bcid
+        md["business_chat_id"] = chat_id
+        md["biz_lang"] = lang
+        md["biz_mode"] = mode
+    try:
+        event.source.user_id = uid or event.source.user_id
+    except Exception:
+        logger.debug("[TGAhermes] could not set source.user_id", exc_info=True)
+    if hasattr(event.source, "chat_name") and user_name:
+        event.source.chat_name = user_name
+    if hasattr(event.source, "user_name"):
+        event.source.user_name = user_name
+    event.allow_gateway_control = False
+    event.internal = True
+    _record_user(user, started=text.lstrip().lower().startswith("/start"), sample=text)
+    await _log("🤖 Chat Automation — message",
+               f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code> "
+               f"(automation)\n<b>Language:</b> {_esc(lang_label)} · "
+               f"<b>Mode:</b> {_esc(mode)}"
+               f"\n<b>Text:</b> <i>{_esc(text[:500])}</i>"
+               f"\n<b>Action:</b> handed to the brain", buttons=prof)
+    if getattr(adapter, "_message_handler", None) is None:
+        logger.warning("[TGAhermes] automation turn received but no message handler installed")
+        return
+    await adapter.handle_message(event)
+
+
+async def _on_business_connection(adapter: Any, update: Any) -> None:
+    """Record the connection + granted rights so the panel can show them."""
+    bc = getattr(update, "business_connection", None)
+    if bc is None:
+        return
+    bcid = str(getattr(bc, "id", "") or "")
+    rights = getattr(bc, "rights", None)
+    rd: Dict[str, bool] = {}
+    for f in ("can_reply", "can_read_messages", "can_delete_sent_messages",
+              "can_delete_all_messages", "can_edit_name", "can_edit_bio",
+              "can_edit_username", "can_send_payments"):
+        rd[f] = bool(getattr(rights, f, False)) if rights is not None else False
+    enabled = bool(getattr(bc, "is_enabled", False))
+    store = _biz_store()
+    if store is not None and bcid:
+        try:
+            store.record_connection({
+                "id": bcid,
+                "user": str(getattr(getattr(bc, "user", None), "id", "") or ""),
+                "user_chat_id": str(getattr(bc, "user_chat_id", "") or ""),
+                "rights": rd,
+                "is_enabled": str(enabled).lower(),
+            })
+        except Exception:
+            logger.warning("[TGAhermes] business connection record failed", exc_info=True)
+    granted = ", ".join(k for k, v in rd.items() if v) or "none"
+    await _log("🔌 Chat Automation connection",
+               f"<b>Status:</b> {'enabled' if enabled else 'disabled'}\n"
+               f"<b>Connection:</b> <code>{_esc(bcid)}</code>\n"
+               f"<b>Granted:</b> {_esc(granted)}\n"
+               "<i>Attach or edit in Telegram → Settings → Chat Automation.</i>")
+
+
+def _bizlang_view(st: Dict[str, Any], note: str = "") -> str:
+    cur = str(st.get("biz_lang") or "auto")
+    label = bizauto.language_label(cur) if bizauto else cur
+    warn = str(st.get("biz_warn_text") or "").strip()
+    lines = ["<b>🌐 Automation language</b>",
+             f"current: <b>{_esc(label)}</b> <code>({_esc(cur)})</code>"]
+    if note:
+        lines.append(note)
+    lines += ["",
+              "auto = every message's language is detected (Persian included); "
+              "a fixed language pins the warning and the replies.",
+              f"warning text: <i>{_esc(warn[:120]) if warn else 'per-language default'}</i>",
+              "",
+              "Tap a language to confirm it."]
+    return "\n".join(lines)
+
+
+def _bizconn_view(st: Dict[str, Any], note: str = "") -> str:
+    lines = ["<b>🔌 Chat Automation connection</b>"]
+    if note:
+        lines.append(note)
+    store = _biz_store()
+    conns: List[Dict[str, Any]] = []
+    if store is not None:
+        try:
+            conns = store.connections() or []
+        except Exception:
+            conns = []
+    if not conns:
+        lines += ["", "No connection recorded yet.",
+                  "Telegram → Settings → Chat Automation → connect this bot, "
+                  "then come back — the granted rights show up here."]
+    for c in conns[:6]:
+        try:
+            rd = json.loads(str(c.get("rights_json") or "{}"))
+        except Exception:
+            rd = {}
+        granted = ", ".join(k for k, v in (rd or {}).items() if v) or "none"
+        lines += [f"• <code>{_esc(str(c.get('business_connection_id') or ''))}</code> "
+                  f"{'✅ enabled' if str(c.get('is_enabled')) == 'true' else '⏸ disabled'}",
+                  f"  rights: {_esc(granted[:200])}"]
+    stats: Dict[str, int] = {}
+    if store is not None:
+        try:
+            stats = store.stats() or {}
+        except Exception:
+            stats = {}
+    if stats:
+        lines += ["", f"chats seen: <b>{_esc(str(stats.get('chats', 0)))}</b> · "
+                      f"warned: <b>{_esc(str(stats.get('warned', 0)))}</b> · "
+                      f"replies: <b>{_esc(str(stats.get('replies', 0)))}</b>"]
+    lines += ["", "Replies go out inside the 24h window after the customer's last "
+                  "message and appear as your own messages."]
+    return "\n".join(lines)
+
+
 def _install_wraps(adapter: Any) -> None:
     if getattr(adapter, "_guest_wraps_installed", False):
         return
@@ -825,6 +1273,9 @@ def _install_wraps(adapter: Any) -> None:
 
     async def send(chat_id: Any, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> "SendResult":
+        if _biz_chat_known(chat_id):
+            _ok = await _biz_send(adapter, chat_id, str(content or ""))
+            return SendResult(success=bool(_ok), message_id=None)
         if _is_guest_chat(chat_id):
             return SendResult(success=True, message_id=None)
         return await _orig_send(chat_id, content, reply_to, metadata)
@@ -846,6 +1297,10 @@ def _install_wraps(adapter: Any) -> None:
             else:
                 logger.info("[TGAhermes] empty final for guest query %s", gqid)
             return SendResult(success=True, message_id=None), adapter
+        if str(md.get("business_connection_id") or ""):
+            return await _biz_deliver(adapter, event,
+                                      str(md["business_connection_id"]),
+                                      text_content)
         result, who = await _orig_sfl(event, session_key, text_content, metadata,
                                       reply_to=reply_to,
                                       is_ephemeral_response=is_ephemeral_response)
@@ -860,6 +1315,21 @@ def _install_wraps(adapter: Any) -> None:
     adapter.send_final_ledgered = send_final_ledgered
 
     async def send_clarify(chat_id, question, choices, clarify_id, session_key, metadata=None):
+        if _biz_chat_known(chat_id):
+            try:
+                from tools.clarify_gateway import mark_awaiting_text
+                if choices:
+                    _numbered = [f"  {_i}. {_c}"
+                                 for _i, _c in enumerate(choices, start=1)]
+                    _qtext = "\n".join([f"❓ {question}", "", *_numbered, ""])
+                    mark_awaiting_text(clarify_id)
+                else:
+                    _qtext = f"❓ {question}"
+                await _biz_send(adapter, chat_id, _qtext)
+                return SendResult(success=True, message_id=None)
+            except Exception as _ce:
+                logger.warning("[TGAhermes] business clarify send failed: %s", _ce)
+                return SendResult(success=False, error=str(_ce))
         if not _is_guest_chat(chat_id):
             return await _orig_sc(chat_id, question, choices, clarify_id, session_key, metadata)
         try:
@@ -915,6 +1385,20 @@ def _install_wraps(adapter: Any) -> None:
     async def _notify_turn_error(event, e):
         md = getattr(event, "metadata", None) or {}
         gqid = md.get("guest_query_id")
+        if str(md.get("business_connection_id") or ""):
+            # A customer chat never sees a raw traceback: log it, apologise.
+            logger.error("[TGAhermes] automation turn failed: %s", e)
+            _esrc = getattr(event, "source", None)
+            _ecid = str(getattr(_esrc, "chat_id", "") or "")
+            if _ecid:
+                try:
+                    await _biz_send(adapter, _ecid,
+                                    "⚠️ Something went wrong — please try again "
+                                    "in a moment.")
+                except Exception:
+                    logger.debug("[TGAhermes] automation error notice failed",
+                                 exc_info=True)
+            return None
         if not gqid:
             result = await _orig_nte(event, e)
             st = settings()
@@ -956,6 +1440,16 @@ def _install_wraps(adapter: Any) -> None:
     adapter._notify_turn_error = _notify_turn_error
 
     async def send_typing(chat_id, metadata=None):
+        if _biz_chat_known(chat_id):
+            _bc = _BIZ_CONN.get(str(chat_id) or "")
+            if _bc:
+                try:
+                    await adapter._bot.send_chat_action(chat_id=chat_id,
+                                                        action="typing",
+                                                        business_connection_id=_bc)
+                except Exception:
+                    logger.debug("[TGAhermes] business typing failed", exc_info=True)
+            return
         if not _is_guest_chat(chat_id):
             await _orig_st(chat_id, metadata)
 
@@ -1576,6 +2070,9 @@ def _panel_text(st: Optional[Dict[str, Any]] = None, note: str = "") -> str:
         f"\U0001f4e3 mentions <b>{_b('log_group_mentions')}</b>",
         f"\U0001f4e6 updates: <b>{'on' if st.get('update_enabled', True) else 'locked'}</b> · "
         f"\U0001f3ad persona: <b>{'custom' if st.get('persona_path') else 'default'}</b>",
+        f"\U0001f4bc automation: <b>"
+        f"{_MODE_LABEL.get(str(st.get('biz_mode') or 'assistant'), 'assistant')}</b> · "
+        f"\U0001f310 lang: <b>{_esc(str(st.get('biz_lang') or 'auto'))}</b>",
     ]
     if note:
         lines.append(note)
@@ -1662,6 +2159,10 @@ _TOGGLES: Dict[str, Tuple[str, str]] = {
     "wmsgs": ("log_whitelisted_messages", "💬 whitelisted msgs"),
     "omsgs": ("log_other_messages", "🗨 other msgs"),
     "owner": ("guest_owner_full_access", "🔓 owner access in unlocked guest chats"),
+    "bizmode": ("biz_mode", "\U0001f916 automation mode"),
+    "bizwarn": ("biz_warn_first", "\u26a0\ufe0f first-contact warning"),
+    "bizreact": ("biz_react", "\U0001f47e automation reply reaction"),
+    "bizlarp": ("biz_larp", "\U0001f3ad LARP voice"),
 }
 
 
@@ -1671,6 +2172,11 @@ def _tg_next(sub: str, st: Dict[str, Any]) -> Any:
         order = ["strict", "balanced", "open"]
         cur = str(st.get("guest_tool_mode") or "balanced")
         return order[(order.index(cur) + 1) % len(order)] if cur in order else "balanced"
+    if sub == "bizmode":
+        cur_b = str(st.get("biz_mode") or "assistant")
+        order_b = list(_BIZ_MODE_ORDER)
+        return (order_b[(order_b.index(cur_b) + 1) % len(order_b)]
+                if cur_b in order_b else "assistant")
     ent = _TOGGLES.get(sub)
     if not ent:
         return None
@@ -1684,6 +2190,15 @@ def _tg_view(sub: str, origin: str, st: Dict[str, Any]) -> str:
         nxt = str(_tg_next("mode", st))
         return ("<b>🛡 Guest tool mode</b>\n"
                 f"now: <b>{_MODE_LABEL.get(cur, cur)}</b> → <b>{_MODE_LABEL.get(nxt, nxt)}</b>\n\n"
+                "Tap ✅ Apply to change, ✖ Cancel to go back.")
+    if sub == "bizmode":
+        cur_b = str(st.get("biz_mode") or "assistant")
+        nxt_b = _tg_next("bizmode", st)
+        return (f"<b>\U0001f916 Automation mode</b>\n"
+                f"now: <b>{_MODE_LABEL.get(cur_b, cur_b)}</b> → "
+                f"<b>{_MODE_LABEL.get(nxt_b, nxt_b)}</b>\n\n"
+                "assistant: ATRA answers as itself · mimic: writes in your voice · "
+                "off: stay silent\n\n"
                 "Tap ✅ Apply to change, ✖ Cancel to go back.")
     ent = _TOGGLES.get(sub)
     if not ent:
@@ -1702,6 +2217,18 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
     It states the CURRENT value and the NEXT one, plus the consequence, so a tap
     is never a guess. It changes NOTHING — the Apply callback is the only writer.
     """
+    if kind == "bizlang":
+        cur = str(st.get("biz_lang") or "auto")
+        nxt = (arg or "auto").strip() or "auto"
+        cur_l = bizauto.language_label(cur) if bizauto else cur
+        nxt_l = bizauto.language_label(nxt) if bizauto else nxt
+        warn = str(st.get("biz_warn_text") or "").strip()
+        return (f"<b>\U0001f310 Automation language</b>\n"
+                f"now: <b>{_esc(cur_l)}</b> → <b>{_esc(nxt_l)}</b>\n\n"
+                "The first-contact warning and every automation reply go out in "
+                "this language. <b>auto</b> detects per message (Persian included)."
+                f"\n\nwarning: <i>{_esc(warn[:80]) if warn else 'per-language default'}</i>"
+                "\n\nTap ✅ Apply to change, ✖ Cancel to go back.")
     if kind == "tg":                      # a settings flag / guest mode cycle
         sub, _, _origin = (arg or "").partition(":")
         if sub == "mode":
@@ -1862,6 +2389,30 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
 #   list  -> count + an edit button
 #   cmd   -> a plain button with no value line
 _CATS: Dict[str, List[Dict[str, Any]]] = {
+    "biz": [
+        {"kind": "enum", "key": "biz_mode", "sub": "bizmode",
+         "label": "Automation mode"},
+        {"kind": "bool", "key": "biz_warn_first", "sub": "bizwarn",
+         "label": "First-contact warning"},
+        {"kind": "cmd", "key": "biz_lang", "cb": "panel:bizlang",
+         "label": "\U0001f310 Language"},
+        {"kind": "text", "key": "biz_warn_text", "flow": "bizwarntext",
+         "label": "\u2709\ufe0f Warning text"},
+        {"kind": "bool", "key": "biz_react", "sub": "bizreact",
+         "label": "\U0001f47e React to replies"},
+        {"kind": "text", "key": "biz_react_emoji", "flow": "bizemoji",
+         "label": "\U0001f3a8 Reaction emoji"},
+        {"kind": "bool", "key": "biz_larp", "sub": "bizlarp",
+         "label": "\U0001f3ad LARP the owner's voice"},
+        {"kind": "text", "key": "biz_persona_path", "flow": "bizpersona",
+         "label": "\U0001f3ad Mimic persona file"},
+        {"kind": "list", "key": "biz_scope", "cb": "panel:wiz:bizscope",
+         "label": "\U0001f3af Scope (all chats when empty)"},
+        {"kind": "list", "key": "biz_deny_tools", "cb": "panel:wiz:bizdeny",
+         "label": "\U0001f512 Locked tools"},
+        {"kind": "cmd", "cb": "panel:bizconn",
+         "label": "\U0001f50c Connection status"},
+    ],
     "log": [
         {"kind": "chan", "key": "log_channel", "label": "Log channel"},
         {"kind": "bool", "key": "log_owner_messages", "sub": "mirror",
@@ -1967,7 +2518,7 @@ _CATS: Dict[str, List[Dict[str, Any]]] = {
 
 _CAT_LABEL = {"log": "📡 Logging", "guests": "👾 Guests", "react": "🔁 Reactions",
               "tool": "🤖 Tool & gate", "access": "🛡 Access", "system": "🔧 System",
-              "settings": "⚙️ All flags"}
+              "settings": "⚙️ All flags", "biz": "💼 Chat Automation",}
 
 # One line under each title, so a category page says what it is for before it
 # lists values. `system` doubles as the version readout the panel used to show.
@@ -1979,6 +2530,7 @@ _CAT_BLURB = {
     "access": "Who talks to the real brain, and at which tool level.",
     "system": "",
     "settings": "Every flag in one column, for a fast scan before you leave.",
+    "biz": "Answer customer chats on your connected account: assistant / mimic / off, first-contact warning, locked tools. Replies follow each message's language.",
 }
 
 
@@ -2180,6 +2732,12 @@ def _view_body(view: str, st: Dict[str, Any], note: str = "",
         _o, _, _kp = (arg or "").partition(":")
         _k, _, _p = _kp.partition(":")
         return _with(_cfm_view(_k, _p, st))
+    if view == "biz":
+        return _cat_body("biz", st, note)
+    if view == "bizlang":
+        return _bizlang_view(st, note)
+    if view == "bizconn":
+        return _bizconn_view(st, note)
     if view in ("full", "bot", "who", "status", "sessions", "log", "guests",
                 "access", "system"):
         # help pages a Back pop can land on — render the real section, never
@@ -2211,9 +2769,24 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         _pairs = _cat_buttons(view, st, chat_id)
         for _ci in range(0, len(_pairs), 2):
             add(*_pairs[_ci:_ci + 2])
+    elif view == "bizlang":
+        _langs = bizauto.available_languages() if bizauto else ["auto", "en"]
+        _cur = str(st.get("biz_lang") or "auto")
+        for _ci in range(0, len(_langs), 2):
+            _pr = []
+            for _l in _langs[_ci:_ci + 2]:
+                _lbl = (("✅ " if _l == _cur else "") +
+                        (bizauto.language_label(_l) if bizauto else _l))
+                _pr.append((_lbl, f"panel:bizlang:{_l}"))
+            add(*_pr)
+        add(("✉️ Custom warning text", "panel:wiz:bizwarntext"),
+            ("🔌 Connection status", "panel:bizconn"))
+    elif view == "bizconn":
+        add(("↩ Back to Chat Automation", "panel:view:biz"))
     elif view == "panel":
         # Home: a status board plus the six categories, everything one tap away.
         add(("📡 Log", "help:log"), ("👾 Guests", "help:guests"))
+        add(("💼 Chat Automation", "help:biz"), ("🌐 Language", "panel:bizlang"))
         add(("🔁 Reactions", "help:react"), ("🤖 Tool", "help:tool"))
         add(("🛡 Access", "help:access"), ("🔧 System", "help:system"))
         add(("⚙️ Settings", "panel:settings"), ("🛡 Whitelist", "panel:wl"))
@@ -2333,7 +2906,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
     return rows
 
 
-_MODE_LABEL = {"strict": "🔒 strict", "balanced": "⚖️ balanced", "open": "🔓 open"}
+_MODE_LABEL = {"strict": "🔒 strict", "balanced": "⚖️ balanced", "open": "🔓 open", "assistant": "🤖 assistant", "mimic": "🎭 mimic", "off": "⏸ off",}
 
 _VIEW_LABEL = {"full": "📜 Full help", "panel": "🧩 Console", "out": "📋 Output",
                "status": "ℹ️ Status", "log": "📡 Log", "access": "🛡 Access",
@@ -2342,13 +2915,14 @@ _VIEW_LABEL = {"full": "📜 Full help", "panel": "🧩 Console", "out": "📋 O
                "cool": "⏱ Cooldown", "system": "🔧 System", "safeguard": "🛡 Safeguards",
                "actions": "⚡ Actions", "gsess": "🔐 Guest sessions", "wiz": "📝 Wizard",
                "settings": "⚙️ Settings", "wl": "🛡 Whitelist", "wlfr": "👤 Friend",
-               "wlrm": "🗑 Remove", "tg": "✅ Confirm", "cfm": "✅ Confirm"}
+               "wlrm": "🗑 Remove", "tg": "✅ Confirm", "cfm": "✅ Confirm", "biz": "💼 Chat Automation", "bizlang": "🌐 Language", "bizconn": "🔌 Connection",}
 
 # One confirm vocabulary: every mutating button first renders
 # `panel:cfm:<kind>:...` (read-only, states now → next), and only the Apply
 # button writes — `panel:tgy` for settings flags, `panel:upd` for updates,
 # `panel:cfmok` for the rest. Nothing else in the panel writes a setting.
-_CFM_KINDS = {"tg", "gs", "log", "upd", "sup", "cool", "wl", "gate"}
+_CFM_KINDS = {"tg", "gs", "log", "upd", "sup", "cool", "wl", "gate",
+              "bizlang"}
 
 # v4.0.0 — Back returns to the page you came from, not always to the console.
 # A per-panel-message history: navigate truncates/appends, `panel:back` pops.
@@ -2840,6 +3414,48 @@ async def _run_bang_command(adapter: Any, event: Any, text: str,
 _WIZARD: Dict[str, Dict[str, Any]] = {}
 
 _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
+    "bizwarntext": {
+        "prompts": ["\u2709\ufe0f <b>Automation - warning text</b>\n\nSend the exact "
+                    "first-contact message, or <code>default</code> to fall back to the "
+                    "per-language one.\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"biz_warn_text": (
+            "" if d[0].strip().lower() in ("default", "reset", "auto")
+            else d[0].strip()[:600])},
+        "validate": lambda d: "" if d[0].strip() else "send the text, or 'default'",
+        "done": "automation warning text updated."},
+    "bizemoji": {
+        "prompts": ["\U0001f47e <b>Automation - reply reaction</b>\n\nSend the emoji "
+                    "ATRA drops on the reply that speaks for you.\n"
+                    "<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"biz_react_emoji": d[0].strip()[:32] or "\U0001f47e"},
+        "validate": lambda d: "" if d[0].strip() else "send an emoji",
+        "done": "automation reaction updated."},
+    "bizpersona": {
+        "prompts": ["\U0001f3ad <b>Automation - mimic persona</b>\n\nSend the path of "
+                    "the markdown file that describes how you write, or "
+                    "<code>default</code> for the built-in mimic prompt.\n"
+                    "<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"biz_persona_path": (
+            "" if d[0].strip().lower() in ("default", "reset", "auto")
+            else d[0].strip()[:400])},
+        "validate": lambda d: "" if d[0].strip() else "send a path, or 'default'",
+        "done": "mimic persona updated - used on the next automation turn."},
+    "bizscope": {
+        "prompts": ["\U0001f3af <b>Automation - scope</b>\n\nSend a chat id to include "
+                    "(repeat per id), <code>all</code> to answer every business chat, or "
+                    "<code>-&lt;id&gt;</code> to drop one."
+                    "\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"biz_scope": _biz_list_patch("biz_scope", d[0])},
+        "validate": lambda d: "" if d[0].strip() else "send an id, 'all', or '-id'",
+        "done": "automation scope updated."},
+    "bizdeny": {
+        "prompts": ["\U0001f512 <b>Automation - locked tools</b>\n\nSend a tool name "
+                    "to lock it in automation chats, <code>all</code> to reset, or "
+                    "<code>-&lt;name&gt;</code> to unlock."
+                    "\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"biz_deny_tools": _biz_list_patch("biz_deny_tools", d[0])},
+        "validate": lambda d: "" if d[0].strip() else "send a tool name, 'all', or '-name'",
+        "done": "automation tool lock updated."},
     "wladd": {
         "prompts": ["🛡 <b>Add to whitelist</b>\n\nSend the user id (or @username).\n"
                     "<i>Type cancel to abort.</i>"],
@@ -3074,6 +3690,7 @@ def _maybe_rewire() -> None:
 
 
 async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **_) -> Optional[dict]:
+    _bump_owner_seen(event)  # Chat Automation: owner presence for warn-first
     """Observe + console: bang commands (skip), owner reactions, group mentions, owner mirror."""
     chat_for_error: Any = None
     try:
@@ -3270,6 +3887,16 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                 body = _cfm_view("tg", f"{sub}:settings", st)
             elif action == "settings":
                 view, body = "settings", _settings_view(st)
+            elif action == "bizlang":
+                # Language picker: a tap opens the read-only confirm screen;
+                # panel:cfmok:bizlang is the only writer.
+                if sub:
+                    view, arg = "cfm", f"biz:bizlang:{sub}"
+                    body = _cfm_view("bizlang", sub, st)
+                else:
+                    view, body = "bizlang", _bizlang_view(st, note)
+            elif action == "bizconn":
+                view, body = "bizconn", _bizconn_view(st, note)
             elif action == "wl":
                 view, body = "wl", _wl_view(st)
             elif action == "wlfr" and sub:
@@ -3370,6 +3997,15 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                         note = f"🛡 guest mode → <b>{_MODE_LABEL.get(nxt, nxt)}</b>"
                         await _log("🛡 Guest tool mode",
                                    f"Mode set to <b>{nxt}</b> (owner {_esc(str(_owner_id()))})")
+                    elif _ts == "bizmode":
+                        nxt = _tg_next("bizmode", st)
+                        save_settings({"biz_mode": nxt})
+                        st = settings()
+                        note = (f"\U0001f916 automation mode → "
+                                f"<b>{_MODE_LABEL.get(nxt, nxt)}</b>")
+                        await _log("\U0001f916 Chat Automation",
+                                   f"Mode → <b>{nxt}</b> "
+                                   f"(owner {_esc(str(_owner_id()))})")
                     elif _ts in _TOGGLES:
                         key, label = _TOGGLES[_ts]
                         on = bool(_tg_next(_ts, st))
@@ -3384,6 +4020,16 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                         note = "❌ unknown setting."
                         view = "settings"
                     view, body = view, _view_body(view, st, note, arg=f"{_ts}:{view}")
+                elif _kind == "bizlang":
+                    _lang = (_pay or "auto").strip() or "auto"
+                    save_settings({"biz_lang": _lang})
+                    st = settings()
+                    _lbl = bizauto.language_label(_lang) if bizauto else _lang
+                    note = f"\U0001f310 language → <b>{_esc(_lbl)}</b>"
+                    view, body = "bizlang", _bizlang_view(st, note)
+                    await _log("\U0001f310 Chat Automation",
+                               f"Language → <b>{_esc(_lang)}</b> "
+                               f"(owner {_esc(str(_owner_id()))})")
                 elif _kind == "gs":
                     _guid, _, _gact = _pay.partition(":")
                     gstate = {"open": "open", "lock": "locked",
@@ -3626,6 +4272,10 @@ async def _on_callback(update: Any, context: Any = None) -> None:
 async def _on_private_text(adapter: Any, update: Any, context: Any = None) -> None:
     msg = getattr(update, "effective_message", None) or getattr(update, "message", None)
     if msg is None:
+        return
+    # Chat Automation owns business updates: never log them as Stranger DMs.
+    if (getattr(update, "business_message", None) is not None
+            or getattr(update, "edited_business_message", None) is not None):
         return
     user = msg.from_user
     uid = str(getattr(user, "id", "") or "")
@@ -3976,6 +4626,21 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
     _maybe_rewire()
     name = str(tool_name or "")
     if name in GUEST_SAFE_TOOLS:
+        return None
+    # Chat Automation: business chats run the read-only sandbox, no owner path.
+    _brow = _session_row(session_id)
+    _bchat = None
+    if _brow and _brow[0] == "telegram":
+        _bchat = _brow[1]
+    elif session_id:
+        _bchat = str(session_id).split(":", 1)[-1]
+    if _bchat and _biz_chat_known(_bchat):
+        if name in _biz_denied(settings()) or _tripwire_danger(name, args):
+            _cnt = _bump_block(session_id)
+            logger.warning("[TGAhermes] automation tool refused: %s (block#%d)",
+                           name, _cnt)
+            return {"action": "block",
+                    "message": _biz_refusal(name, repeats=max(0, _cnt - 1))}
         return None
     info = _guest_session_info(session_id)
     if info is None:
@@ -4382,6 +5047,32 @@ def _make_factory():
                 # MUST be first: guest updates also match filters.TEXT.
                 native.add_handler(MessageHandler(gfilter, _guest))
 
+            # Chat Automation: business updates also match filters.TEXT &
+            # filters.ChatType.PRIVATE, so register them BEFORE the private
+            # handler - PTB dispatch is first-match in registration order.
+            if getattr(filters.UpdateType, "BUSINESS_MESSAGE", None) is not None:
+                async def _bizmsg(update, context):
+                    await _handle_business_message(adapter, update, context)
+                native.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE,
+                                                  _bizmsg))
+
+                async def _bizmsg_edit(update, context):
+                    await _handle_business_message(adapter, update, context,
+                                                   edited=True)
+                native.add_handler(MessageHandler(
+                    filters.UpdateType.EDITED_BUSINESS_MESSAGE, _bizmsg_edit))
+            else:
+                logger.warning("[%s] PTB lacks BUSINESS_MESSAGE - Chat Automation "
+                               "inactive", __name__)
+            try:
+                from telegram.ext import BusinessConnectionHandler
+
+                async def _bizconn_h(update, context):
+                    await _on_business_connection(adapter, update)
+                native.add_handler(BusinessConnectionHandler(_bizconn_h))
+            except Exception:
+                logger.warning("[%s] business connection handler unavailable",
+                               __name__, exc_info=True)
             async def _private(update, context):
                 await _on_private_text(adapter, update, context)
             native.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, _private))

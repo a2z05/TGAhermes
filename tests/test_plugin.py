@@ -613,7 +613,7 @@ print("\n[8] manifest + config")
 from pathlib import Path as P
 from hermes_cli.plugins_manifest import parse_manifest_file
 mf = parse_manifest_file(HERE / "plugin.yaml", HERE, "user", "")
-check(mf is not None and mf.name == "TGAhermes" and mf.version == "4.0.0", "manifest parses v4.0.0")
+check(mf is not None and mf.name == "TGAhermes" and mf.version == "4.1.0", "manifest parses v4.1.0")
 check(mf is not None and "telegram_admin" in (mf.provides_tools or []), "provides_tools declared")
 check(mf is not None and "pre_gateway_dispatch" in (mf.provides_hooks or []), "provides_hooks declared")
 
@@ -1797,7 +1797,7 @@ print("\n[23] v3: TGAhermes rename, !setlog here, Actions, wizard, update lock")
 # --- the rename landed where it matters
 _mf = (HERE / "plugin.yaml").read_text(encoding="utf-8")
 check("name: TGAhermes" in _mf, "manifest name is TGAhermes")
-check("version: 4.0.0" in _mf, "manifest version is 4.0.0")
+check("version: 4.1.0" in _mf, "manifest version is 4.1.0")
 check("telegram-guest-mode" not in Path(mod.__file__).read_text(encoding="utf-8"),
       "no old plugin name left in the module source")
 
@@ -2124,6 +2124,116 @@ check("ghp_" not in mod._cat_body("system", mod.settings()),
       "System category body carries no token")
 check("ghp_" not in mod._panel_text(mod.settings()),
       "home board carries no token")
+
+
+print("\n[27] Chat Automation: wiring, category, gating")
+import types as _t27types
+import inspect as _t27inspect
+
+check(mod.bizauto is not None, "bizauto language module loads with the plugin")
+check("biz" in mod._CATS, "Chat Automation category registered")
+check(mod._tg_next("bizmode", {"biz_mode": "assistant"}) == "mimic",
+      "automation mode cycles assistant -> mimic")
+check(mod._tg_next("bizmode", {"biz_mode": "off"}) == "assistant",
+      "automation mode cycles off -> assistant")
+check("bizlang" in mod._CFM_KINDS, "bizlang confirm kind registered")
+check("Automation language" in mod._cfm_view("bizlang", "fa", mod.settings()),
+      "language confirm screen renders")
+check("Automation mode" in mod._tg_view("bizmode", "biz", mod.settings()),
+      "mode confirm screen renders")
+check(set(mod.GUEST_NEVER_TOOLS) <= set(mod._biz_denied(mod.settings())),
+      "never-tools stay locked in automation chats")
+check("BUSINESS_MESSAGE" in _t27inspect.getsource(mod),
+      "factory registers business-message handlers")
+check("Stranger DM" not in (mod._help_text(mod.settings()) or ""),
+      "no stranger-log leakage in help")
+
+
+async def _t27():
+    _orig = dict(mod.settings())
+    _orig_log = mod._log
+    _titles = []
+
+    async def _slog(title, body="", buttons=None):
+        _titles.append(str(title))
+
+    class _Bot:
+        sent = []
+
+        async def send_message(self, **kw):
+            _Bot.sent.append(kw)
+            return _t27types.SimpleNamespace(message_id=900001)
+
+    class _Stub:
+        def __init__(self):
+            self._bot = _Bot()
+            self._message_handler = object()
+            self.handles = 0
+            self.events = []
+
+        def _clean_bot_trigger_text(self, t, *a, **k):
+            return t or ""
+
+        def _build_message_event(self, msg, mtype, update_id=None):
+            ev = _t27types.SimpleNamespace(
+                text=msg.text, metadata={},
+                source=_t27types.SimpleNamespace(
+                    chat_id=msg.chat.id, message_id=msg.message_id,
+                    user_id=msg.from_user.id),
+                internal=False, channel_prompt="")
+            self.events.append(ev)
+            return ev
+
+        async def handle_message(self, event):
+            self.handles += 1
+
+    def _mk_update():
+        return _t27types.SimpleNamespace(
+            update_id=1001,
+            business_message=_t27types.SimpleNamespace(
+                message_id=501,
+                business_connection_id="bc_test",
+                text="hello from a customer",
+                caption=None, date=None,
+                from_user=_t27types.SimpleNamespace(
+                    id=770011, is_bot=False, first_name="Cust",
+                    last_name="", username="custx"),
+                chat=_t27types.SimpleNamespace(
+                    id=770011, type="private", first_name="Cust")),
+            edited_business_message=None,
+            message=None)
+
+    mod._log = _slog
+    stub = _Stub()
+    try:
+        # mode off: observed + logged under its own title, never handed to the brain
+        mod.save_settings({"biz_mode": "off", "biz_warn_first": False})
+        await mod._handle_business_message(stub, _mk_update(), None)
+        check(stub.handles == 0, "mode off: customer message never reaches the brain")
+        check(any("Chat Automation" in str(x) for x in _titles),
+              f"mode off: logged under its own title ({len(_titles)} title(s))")
+        check(not any("Stranger" in str(x) for x in _titles),
+              "mode off: automation traffic never uses the Stranger-DM log")
+
+        # mode assistant: event wired with the business connection id
+        _titles.clear()
+        mod.save_settings({"biz_mode": "assistant", "biz_warn_first": False,
+                           "biz_react": False})
+        await mod._handle_business_message(stub, _mk_update(), None)
+        check(stub.handles == 1, "assistant: exactly one brain turn")
+        _ev = stub.events[0]
+        check(_ev.metadata.get("business_connection_id") == "bc_test",
+              "assistant: event metadata carries the business_connection_id")
+        check(getattr(_ev, "internal", False) is True,
+              "assistant: automation event marked internal")
+        check(bool(getattr(_ev, "channel_prompt", "")),
+              "assistant: persona + identity prompt attached")
+    finally:
+        mod._log = _orig_log
+        mod.save_settings(_orig)
+
+
+asyncio.run(_t27())
 
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

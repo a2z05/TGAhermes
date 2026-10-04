@@ -36,7 +36,7 @@ PY=$(find_python)
 
 # Only these files are copied. settings.json, state.json and anything learned
 # at runtime are never touched: an update must not reset the owner's config.
-FILES=(__init__.py selfupdate.py plugin.yaml README.md AGENT.md settings.example.json)
+FILES=(__init__.py bizauto.py selfupdate.py plugin.yaml README.md AGENT.md settings.example.json)
 DIRS=(tests scripts assets)
 
 # Never copy the identity file that holds the owner's real ids: it stays
