@@ -4626,17 +4626,60 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# _WIZARD lives only in RAM, so a hot reload dropped a flow the owner was halfway
+# through answering — the next typed value then fell through to the agent as plain
+# text. Persist the open steps beside settings.json (tests redirect SETTINGS_PATH)
+# and restore on import, so a deploy that reloads this module eats nothing.
+_WIZARD_TTL_S = 1800  # an unanswered step older than this is abandoned
+
+
+def _wizard_path() -> Path:
+    return SETTINGS_PATH.with_name("wizard.json")
+
+
+def _wizard_persist() -> None:
+    """Snapshot open wizard steps; a save failure must never break the flow."""
+    try:
+        tmp = _wizard_path().with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"ts": time.time(), "open": _WIZARD},
+                                  ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, _wizard_path())
+    except Exception:
+        logger.debug("[TGAhermes] wizard persist failed", exc_info=True)
+
+
+def _wizard_restore() -> None:
+    """Reopen the steps a reload would otherwise have dropped; a stale step expires."""
+    try:
+        rec = json.loads(_wizard_path().read_text(encoding="utf-8"))
+        if time.time() - float(rec.get("ts") or 0) > _WIZARD_TTL_S:
+            return
+        for chat, w in (rec.get("open") or {}).items():
+            if isinstance(w, dict) and str(w.get("flow") or "") in _WIZ_FLOWS:
+                _WIZARD[str(chat)] = {"flow": str(w["flow"]),
+                                       "data": [str(x) for x in (w.get("data") or [])]}
+    except FileNotFoundError:
+        return
+    except Exception:
+        logger.debug("[TGAhermes] wizard restore failed", exc_info=True)
+
+
+_wizard_restore()
+
+
 def _wizard_start(chat_id: Any, flow: str) -> Optional[str]:
     """Open a wizard in this chat; returns the first prompt, or None."""
     f = _WIZ_FLOWS.get(flow)
     if not f:
         return None
     _WIZARD[str(chat_id)] = {"flow": flow, "data": []}
+    _wizard_persist()
     return f["prompts"][0]
 
 
 def _wizard_cancel(chat_id: Any) -> None:
     _WIZARD.pop(str(chat_id), None)
+    _wizard_persist()
 
 
 async def _wizard_feed(adapter: Any, chat_id: Any, text: str,
@@ -4654,11 +4697,14 @@ async def _wizard_feed(adapter: Any, chat_id: Any, text: str,
     f = _WIZ_FLOWS.get(str(w.get("flow") or ""))
     if not f:
         _WIZARD.pop(key, None)
+        _wizard_persist()
         return None
     if text.strip().lower() in ("cancel", "/cancel", "!cancel", "stop"):
         _WIZARD.pop(key, None)
+        _wizard_persist()
         return "✖ cancelled."
     w["data"].append(text.strip()[:4000])
+    _wizard_persist()
     if len(w["data"]) < len(f["prompts"]):
         return f["prompts"][len(w["data"])]
     # A flow either builds a command string (so the panel button and its
@@ -4669,8 +4715,10 @@ async def _wizard_feed(adapter: Any, chat_id: Any, text: str,
         err = f["validate"](w["data"])
         if err:
             w["data"].pop()
+            _wizard_persist()  # the rejected answer must not survive on disk
             return f"⚠️ {_esc(str(err))}\n\n{f['prompts'][len(w['data'])]}"
     _WIZARD.pop(key, None)
+    _wizard_persist()
     try:
         if f.get("save") is not None:
             save_settings(f["save"](w["data"]))
@@ -4837,6 +4885,7 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
         setlog_here = in_group and text.lower().startswith("!setlog")
         if text.startswith("!") and owner and uid == owner and (in_log or in_owner_dm or setlog_here):
             _WIZARD.pop(chat, None)  # a real command abandons any open wizard step
+            _wizard_persist()
             await _run_bang_command(ad, event, text, session_store=session_store)
             return {"action": "skip", "reason": "TGAhermes bang command"}
 

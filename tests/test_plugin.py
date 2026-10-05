@@ -1870,6 +1870,20 @@ async def t24():
     out3 = await mod._wizard_feed(None, "-100555", "hello world")
     check(out3 is not None and not mod._WIZARD, "flow completes and clears")
 
+    # a hot reload re-imports this module: the open step must survive it
+    mod._wizard_start("-100555", "send")
+    await mod._wizard_feed(None, "-100555", "123")
+    mod._WIZARD.clear()                 # what a reload does to the module globals
+    mod._wizard_restore()
+    check(mod._WIZARD.get("-100555", {}).get("flow") == "send",
+          "an open wizard step survives a hot reload")
+    check(mod._WIZARD.get("-100555", {}).get("data") == ["123"],
+          "the typed answer survives with it")
+    mod._wizard_cancel("-100555")
+    mod._WIZARD.clear()
+    mod._wizard_restore()
+    check(not mod._WIZARD, "a cancelled step does not come back")
+
     # the panel keyboard actually offers the flows
     d_act = [b.callback_data for row in mod._help_keyboard("actions") for b in row]
     check(any(x.endswith("panel:sethere") for x in d_act),
