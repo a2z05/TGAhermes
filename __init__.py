@@ -990,7 +990,10 @@ def _biz_list_patch(key: str, raw: str) -> list:
 
 async def _biz_send(adapter: Any, chat_id: Any, text: str) -> bool:
     """Best-effort text delivery over the business connection."""
-    bcid = _BIZ_CONN.get(str(chat_id) or "")
+    # Fall back to the recorded connection: this may be a wrap from a previous
+    # module load whose _BIZ_CONN froze at reload, and incoming messages do not
+    # always carry the id either way.
+    bcid = _BIZ_CONN.get(str(chat_id) or "") or _active_bcid()
     if not bcid or not text:
         return False
     try:
@@ -1301,8 +1304,34 @@ def _bizconn_view(st: Dict[str, Any], note: str = "") -> str:
 
 
 def _install_wraps(adapter: Any) -> None:
-    if getattr(adapter, "_guest_wraps_installed", False):
-        return
+    # Re-run on EVERY factory load (no early return): these closures must
+    # belong to the CURRENT module instance. A wrap left over from an older
+    # load still calls that load's _biz_send/_BIZ_CONN - state nobody fills
+    # anymore - so _biz_send returns False and the gateway's plain-text
+    # fallback sends the reply as the bot (bot DM, or 403 for strangers).
+    # Originals are unwrapped from the previous install's closure, so
+    # re-installing rebinds instead of stacking wraps.
+    import inspect as _inspect
+
+    def _true(fn: Any, *names: str) -> Any:
+        for _ in range(8):
+            if fn is None or not callable(fn):
+                return fn
+            try:
+                nl = _inspect.getclosurevars(fn).nonlocals
+            except Exception:
+                return fn
+            nxt = None
+            for nm in names:
+                v = nl.get(nm)
+                if callable(v):
+                    nxt = v
+                    break
+            if nxt is None:
+                return fn
+            fn = nxt
+        return fn
+
     adapter._guest_wraps_installed = True
     from gateway.platforms.base import SendResult
 
@@ -1315,7 +1344,7 @@ def _install_wraps(adapter: Any) -> None:
             return SendResult(success=True, message_id=None)
         return await _orig_send(chat_id, content, reply_to, metadata)
 
-    _orig_send = adapter.send
+    _orig_send = _true(adapter.send, "_orig_send")
     adapter.send = send
 
     async def send_final_ledgered(event, session_key, text_content, metadata, *, reply_to,
@@ -1346,7 +1375,7 @@ def _install_wraps(adapter: Any) -> None:
                 _spawn(_react(src.chat_id, src.message_id, st.get("react_emoji_done") or "✅"))
         return result, who
 
-    _orig_sfl = adapter.send_final_ledgered
+    _orig_sfl = _true(adapter.send_final_ledgered, "_orig_sfl")
     adapter.send_final_ledgered = send_final_ledgered
 
     async def send_clarify(chat_id, question, choices, clarify_id, session_key, metadata=None):
@@ -1393,7 +1422,7 @@ def _install_wraps(adapter: Any) -> None:
             logger.warning("[TGAhermes] guest clarify failed: %s", e)
             return SendResult(success=False, error=str(e))
 
-    _orig_sc = adapter.send_clarify
+    _orig_sc = _true(adapter.send_clarify, "_orig_sc")
     adapter.send_clarify = send_clarify
 
     async def _send_prompt(what, chat_id, metadata, build, *, parse_mode=None,
@@ -1414,7 +1443,7 @@ def _install_wraps(adapter: Any) -> None:
             logger.warning("[TGAhermes] guest prompt %s failed: %s", what, e)
             return SendResult(success=False, error=str(e))
 
-    _orig_sp = adapter._send_prompt
+    _orig_sp = _true(adapter._send_prompt, "_orig_sp")
     adapter._send_prompt = _send_prompt
 
     async def _notify_turn_error(event, e):
@@ -1471,7 +1500,7 @@ def _install_wraps(adapter: Any) -> None:
                           st.get("react_emoji_error") or "❌"))
         return None
 
-    _orig_nte = adapter._notify_turn_error
+    _orig_nte = _true(adapter._notify_turn_error, "_orig_nte")
     adapter._notify_turn_error = _notify_turn_error
 
     async def send_typing(chat_id, metadata=None):
@@ -1488,12 +1517,12 @@ def _install_wraps(adapter: Any) -> None:
         if not _is_guest_chat(chat_id):
             await _orig_st(chat_id, metadata)
 
-    _orig_st = adapter.send_typing
+    _orig_st = _true(adapter.send_typing, "_orig_st")
     adapter.send_typing = send_typing
 
     # Media: guests get URL media as inline results (or a text fallback); others pass through.
     def _wrap_media(mname: str, kind: str, url_pos: int = 1, name_pos: Optional[int] = None):
-        orig = getattr(adapter, mname, None)
+        orig = _true(getattr(adapter, mname, None), "orig")
         if orig is None:
             return
 
