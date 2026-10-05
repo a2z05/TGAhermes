@@ -195,6 +195,7 @@ Everything that can be done, I do, and I finish it.
 """
 _lock = threading.Lock()
 _ADAPTER: Dict[str, Any] = {"adapter": None}  # live adapter, set by the PTB factory
+_NATIVE: Any = None  # live PTB application, set by the PTB factory (sweep target)
 # Fresh object per module instance: when a hot reload swaps this module, the
 # first hook run sees its sentinel differ from the one stored on the adapter and
 # triggers the PTB re-wire (on_plugin_loaded never fires for a RE-load, so
@@ -853,7 +854,32 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
 
 # --- Chat Automation wiring: connection map + owner presence ---------------
 _BIZ_CONN: Dict[str, str] = {}             # chat_id -> business_connection_id (live)
+_BIZ_ACTIVE_ID: str = ""                   # last attached connection id (see _on_business_connection)
 _OWNER_LAST_SEEN: Dict[str, float] = {"t": 0.0}   # monotonic ts of owner's last event
+
+
+def _active_bcid() -> str:
+    """Connection id for deliveries when the incoming message omitted it.
+
+    The business_connection update carries the id (the panel shows it), but
+    incoming business messages don't always include business_connection_id.
+    Without it the final reply falls through to the plain send path: it lands
+    in the customer's DM with the bot (or 403s if they never started it)
+    instead of appearing as the owner's message.
+    """
+    if _BIZ_ACTIVE_ID:
+        return _BIZ_ACTIVE_ID
+    store = _biz_store()
+    if store is not None:
+        try:
+            for row in reversed(store.connections() or []):
+                en = row.get("is_enabled")
+                if en in (1, "1", "true", "True", True) and row.get("business_connection_id"):
+                    return str(row["business_connection_id"])
+        except Exception:
+            logger.debug("[TGAhermes] connection lookup failed", exc_info=True)
+    return ""  # none recorded yet
+
 
 
 def _owner_idle() -> bool:
@@ -991,7 +1017,7 @@ async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -
     ok = False
     if chat_id and text_content and str(text_content).strip():
         if not bcid:
-            bcid = _BIZ_CONN.get(chat_id, "")
+            bcid = _BIZ_CONN.get(chat_id, "") or _active_bcid()
         if bcid:
             try:
                 sent = await adapter._bot.send_message(
@@ -1058,6 +1084,10 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     st = settings()
     mode = str(st.get("biz_mode") or "assistant")
     bcid = str(getattr(msg, "business_connection_id", "") or "")
+    if not bcid:
+        # Incoming business updates may omit the field; the attached
+        # connection (recorded by _on_business_connection) is the same one.
+        bcid = _active_bcid()
     chat_id = str(getattr(getattr(msg, "chat", None), "id", "") or "")
     text = str(getattr(msg, "text", "") or getattr(msg, "caption", "") or "")
     if not chat_id:
@@ -1189,6 +1219,11 @@ async def _on_business_connection(adapter: Any, update: Any) -> None:
               "can_edit_username", "can_send_payments"):
         rd[f] = bool(getattr(rights, f, False)) if rights is not None else False
     enabled = bool(getattr(bc, "is_enabled", False))
+    global _BIZ_ACTIVE_ID
+    if bcid and enabled:
+        _BIZ_ACTIVE_ID = bcid
+    elif bcid and not enabled and _BIZ_ACTIVE_ID == bcid:
+        _BIZ_ACTIVE_ID = ""
     store = _biz_store()
     if store is not None and bcid:
         try:
@@ -3685,8 +3720,22 @@ def _maybe_rewire() -> None:
     try:
         ad.rewire_plugin_handlers()
         logger.info("[TGAhermes] post-reload rewire requested")
+        # The adapter's hoist rebuilds group-0 from a snapshot taken BEFORE our
+        # factory ran, so the stale handlers the factory just dropped get
+        # re-inserted in front of ours ("ghosts" answering taps/messages with
+        # OLD code). Sweep again now that the hoist has settled.
+        _sweep_stale()
     except Exception:
         logger.debug("[TGAhermes] post-reload rewire failed", exc_info=True)
+
+
+def _sweep_stale() -> None:
+    """Drop any stale TGAhermes handlers that resurfaced after a rewire/hoist."""
+    if _NATIVE is not None:
+        try:
+            _drop_stale_handlers(_NATIVE)
+        except Exception:
+            logger.debug("[TGAhermes] sweep skipped", exc_info=True)
 
 
 async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **_) -> Optional[dict]:
@@ -3717,8 +3766,11 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
         # Hot-reload rewire trigger: see _maybe_rewire — one check on the first
         # dispatched message makes the adapter rewire, the factory's per-deploy
         # qualname key is then unknown to the wired set, so it runs, sweeps the
-        # stale handlers and re-syncs allow_from.
+        # stale handlers and re-syncs allow_from. The sweep also runs on every
+        # event (not just the first) because the hoist can resurrect ghosts
+        # after ANY factory re-run.
         _maybe_rewire()
+        _sweep_stale()
         # Push file-side allow_from into the adapter's wire-time snapshot. A CLI
         # `hermes config set` writes the file but never reaches the running
         # prefilter, so without this a freshly whitelisted user keeps bouncing
@@ -3805,6 +3857,12 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
 
         # --- mirror: owner never logged here; friends / others each toggleable ---
         if text and uid and uid != owner and not mention_logged:
+            # Chat Automation keeps business traffic out of the generic DM
+            # mirror: an automation message must never show up as a plain
+            # "Whitelisted/Stranger DM to bot" entry — it gets its own title.
+            _braw = getattr(event, "raw_message", None)
+            if getattr(_braw, "business_connection_id", None):
+                return None
             in_group = (src.chat_type or "") in ("group", "supergroup", "forum", "channel")
             is_friend = uid in _read_allow_from()
             if is_friend or in_group:   # stranger DMs = guest zone, already logged there
@@ -3832,6 +3890,10 @@ async def _on_callback(update: Any, context: Any = None) -> None:
     q = getattr(update, "callback_query", None)
     if q is None:
         return
+    # Taps must rewire too — otherwise a reload's ghost handlers keep
+    # answering panel taps with OLD code (wrong keyboard, empty sections).
+    _maybe_rewire()
+    _sweep_stale()
     data = str(q.data or "")
     owner = _owner_id()
     try:
@@ -4281,6 +4343,11 @@ async def _on_private_text(adapter: Any, update: Any, context: Any = None) -> No
     uid = str(getattr(user, "id", "") or "")
     owner = _owner_id(adapter)
     text = str(msg.text or "")
+    # Echo of the bot's own message (bot self-chat) — not a stranger DM, and a
+    # canned reply there just fails with "reply target message not found".
+    _bot_id = str(getattr(getattr(adapter, "_bot", None), "id", "") or "")
+    if _bot_id and uid == _bot_id:
+        return
     if _is_authorized_user(uid, owner):
         # Owner or whitelisted friend: hand the message back to the core handlers.
         try:
@@ -4954,7 +5021,12 @@ def _drop_stale_handlers(native: Any) -> int:
                 cb = getattr(h, "callback", None)
                 if not callable(cb):
                     continue
-                if getattr(cb, "__globals__", None) is mine:
+                # The admission layer wraps every callback with @wraps, so the live
+                # object's own __globals__ is update_admission's module, not ours.
+                # Unwrap first or the current instance's handlers look foreign and a
+                # sweep would delete the plugin out from under itself.
+                cb_root = getattr(cb, "__wrapped__", cb)
+                if getattr(cb_root, "__globals__", None) is mine:
                     continue  # registered by THIS very instance — keep it
                 mod = getattr(cb, "__module__", "") or ""
                 # ours by module name (current or pre-rename), OR ours by the
@@ -5014,6 +5086,8 @@ def _drop_stale_handlers(native: Any) -> int:
 def _make_factory():
     def factory(native: Any, adapter: Any) -> None:
         _ADAPTER["adapter"] = adapter
+        global _NATIVE
+        _NATIVE = native  # sweep target: _sweep_stale() undoes hoist ghosts
         # The adapter's config snapshot predates every config set made since it
         # first wired; push the file's current allow_from into it so a plugin
         # (re)load alone is enough for the core prefilter to agree with the file
@@ -5052,6 +5126,10 @@ def _make_factory():
             # handler - PTB dispatch is first-match in registration order.
             if getattr(filters.UpdateType, "BUSINESS_MESSAGE", None) is not None:
                 async def _bizmsg(update, context):
+                    logger.info("[TGAhermes] bizmsg fired (update_id=%s bcid=%r)",
+                                getattr(update, "update_id", "?"),
+                                getattr(getattr(update, "business_message", None),
+                                        "business_connection_id", "<no-field>"))
                     await _handle_business_message(adapter, update, context)
                 native.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE,
                                                   _bizmsg))

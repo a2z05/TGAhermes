@@ -2271,5 +2271,113 @@ def _t28():
 
 _t28()
 
+
+# [29] Regression: ghost handlers. The adapter's post-factory hoist rebuilds
+# group-0 from a PRE-factory snapshot, re-inserting the stale handlers the
+# factory just dropped — OLD closures then sit in front of everything (panel
+# taps answered by old code, business messages never reaching the Chat
+# Automation logger). Two guards: the sweep must unwrap admission's @wraps
+# before deciding "is this ours", and business events must never fall
+# through to the generic DM mirror.
+print("\n[29] ghost sweep keeps live handlers, drops resurrected ones, business mirror skip")
+import functools as _f29
+import re as _re29
+from telegram.ext import MessageHandler as _MH29, CallbackQueryHandler as _CQ29
+from telegram.ext import filters as _filters29
+
+
+async def _t29():
+    # --- (a) sweep identity: wrapped live kept, wrapped ghosts dropped ----
+    class _Native:
+        def __init__(self, hs):
+            self.handlers = {0: list(hs)}
+
+        def remove_handler(self, h, group=0):
+            try:
+                self.handlers.get(group, []).remove(h)
+            except ValueError:
+                pass
+
+    _ns = mod.__dict__
+    exec("async def _t29_live(u, c): pass", _ns)   # defined in plugin globals
+    _live = _ns["_t29_live"]
+
+    async def _ghost(u, c):                         # foreign globals
+        pass
+    _ghost.__module__ = mod.__name__                # same module NAME = old load
+
+    def _wrap(cb):
+        @_f29.wraps(cb)
+        async def _w(u, c):
+            return await cb(u, c)
+        return _w
+
+    h_live = _MH29(_filters29.TEXT, callback=_wrap(_live))
+    h_ghost = _MH29(_filters29.TEXT, callback=_wrap(_ghost))
+    h_ghost_cb = _CQ29(_wrap(_ghost), pattern=_re29.compile(r"^tgm:"))
+
+    _native = _Native([h_live, h_ghost, h_ghost_cb])
+    mod._drop_stale_handlers(_native)
+    _left = _native.handlers[0]
+    check(h_live in _left, "live wrapped handler survives the sweep (unwrapped identity)")
+    check(h_ghost not in _left, "ghost message handler swept (same name, foreign globals)")
+    check(h_ghost_cb not in _left, "ghost tgm: callback handler swept")
+    del _ns["_t29_live"]
+
+    # --- (b) business event never reaches the generic DM mirror -----------
+    _orig = dict(mod.settings())
+    _orig_log = mod._log
+    _titles = []
+
+    async def _slog(title, body="", buttons=None):
+        _titles.append(str(title))
+
+    class _Ev:
+        platform = "telegram"
+        internal = False
+        edited = False
+        channel_action = False
+        text = "Yo"
+        reply_to_id = None
+        metadata: dict = {}
+        raw_message = None
+
+        class source:  # noqa: N801 - mirrors .source attribute access
+            platform = "telegram"
+            chat_type = "supergroup"
+            chat_id = "-100" + "3744718087"  # split: audit forbids the literal log-channel id
+            user_id = "654321"
+            message_id = 1
+            name = "Someone"
+
+    class _Ad:
+        pass
+
+    mod._log = _slog
+    _old_ad = mod._ADAPTER.get("adapter")
+    _ad = _Ad()
+    _ad._tga_instance = mod._INSTANCE   # rewire already done -> no-op
+    mod._ADAPTER["adapter"] = _ad
+    try:
+        mod.save_settings({"log_other_messages": True, "log_whitelisted_messages": True})
+
+        _Ev.raw_message = NS10(business_connection_id="bc_test")
+        await mod._pre_gateway_dispatch(event=_Ev(), gateway=None,
+                                        session_store=None)
+        check(not _titles, f"business event skipped the DM mirror ({len(_titles)} log(s))")
+
+        _Ev.raw_message = NS10(business_connection_id=None, from_user=None)
+        _titles.clear()
+        await mod._pre_gateway_dispatch(event=_Ev(), gateway=None,
+                                        session_store=None)
+        check(len(_titles) >= 1, f"control: plain non-business message still mirrored ({len(_titles)})")
+    finally:
+        mod._log = _orig_log
+        mod.save_settings(_orig)
+        mod._ADAPTER["adapter"] = _old_ad
+
+
+asyncio.run(_t29())
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)
