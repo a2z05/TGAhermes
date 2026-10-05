@@ -62,8 +62,8 @@ GUEST_CHAT_PREFIX = "guest_"
 # harness imports this file by path. A missing file degrades, never crashes.
 bizauto: Any = None
 try:
-    from . import bizauto as _bizauto_mod  # type: ignore
-    bizauto = _bizauto_mod
+    import importlib as _ila
+    bizauto = _ila.import_module(".bizauto", __name__)  # type: ignore
 except Exception:
     try:
         import importlib.util as _ilu

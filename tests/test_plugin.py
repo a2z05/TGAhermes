@@ -2235,5 +2235,41 @@ async def _t27():
 
 asyncio.run(_t27())
 
+
+# [28] Regression: the gateway loads the plugin AS A PACKAGE, so the loader's
+# relative-import branch must yield a real module. Initializing the package
+# attribute before the import used to shadow the submodule (fromlist saw the
+# None attribute and skipped the import entirely) - the by-path test harness
+# could never catch that because it takes the file-path fallback.
+print("\n[28] bizauto loads in the real package context (attribute-shadowing)")
+def _t28():
+    import subprocess
+    script = (
+        "import sys, types, importlib.util\n"
+        "hermes_src, plugin_dir = sys.argv[1], sys.argv[2]\n"
+        "sys.path.insert(0, hermes_src)\n"
+        "ns = \"hermes_plugins\"\n"
+        "parent = types.ModuleType(ns); parent.__path__ = []; parent.__package__ = ns\n"
+        "sys.modules[ns] = parent\n"
+        "mn = ns + \".TGAhermes\"\n"
+        "spec = importlib.util.spec_from_file_location(mn, plugin_dir + \"/__init__.py\",\n"
+        "    submodule_search_locations=[plugin_dir])\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "mod.__package__ = mn; mod.__path__ = [plugin_dir]\n"
+        "sys.modules[mn] = mod\n"
+        "spec.loader.exec_module(mod)\n"
+        "ba = getattr(mod, \"bizauto\", None)\n"
+        "ok = ba is not None and callable(getattr(ba, \"detect_language\", None))\n"
+        "print(\"PKGLOAD_OK\" if ok else \"PKGLOAD_FAIL bizauto=\" + repr(ba))\n"
+    )
+    r = subprocess.run([sys.executable, "-c", script, HERMES_SRC, str(HERE)],
+                       capture_output=True, text=True, timeout=90)
+    tail = (r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout or r.stderr) else ""
+    check("PKGLOAD_OK" in r.stdout,
+          f"package-context import yields a usable bizauto ({tail[:90]})")
+
+
+_t28()
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)
