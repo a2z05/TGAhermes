@@ -5548,6 +5548,10 @@ def _chat_is_busy(adapter: Any, chat_id: str) -> bool:
 
 async def _on_busy_path_text(adapter: Any, update: Any, context: Any = None) -> None:
     """PTB text handler: run owner bang/wizard input while the chat is busy."""
+    # Same self-heal as _on_callback: this path never reaches the dispatch hook,
+    # so run the rewire check and the hoist-ghost sweep here too.
+    _maybe_rewire()
+    _sweep_stale()
     msg = getattr(update, "effective_message", None) or getattr(update, "message", None)
     if msg is None:
         return
