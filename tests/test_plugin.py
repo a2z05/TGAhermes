@@ -2567,6 +2567,31 @@ try:
     check(mod._owner_idle({"biz_owner_idle_min": 0}) is False,
           "owner idle threshold 0 means never idle")
 
+    # The idle hold is for ATRA's ENTRY into a conversation, not every message
+    # in it. Once ATRA has answered, the next message answers immediately —
+    # until the owner posts in that same chat, which arms the hold again.
+    mod._BIZ_REPLIED.clear()
+    mod._BIZ_OWNER_SEEN.clear()
+    check(mod._biz_engaged("c-delay") is False,
+          "an untouched chat still waits for the owner")
+    mod._BIZ_REPLIED["c-delay"] = time.monotonic() - 100.0
+    check(mod._biz_engaged("c-delay") is True,
+          "a chat ATRA already answered skips the wait")
+    check(mod._biz_engaged("c-other") is False,
+          "the spent grace period is per chat, not global")
+    mod._BIZ_OWNER_SEEN["c-delay"] = time.monotonic()
+    check(mod._biz_engaged("c-delay") is False,
+          "the owner posting in that chat re-arms the hold")
+    check(mod._biz_engaged("c-other") is False,
+          "the owner returning to one chat does not re-arm another")
+    mod._BIZ_REPLIED["c-other"] = time.monotonic() - 100.0
+    mod._BIZ_OWNER_SEEN["c-delay"] = time.monotonic() - 50.0
+    mod._BIZ_REPLIED["c-delay"] = time.monotonic() - 10.0
+    check(mod._biz_engaged("c-delay") is True,
+          "an answer sent after the owner's visit holds again")
+    mod._BIZ_REPLIED.clear()
+    mod._BIZ_OWNER_SEEN.clear()
+
     # bundled personas: one per mode, and the assistant one is NOT the guest
     a31 = mod._biz_persona({}, "assistant")
     m31 = mod._biz_persona({}, "mimic")

@@ -1023,6 +1023,15 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
 _BIZ_CONN: Dict[str, str] = {}             # chat_id -> business_connection_id (live)
 _BIZ_ACTIVE_ID: str = ""                   # last attached connection id (see _on_business_connection)
 _OWNER_LAST_SEEN: Dict[str, float] = {"t": 0.0}   # monotonic ts of owner's last event
+# chat_id -> monotonic ts of ATRA's last successful reply there.
+_BIZ_REPLIED: Dict[str, float] = {}
+# chat_id -> monotonic ts of the owner's own last message IN THAT chat.
+# The spent grace period is per conversation, not global: it holds until the
+# owner comes back to *that* chat, and the owner posting there arms the delay
+# again. The owner talking somewhere else must not clear it. In-memory only —
+# every value here shares the same monotonic clock and all of them are
+# meaningless across a restart, where the owner is treated as just-seen anyway.
+_BIZ_OWNER_SEEN: Dict[str, float] = {}
 
 
 def _active_bcid() -> str:
@@ -1080,16 +1089,41 @@ def _owner_idle(st: Optional[Dict[str, Any]] = None) -> bool:
 
 
 def _bump_owner_seen(event: Any) -> None:
-    """Remember the owner just spoke (called from the dispatch hook)."""
+    """Remember the owner just spoke (called from the dispatch hook).
+
+    Records both the global stamp (drives the idle window) and the per-chat
+    stamp, which is what re-arms the automation delay for that one conversation."""
     try:
         if event is None:
             return
         _src_ev = getattr(event, "source", None)
         _uid = str(getattr(_src_ev, "user_id", "") or "")
         if _uid and _uid == str(_owner_id() or "") and not getattr(event, "internal", False):
-            _OWNER_LAST_SEEN["t"] = time.monotonic()
+            _now = time.monotonic()
+            _OWNER_LAST_SEEN["t"] = _now
+            _cid = str(getattr(_src_ev, "chat_id", "") or "")
+            if _cid:
+                _BIZ_OWNER_SEEN[_cid] = _now
     except Exception:
         logger.debug("[TGAhermes] owner presence update failed", exc_info=True)
+
+
+def _biz_engaged(chat_id: Any) -> bool:
+    """True when ATRA has already spoken in this chat and the owner has not
+    come back to it since — i.e. the entry grace period for this conversation
+    is spent.
+
+    The idle delay exists once, to give a returning owner the first word. Once
+    ATRA has answered, the conversation is live and the next message in it must
+    not sit on a fresh 5-minute wait. Both stamps share one monotonic clock, and
+    the reset is deliberately scoped to *this* chat: only the owner posting here
+    arms the delay again, so the owner answering somewhere else can never hold up
+    a conversation that is already under way."""
+    _cid = str(chat_id or "")
+    _at = _BIZ_REPLIED.get(_cid)
+    if not _at:
+        return False
+    return _at > (_BIZ_OWNER_SEEN.get(_cid) or 0.0)
 
 
 # ---------------------------------------------------------------- chat automation (bizauto)
@@ -1400,6 +1434,7 @@ async def _biz_send(adapter: Any, chat_id: Any, text: str) -> bool:
     try:
         await adapter._bot.send_message(chat_id=chat_id, text=str(text)[:4000],
                                         business_connection_id=bcid)
+        _BIZ_REPLIED[str(chat_id)] = time.monotonic()
         return True
     except Exception:
         logger.warning("[TGAhermes] automation send failed (chat=%s)", chat_id, exc_info=True)
@@ -1438,6 +1473,10 @@ async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -
         else:
             logger.warning("[TGAhermes] automation reply dropped, no business "
                            "connection (chat=%s)", chat_id)
+    if ok and chat_id:
+        # Only a reply that actually went out spends the grace period; a failed
+        # send leaves the next message waiting for the owner as before.
+        _BIZ_REPLIED[str(chat_id)] = time.monotonic()
     store = _biz_store()
     if store is not None and chat_id:
         try:
@@ -1564,7 +1603,13 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
         return  # bots never trigger a reply
     uid = str(getattr(user, "id", "") or "")
     owner = _owner_id(adapter)
+    chat_id = str(getattr(getattr(msg, "chat", None), "id", "") or "")
     if uid and owner and owner not in ("", "*") and uid == owner:
+        # The owner is back in THIS conversation — that is what re-arms the
+        # entry hold. Recorded here because an owner turn never reaches the
+        # gateway dispatch hook: it is filtered out just below.
+        if chat_id:
+            _BIZ_OWNER_SEEN[chat_id] = time.monotonic()
         return  # the owner's own traffic is not automation
     st = settings()
     mode = str(st.get("biz_mode") or "assistant")
@@ -1573,7 +1618,6 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
         # Incoming business updates may omit the field; the attached
         # connection (recorded by _on_business_connection) is the same one.
         bcid = _active_bcid()
-    chat_id = str(getattr(getattr(msg, "chat", None), "id", "") or "")
     text = str(getattr(msg, "text", "") or getattr(msg, "caption", "") or "")
     if not chat_id:
         return
@@ -1611,8 +1655,13 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
                    f"\n<b>Action:</b> {_esc(_why)} — nothing sent", buttons=prof)
         return
     # --- idle delay: owner was away -> hold the answer briefly ------------
+    # The hold is spent once per conversation, not once per message: after
+    # ATRA has answered this chat the conversation is live, and the next
+    # message in it goes straight out. A returning owner still gets the first
+    # word — the delay only governs ATRA's ENTRY, and seeing the owner again
+    # (or an untouched chat) arms it back.
     _delay = _biz_idle_delay_s(st)
-    if _delay > 0 and _owner_idle(st):
+    if _delay > 0 and _owner_idle(st) and not _biz_engaged(chat_id):
         _quiet = _owner_idle_for(st)
         try:
             await _log("🤖 Chat Automation — waiting for owner",
