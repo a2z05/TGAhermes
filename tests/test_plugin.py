@@ -2597,5 +2597,94 @@ finally:
     mod.save_settings(_prev31)
     mod._WIZARD.clear()
 
+
+
+# --- busy-path console input: the dispatch hook never runs while a session for
+# the chat is live, so bang/wizard input has to be served from the PTB handler.
+async def t_busy():
+    _ad = FakeAdapter()
+    _ad._active_sessions = {}
+    _prev_ad = mod._ADAPTER.get("adapter")
+    mod._ADAPTER["adapter"] = _ad
+    _st0 = dict(mod.settings())
+    _chat = "-10042"
+    _owner = "999"
+    mod.save_settings({"owner_id": _owner, "log_channel": _chat})
+
+    _bang = []
+    _wiz = []
+    _orig_bang, _orig_feed, _orig_reply = (mod._run_bang_command,
+                                           mod._wizard_feed,
+                                           mod._reply_to_event)
+
+    async def _fake_bang(adapter, event, text, session_store=None):
+        _bang.append((str(event.source.chat_id), text))
+
+    async def _fake_feed(adapter, chat_id, text, session_store=None):
+        _wiz.append((str(chat_id), text))
+        return "next step"
+
+    async def _fake_reply(adapter, chat_id, text, buttons=None):
+        _wiz.append(("reply", str(chat_id)))
+
+    mod._run_bang_command, mod._wizard_feed, mod._reply_to_event = (
+        _fake_bang, _fake_feed, _fake_reply)
+
+    def _mk(chat, uid, text, ct="supergroup"):
+        m = NS(message_id=505, text=text,
+               from_user=NS(id=int(uid)),
+               chat=NS(id=int(chat), type=ct))
+        return NS(effective_message=m, message=m)
+
+    try:
+        # IDLE: nothing is running -> the core handler (and the hook) own it.
+        _ad.delegated.clear(); _bang.clear()
+        await mod._on_busy_path_text(_ad, _mk(_chat, _owner, "!panel"), None)
+        check(_ad.delegated == ["text"],
+              "idle: bang falls through to the core handler")
+        check(not _bang, "idle: the busy path does not run the bang itself")
+
+        # BUSY: session live for this chat -> bang served here, no delegation.
+        _ad._active_sessions[f"agent:main:telegram:group:{_chat}"] = object()
+        _ad.delegated.clear(); _bang.clear()
+        await mod._on_busy_path_text(_ad, _mk(_chat, _owner, "!panel"), None)
+        check(not _ad.delegated,
+              "busy: bang is not also handed to the core handler")
+        check(_bang and _bang[0][0] == _chat and _bang[0][1] == "!panel",
+              "busy: bang executes with the right chat and command")
+
+        # BUSY + ordinary text: still the core's, so normal turns are untouched.
+        _ad.delegated.clear(); _bang.clear()
+        await mod._on_busy_path_text(_ad, _mk(_chat, _owner, "hello"), None)
+        check(_ad.delegated == ["text"],
+              "busy: plain text still goes to the core handler")
+        check(not _bang, "busy: plain text never runs a bang")
+
+        # BUSY + wizard answer: served here too (the reported bug).
+        mod._WIZARD[_chat] = {"flow": "send", "step": 1, "data": []}
+        _ad.delegated.clear(); _wiz.clear()
+        await mod._on_busy_path_text(_ad, _mk(_chat, _owner, "10m"), None)
+        check(not _ad.delegated,
+              "busy: wizard answer is not queued as a user turn")
+        check(any(x == (_chat, "10m") for x in _wiz),
+              "busy: the wizard receives the typed answer")
+        mod._WIZARD.pop(_chat, None)
+
+        # A non-owner never reaches the console branch.
+        _ad.delegated.clear(); _bang.clear()
+        await mod._on_busy_path_text(_ad, _mk(_chat, "12345", "!panel"), None)
+        check(_ad.delegated == ["text"],
+              "busy: a stranger's bang is not executed")
+        check(not _bang, "busy: a stranger never runs a console command")
+    finally:
+        mod._run_bang_command, mod._wizard_feed, mod._reply_to_event = (
+            _orig_bang, _orig_feed, _orig_reply)
+        mod._ADAPTER["adapter"] = _prev_ad
+        mod.save_settings(_st0)
+        mod._WIZARD.clear()
+
+
+asyncio.run(t_busy())
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

@@ -5526,6 +5526,83 @@ async def _on_private_text(adapter: Any, update: Any, context: Any = None) -> No
                 logger.warning("[TGAhermes] stranger canned reply failed", exc_info=True)
 
 
+# ------------------------------------------- busy-path bang / wizard input
+# A message that arrives while this chat's session is running is routed by
+# base._handle_message_while_active to the busy handler, which never reaches
+# _hm_admit_event — so pre_gateway_dispatch, where bang commands and wizard
+# answers are handled, is never called ("A steered or queued follow-up never
+# reaches _hm_admit_event"). PTB dispatches the FIRST matching handler per
+# group and this plugin's handlers are hoisted ahead of the core's, so this one
+# sees the message first: while the chat is busy, owner bang and wizard input
+# are executed here; everything else is delegated back exactly as
+# _on_private_text does, leaving the idle path — and its dispatch-hook side
+# effects — unchanged.
+
+def _chat_is_busy(adapter: Any, chat_id: str) -> bool:
+    """True while a gateway session for this chat is running."""
+    try:
+        return bool(chat_id) and _session_key_for(adapter, chat_id) is not None
+    except Exception:
+        return False
+
+
+async def _on_busy_path_text(adapter: Any, update: Any, context: Any = None) -> None:
+    """PTB text handler: run owner bang/wizard input while the chat is busy."""
+    msg = getattr(update, "effective_message", None) or getattr(update, "message", None)
+    if msg is None:
+        return
+    text = str(msg.text or "")
+    chat = str(getattr(getattr(msg, "chat", None), "id", "") or "")
+    ct = str(getattr(getattr(msg, "chat", None), "type", "") or "")
+    uid = str(getattr(getattr(msg, "from_user", None), "id", "") or "")
+    owner = _owner_id(adapter)
+    if not owner or uid != owner:
+        # Not ours to intercept: strangers in a DM get the canned-reply path.
+        if ct == "private":
+            await _on_private_text(adapter, update, context)
+        else:
+            await adapter._handle_text_message(update, context)
+        return
+    st = settings()
+    in_log = bool(st.get("log_channel")) and chat == str(st["log_channel"])
+    in_owner_dm = ct == "private" and chat == owner
+    in_group = ct in ("group", "supergroup", "forum", "channel")
+    setlog_here = in_group and text.lower().startswith("!setlog")
+    is_bang = text.startswith("!") and (in_log or in_owner_dm or setlog_here)
+    is_wiz = chat in _WIZARD and not text.startswith("!")
+    if not (is_bang or is_wiz) or not _chat_is_busy(adapter, chat):
+        # Idle (or not console input): the core handler and the dispatch hook
+        # own it, exactly as before this handler existed.
+        await adapter._handle_text_message(update, context)
+        return
+    try:
+        if is_bang:
+            _WIZARD.pop(chat, None)  # a real command abandons any open wizard step
+            _wizard_persist()
+            from types import SimpleNamespace
+            ev = SimpleNamespace(
+                source=SimpleNamespace(chat_id=chat, chat_type=ct, user_id=uid,
+                                       message_id=getattr(msg, "message_id", None)),
+                text=text)
+            await _run_bang_command(adapter, ev, text,
+                                    session_store=_CTX.get("session_store"))
+            logger.info("[TGAhermes] busy-path bang command %s (dispatch hook bypassed)",
+                        text.split(maxsplit=1)[0])
+            return
+        out = await _wizard_feed(adapter, chat, text,
+                                 session_store=_CTX.get("session_store"))
+        if out is not None:
+            await _reply_to_event(adapter, chat, out,
+                                  buttons=_help_keyboard("wiz", st, chat_id=chat)
+                                  if chat in _WIZARD else None)
+            logger.info("[TGAhermes] busy-path wizard input accepted (hook bypassed)")
+            return
+        # The wizard refused it — fall through so the answer is not lost.
+    except Exception:
+        logger.exception("[TGAhermes] busy-path bang/wizard failed")
+    await adapter._handle_text_message(update, context)
+
+
 # ---------------------------------------------------------------- telegram_admin tool
 
 _TOOL_DESCRIPTION = (
@@ -6337,6 +6414,16 @@ def _make_factory():
             except Exception:
                 logger.warning("[%s] business connection handler unavailable",
                                __name__, exc_info=True)
+            # Busy-path console input: owner bang/wizard answers while this chat
+            # has a live session. Must sit BEFORE _private and (via the adapter's
+            # hoist) ahead of the core text handler — PTB runs the first match in
+            # the group. Commands are excluded so /start and friends keep going
+            # to _private and the core command handler untouched.
+            async def _busy_path(update, context):
+                await _on_busy_path_text(adapter, update, context)
+            native.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                              _busy_path))
+
             async def _private(update, context):
                 await _on_private_text(adapter, update, context)
             native.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, _private))
