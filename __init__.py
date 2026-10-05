@@ -1064,8 +1064,11 @@ def _owner_idle(st: Optional[Dict[str, Any]] = None) -> bool:
     The Bot API exposes no online status, so presence is inferred from the
     owner's own inbound traffic; a cold process starts idle (warn on)."""
     _s = st if isinstance(st, dict) else settings()
+    # `0 or 10` would turn the documented "0 = never idle" into 10 minutes, so
+    # an explicit None check is what keeps that promise.
+    raw = _s.get("biz_owner_idle_min")
     try:
-        need = float(_s.get("biz_owner_idle_min") or 10)
+        need = 10.0 if raw is None else float(raw)
     except Exception:
         need = 10.0
     if need <= 0:
@@ -1111,19 +1114,86 @@ def _biz_sched_st(st: Optional[Dict[str, Any]] = None) -> str:
     return v if v in _BIZ_SCHEDULE_ORDER else "always"
 
 
+def _biz_norm_hhmm(raw: Any) -> str:
+    """Any time the owner might type -> canonical 'HH:MM', or '' when unusable.
+
+    Accepts '9:00', '09:05', '9', '0900' and '2359' so a window time can be
+    entered as plainly as a number. Bad input never raises — it returns '' so
+    the caller rejects it instead of storing garbage.
+    """
+    s = str(raw or "").strip().replace(" ", "")
+    if not s:
+        return ""
+    if ":" in s:
+        hh, _, mm = s.partition(":")
+    elif s.isdigit() and len(s) <= 4:
+        if len(s) <= 2:
+            hh, mm = s, "00"
+        elif len(s) == 3:
+            hh, mm = s[:1], s[1:]
+        else:
+            hh, mm = s[:2], s[2:]
+    else:
+        return ""
+    if not (hh.isdigit() and mm.isdigit()):
+        return ""
+    h, m = int(hh), int(mm)
+    if 0 <= h <= 24 and 0 <= m < 60:
+        return f"{h:02d}:{m:02d}"
+    return ""
+
+
 def _biz_hhmm(value: Any, fallback: int) -> int:
-    """'HH:MM' -> minutes since midnight. Tolerant: bad input never raises."""
+    """'HH:MM' (or '0900' / '9') -> minutes since midnight. Never raises."""
+    s = _biz_norm_hhmm(value)
+    if not s:
+        return fallback
+    return min(24 * 60, int(s[:2]) * 60 + int(s[3:]))
+
+
+# Durations: the owner types what people actually say — '10m', '30s', '1h' —
+# not raw seconds. Every entry point runs through _dur_to_s and rejects
+# anything it cannot read, so a typo never reaches settings.json.
+_DUR_UNITS: Dict[str, int] = {
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+}
+
+
+def _dur_to_s(raw: Any, default_unit: str = "s") -> Optional[int]:
+    """'10s' / '10m' / '1h30m' / '10' -> seconds. None = unparseable."""
+    s = str(raw or "").strip().lower().replace(" ", "")
+    if not s:
+        return None
+    parts = re.findall(r"(\d+(?:\.\d+)?)([a-z]*)", s)
+    if not parts or "".join(n + u for n, u in parts) != s:
+        return None
+    total = 0.0
+    for num, unit in parts:
+        u = unit or default_unit
+        if u not in _DUR_UNITS:
+            return None
+        total += float(num) * _DUR_UNITS[u]
+    if total < 0:
+        return None
+    return int(round(total))
+
+
+def _fmt_min(minutes: Any) -> str:
+    """Minutes (maybe fractional, after typed input) -> '10m' / '30s'."""
     try:
-        s = str(value or "").strip()
-        if not s or ":" not in s:
-            return fallback
-        hh, mm = s.split(":", 1)
-        h, m = int(hh), int(mm)
-        if 0 <= h <= 24 and 0 <= m < 60:
-            return min(24 * 60, h * 60 + m)
+        m = float(minutes)
     except Exception:
-        pass
-    return fallback
+        return str(minutes)
+    if m <= 0:
+        return "0"
+    if m < 1:
+        return f"{m * 60:g}s"
+    if m == int(m):
+        return f"{int(m)}m"
+    return f"{m:g}m"
 
 
 def _biz_window_now(now: Optional[datetime.datetime] = None) -> int:
@@ -1377,15 +1447,96 @@ async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -
     return SendResult(success=ok, message_id=None), adapter
 
 
-_BIZ_MIMIC_PROMPT = (
+# Bundled personas, with a home copy overriding the packaged one (same rule
+# as the guest persona) so the owner can edit one without redeploying.
+_BIZ_PERSONAS = {"mimic": "mimic.md", "assistant": "automation.md"}
+
+_BIZ_MIMIC_FALLBACK = (
     "You are Ar(t)an's Telegram account answering a customer directly. "
     "Write AS him: first person, his voice — concise, casual, practical, "
-    "no corporate tone, no emoji spam. Never claim to be an AI unless the "
-    "customer asks outright; if asked, say an assistant wrote it on his behalf."
+    "no corporate tone, no emoji spam. Only facts you actually have; if you "
+    "don't know, say so in one line. Nothing private, nothing internal — no "
+    "settings, logs, ids, other chats, or how you run. Never claim to be an "
+    "AI unless asked outright; if asked, say an assistant wrote it on his "
+    "behalf, once, then move on."
 )
+_BIZ_ASSISTANT_FALLBACK = (
+    "You are ATRA, replying to messages that arrive in Ar(t)an's Telegram "
+    "account. Answer the question or do the task, in their language, in the "
+    "fewest clear words. Only what you actually know — if you don't know, "
+    "one line saying so. Never invent facts or promises on his behalf. Never "
+    "expose settings, logs, paths, ids, other chats, or how you run. No "
+    "filler, no flattery, no emoji unless they use them first."
+)
+# Kept as the module-level name tests and callers already reference.
+_BIZ_MIMIC_PROMPT = _BIZ_MIMIC_FALLBACK
+
+
+def _biz_persona_file(kind: str) -> Optional[Path]:
+    """Bundled persona file for a mode; a home copy wins when it differs."""
+    name = _BIZ_PERSONAS.get(kind)
+    if not name:
+        return None
+    bundled = PLUGIN_DIR / "assets" / name
+    try:
+        home_copy = _hermes_home() / "assets" / name
+        if home_copy.is_file() and bundled.is_file():
+            if home_copy.read_bytes() != bundled.read_bytes():
+                return home_copy
+        elif home_copy.is_file():
+            return home_copy
+    except OSError:
+        pass
+    return bundled if bundled.is_file() else None
+
+
+def _load_biz_persona(kind: str) -> str:
+    """Bundled persona text for a mode, or its inline fallback."""
+    path = _biz_persona_file(kind)
+    if path:
+        try:
+            txt = path.read_text(encoding="utf-8", errors="replace").strip()
+            if txt:
+                return txt
+        except OSError:
+            logger.warning("[TGAhermes] automation persona unreadable: %s", path)
+    return _BIZ_ASSISTANT_FALLBACK if kind == "assistant" else _BIZ_MIMIC_FALLBACK
+
+
+# "" is deliberately NOT in here: an empty answer is a mistyped one, and the
+# owner should be told so instead of having their override silently cleared.
+_BIZ_PERSONA_RESET = ("default", "reset", "auto")
+
+
+def _biz_persona_arg_ok(data: Any) -> str:
+    """Wizard guard for the persona path.
+
+    It used to accept any non-empty string, so a normal chat message sent
+    while the wizard was open was silently stored as the path — the setting
+    then pointed at nothing and every automation turn logged a read warning.
+    A real path must exist; anything else is rejected with the fix spelled
+    out, and the owner can still clear it with 'default'.
+    """
+    raw = str((data or [""])[0] or "").strip()
+    if raw.lower() in _BIZ_PERSONA_RESET:
+        return ""
+    if not raw:
+        return "send a path, or 'default'"
+    if not Path(os.path.expanduser(raw)).is_file():
+        return f"no file at that path — send an existing file, or 'default'"
+    return ""
 
 
 def _biz_persona(st: Dict[str, Any], mode: str) -> str:
+    """The persona an automation turn is prefixed with.
+
+    An explicit `biz_persona_path` wins for either mode (the owner pointing
+    at one file means "use this voice"). Otherwise each mode gets its own
+    bundled persona — mimic speaks as him, assistant speaks as ATRA. The old
+    fallback for assistant was the GUEST persona, which told customers they
+    were in a guest session with limited tools: wrong audience, and it leaked
+    internal framing straight into a customer chat.
+    """
     p = str(st.get("biz_persona_path") or "").strip()
     if p:
         try:
@@ -1393,10 +1544,10 @@ def _biz_persona(st: Dict[str, Any], mode: str) -> str:
             if txt.strip():
                 return txt
         except Exception:
-            logger.warning("[TGAhermes] mimic persona unreadable: %s", p)
+            logger.warning("[TGAhermes] automation persona unreadable: %s", p)
     if mode == "mimic":
-        return _BIZ_MIMIC_PROMPT
-    return _load_persona()
+        return _load_biz_persona("mimic")
+    return _load_biz_persona("assistant")
 
 
 async def _handle_business_message(adapter: Any, update: Any, context: Any = None,
@@ -1529,9 +1680,13 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     lang_line = ("mirror the sender's language (detected: %s)" % lang_label
                  if cfg_lang in ("", "auto") else "always reply in %s" % lang_label)
     mode_line = {
-        "mimic": ("Mode: MIMIC — you reply AS THE OWNER (first person, his voice, "
-                  "short and casual). Do not mention being an AI unless asked directly."),
-        "assistant": "Mode: ASSISTANT — you reply as ATRA, the owner's AI assistant.",
+        "mimic": ("Mode: MIMIC — you ARE the owner writing his own reply: first "
+                  "person, his voice, short and casual. Never mention automation, "
+                  "AI, a script, or the words 'as an AI'; if asked point-blank, an "
+                  "assistant wrote it on his behalf — once, then move on."),
+        "assistant": ("Mode: ASSISTANT — you reply as ATRA, the owner's AI "
+                      "assistant. Answer what was asked and nothing more; never "
+                      "expose settings, logs, other chats, or how you run."),
         "off": "Mode: OFF — observation only.",
     }.get(mode, "")
     identity = (
@@ -1542,8 +1697,10 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
         "Reply directly to their message; no commands, no panel talk."
     )
     if st.get("biz_larp"):
-        identity += ("\nStyle: imitate the owner's tone from the conversation history "
-                     "above (LARP) — match vocabulary, length and rhythm.")
+        identity += ("\nStyle: read the owner's own messages in the history above "
+                     "and match how he writes — vocabulary, sentence length, "
+                     "rhythm, punctuation. Style only: never copy his facts or "
+                     "commitments into a new context.")
     _note = _LAST_REACTION.pop(chat_id, None)
     if _note:
         identity += (f"\nLatest reaction update in this chat: {_note[0]} on message {_note[1]} "
@@ -2376,7 +2533,7 @@ def _help_sections(st: Optional[Dict[str, Any]] = None) -> list:
         ("guests", "👾 Guests",
          f"canned reply: <i>{_esc(st.get('unauthorized_reply'))}</i>\n"
          f"cooldown: <b>{_esc(st.get('unauthorized_cooldown_s'))}s</b> "
-         "<code>!setcooldown &lt;seconds&gt;</code>\n"
+         "<code>!setcooldown 10m</code> · <code>30s</code> · <code>1h</code> (or plain seconds)\n"
          f"error EN: <i>{_esc(st.get('guest_error_reply_en'))}</i>\n"
          f"error FA: <i>{_esc(st.get('guest_error_reply_fa'))}</i>\n"
          "<code>!setunauthorized &lt;text&gt;</code> · <code>!seterror &lt;text&gt;</code> · "
@@ -2386,7 +2543,7 @@ def _help_sections(st: Optional[Dict[str, Any]] = None) -> list:
          "<code>!setunauthorized &lt;text&gt;</code> — reply for strangers\n"
          "<code>!seterror &lt;text&gt;</code> / <code>!seterrorfa &lt;text&gt;</code> — guest error texts\n"
          "<code>!setreact on|off</code> · <code>!setmedia on|off</code>\n"
-         "<code>!setcooldown &lt;seconds&gt;</code> — stranger reply cooldown\n"
+         "<code>!setcooldown 10m</code> — stranger reply cooldown (any duration)\n"
          "<code>!setowner &lt;id&gt;</code> — owner id"),
     ]
 
@@ -2684,6 +2841,31 @@ _TOGGLES: Dict[str, Tuple[str, str]] = {
 _TENUMS: Tuple[str, ...] = ("mode", "bizmode", "bizsched",
                             "bizidledelay", "bizownidle")
 
+# Confirm sub-key -> wizard flow that accepts a typed duration for it. The
+# confirm screen keeps its preset cycle; these give the owner a way to enter
+# something the preset list does not contain (90s, 3h, …).
+_DUR_FLOWS: Dict[str, str] = {"bizidledelay": "bizidledur",
+                              "bizownidle": "bizownidledur"}
+
+
+def _next_preset(cur: Any, presets: List[int], fallback: int) -> int:
+    """Next value in a duration preset list.
+
+    A typed value (10s -> 0.1667 min, 90s -> 1.5 min) is not in the list, so
+    cycling lands on the first preset above it instead of snapping back to the
+    bottom — otherwise Apply would quietly discard what was just typed.
+    """
+    try:
+        v = float(cur if cur not in (None, "") else fallback)
+    except Exception:
+        v = float(fallback)
+    if v in presets:
+        return presets[(presets.index(v) + 1) % len(presets)]
+    for step in presets:
+        if step > v:
+            return step
+    return presets[0]
+
 
 def _tg_next(sub: str, st: Dict[str, Any]) -> Any:
     """Next value behind a confirm screen: booleans flip, guest mode cycles."""
@@ -2701,19 +2883,9 @@ def _tg_next(sub: str, st: Dict[str, Any]) -> Any:
         order_s = list(_BIZ_SCHEDULE_ORDER)
         return order_s[(order_s.index(cur_s) + 1) % len(order_s)]
     if sub == "bizidledelay":
-        order_d = [0, 1, 2, 5, 10, 15, 30]
-        try:
-            cur_d = int(st.get("biz_idle_delay_min") or 0)
-        except Exception:
-            cur_d = 0
-        return order_d[(order_d.index(cur_d) + 1) % len(order_d)] if cur_d in order_d else 0
+        return _next_preset(st.get("biz_idle_delay_min"), [0, 1, 2, 5, 10, 15, 30], 0)
     if sub == "bizownidle":
-        order_o = [0, 5, 10, 15, 30, 60]
-        try:
-            cur_o = int(st.get("biz_owner_idle_min") or 10)
-        except Exception:
-            cur_o = 10
-        return order_o[(order_o.index(cur_o) + 1) % len(order_o)] if cur_o in order_o else 10
+        return _next_preset(st.get("biz_owner_idle_min"), [0, 5, 10, 15, 30, 60], 10)
     ent = _TOGGLES.get(sub)
     if not ent:
         return None
@@ -2774,21 +2946,24 @@ def _tg_view(sub: str, origin: str, st: Dict[str, Any]) -> str:
                      f"–<b>{_esc(str(st.get('biz_window_end') or '23:59'))}</b>")
         return body
     if sub == "bizidledelay":
-        cur_d = int(st.get("biz_idle_delay_min") or 0) if str(st.get("biz_idle_delay_min") or 0).lstrip("-").isdigit() else 0
-        nxt_d = _tg_next("bizidledelay", st)
+        cur_d = _fmt_min(st.get("biz_idle_delay_min"))
+        nxt_d = _fmt_min(_tg_next("bizidledelay", st))
         return (f"<b>\u23f3 Idle reply delay</b>\n"
-                f"now: <b>{cur_d} min</b> → <b>{nxt_d} min</b>\n\n"
+                f"now: <b>{cur_d}</b> → <b>{nxt_d}</b>\n\n"
                 "When you have been silent longer than the idle threshold below, "
                 "ATRA waits this long before answering — you get the chance to "
-                "answer first. 0 = answer immediately.\n\n"
+                "answer first. 0 = answer immediately.\n"
+                "Tap ✏️ to type any duration (<code>10s</code>, <code>2m</code>, "
+                "<code>1h</code>).\n\n"
                 "Tap ✅ Apply to change, ✖ Cancel to go back.")
     if sub == "bizownidle":
-        cur_o = int(st.get("biz_owner_idle_min") or 10) if str(st.get("biz_owner_idle_min") or 10).lstrip("-").isdigit() else 10
-        nxt_o = _tg_next("bizownidle", st)
+        cur_o = _fmt_min(st.get("biz_owner_idle_min"))
+        nxt_o = _fmt_min(_tg_next("bizownidle", st))
         return (f"<b>\U0001f4c4 Owner idle threshold</b>\n"
-                f"now: <b>{cur_o} min</b> → <b>{nxt_o} min</b>\n\n"
-                "After this many minutes without a message from you, you count "
-                "as idle (warn-first and the idle delay both use it). 0 = never idle.\n\n"
+                f"now: <b>{cur_o}</b> → <b>{nxt_o}</b>\n\n"
+                "After this long without a message from you, you count as idle "
+                "(warn-first and the idle delay both use it). 0 = never idle.\n"
+                "Tap ✏️ to type any duration (<code>10m</code>, <code>1h</code>).\n\n"
                 "Tap ✅ Apply to change, ✖ Cancel to go back.")
     if sub == "userbridge":
         return _ub_cfm(st)
@@ -2907,7 +3082,8 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
             return ("<b>⏱ Cooldown</b>\n"
                     f"current: <b>{_esc(cur)}s</b>\n\n"
                     "How long a stranger waits before the canned reply may repeat. "
-                    "Tap a preset below, or type <code>!setcooldown &lt;seconds&gt;</code>.")
+                    "Tap a preset below, tap \u270f\ufe0f to type any duration, or "
+                    "use <code>!setcooldown 10m</code>.")
         return ("<b>⏱ Cooldown</b>\n"
                 f"now: <b>{_esc(cur)}s</b> → <b>{_esc(n)}s</b>\n\n"
                 "How long a stranger waits before the canned reply may repeat.\n\n"
@@ -3001,7 +3177,7 @@ _CATS: Dict[str, List[Dict[str, Any]]] = {
         {"kind": "bool", "key": "biz_larp", "sub": "bizlarp",
          "label": "\U0001f3ad LARP the owner's voice"},
         {"kind": "text", "key": "biz_persona_path", "flow": "bizpersona",
-         "label": "\U0001f3ad Mimic persona file"},
+         "label": "\U0001f3ad Persona file (assistant + mimic)"},
         {"kind": "list", "key": "biz_scope", "cb": "panel:wiz:bizscope",
          "label": "\U0001f3af Scope (all chats when empty)"},
         {"kind": "list", "key": "biz_deny_tools", "cb": "panel:wiz:bizdeny",
@@ -3020,9 +3196,9 @@ _CATS: Dict[str, List[Dict[str, Any]]] = {
         {"kind": "list", "key": "biz_window_days", "cb": "panel:wiz:bizdays",
          "label": "📅 Window days (all when empty)"},
         {"kind": "enum", "key": "biz_owner_idle_min", "sub": "bizownidle",
-         "label": "📄 You count as idle after (min)"},
+         "unit": "min", "label": "\U0001f4c4 You count as idle after"},
         {"kind": "enum", "key": "biz_idle_delay_min", "sub": "bizidledelay",
-         "label": "⏳ ATRA waits this long when you are away (min)"},
+         "unit": "min", "label": "\u23f3 ATRA waits when you are away"},
         {"kind": "bool", "key": "biz_sessions_split", "sub": "bizsplit",
          "label": "🧮 Separate automation vs whitelist sessions"},
         {"kind": "cmd", "cb": "panel:bizconn",
@@ -3158,7 +3334,12 @@ def _cat_value(it: Dict[str, Any], st: Dict[str, Any]) -> str:
     if k == "bool":
         return "<b>on</b>" if st.get(key) else "<b>off</b>"
     if k == "enum":
-        m = str(st.get(key) or "balanced")
+        if it.get("unit") == "min":
+            return f"<b>{_fmt_min(st.get(key))}</b>"
+        # `0 or "balanced"` would render a numeric zero as a mode label, so
+        # only a genuinely missing value falls back to the default word.
+        raw = st.get(key)
+        m = str(raw if raw not in (None, "") else "balanced")
         return f"<b>{_MODE_LABEL.get(m, m)}</b>"
     if k == "int":
         return f"<b>{_esc(str(st.get(key)))}s</b>"
@@ -3226,8 +3407,14 @@ def _cat_buttons(cat: str, st: Dict[str, Any], chat_id: Optional[str] = None) ->
             mark = "✅" if st.get(it["key"]) else "⏸"
             out.append((f"{mark} {it['label']}", f"panel:tg:{it['sub']}:{cat}"))
         elif k == "enum":
-            m = str(st.get(it["key"]) or "balanced")
-            out.append((f"{_MODE_LABEL.get(m, m)} {it['label']}", f"panel:tg:{it['sub']}:{cat}"))
+            if it.get("unit") == "min":
+                out.append((f"{_fmt_min(st.get(it['key']))} {it['label']}",
+                            f"panel:tg:{it['sub']}:{cat}"))
+            else:
+                _raw = st.get(it["key"])
+                m = str(_raw if _raw not in (None, "") else "balanced")
+                out.append((f"{_MODE_LABEL.get(m, m)} {it['label']}",
+                            f"panel:tg:{it['sub']}:{cat}"))
         elif k == "int":
             out.append((f"✏️ {it['label']} ({st.get(it['key'])}s)",
                         f"panel:{it['page']}"))
@@ -3343,8 +3530,10 @@ def _view_body(view: str, st: Dict[str, Any], note: str = "",
     if view == "cool":
         return _with(f"<b>⏱ Cooldown</b> — how long a stranger waits before the "
                      f"canned reply may repeat\ncurrent: "
-                     f"<b>{st.get('unauthorized_cooldown_s')}s</b>\n"
-                     "Tap a preset, or type <code>!setcooldown &lt;seconds&gt;</code>")
+                     f"<b>{_fmt_min((st.get('unauthorized_cooldown_s') or 0) / 60)}</b>"
+                     f" <i>({st.get('unauthorized_cooldown_s')}s)</i>\n"
+                     "Tap a preset, tap \u270f\ufe0f to type a duration like "
+                     "<code>10m</code>, or use <code>!setcooldown 10m</code>")
     if view == "cfm":
         _o, _, _kp = (arg or "").partition(":")
         _k, _, _p = _kp.partition(":")
@@ -3434,6 +3623,9 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         _tsub, _, _torigin = (arg or "").partition(":")
         add(("✅ Apply", f"panel:tgy:{_tsub}:{_torigin or 'settings'}"),
             ("✖ Cancel", f"panel:view:{_torigin or 'settings'}"))
+        _df = _DUR_FLOWS.get(_tsub)
+        if _df:
+            add(("✏️ Type a value", f"panel:wiz:{_df}"))
     elif view == "actions":
         add(("\U0001f4e1 Log here — log into THIS chat", "panel:sethere"))
         add(("\U0001f6e1 Whitelist add", "panel:wiz:wladd"),
@@ -3525,6 +3717,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         rows.insert(0, [B("⬅️ Back", callback_data=f"{_CB_PREFIX}panel:back")])
         add(("📜 Full help", "help:full"))
     if view == "cool":
+        add(("✏️ Type a value (10m, 30s…)", "panel:wiz:cooldown"))
         add(*[(f"{n}s", f"panel:cool:{n}") for n in (0, 60, 300, 3600)])
     if chat_id and view in ("panel", "sessions", "access") \
             and (view != "sessions" or str(chat_id) not in _SESS_WIPES):
@@ -4106,11 +4299,14 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
         else:
             reply = f"{key} = <b>{st.get(key)}</b> (send on/off)"
     elif cmd == "!setcooldown":
-        try:
-            save_settings({"unauthorized_cooldown_s": int(arg.strip())})
-            reply = f"cooldown → {int(arg.strip())}s"
-        except Exception:
-            reply = f"cooldown = {st.get('unauthorized_cooldown_s')}s"
+        # Durations welcome: '10m' / '30s' / '1h' as well as raw seconds.
+        secs = _dur_to_s(arg, "s")
+        if secs is None:
+            reply = (f"cooldown = {st.get('unauthorized_cooldown_s')}s — "
+                     "send a duration, e.g. <code>!setcooldown 10m</code>")
+        else:
+            save_settings({"unauthorized_cooldown_s": secs})
+            reply = f"cooldown → {secs}s"
     elif cmd in ("!guestlock", "!guestgate"):
         # Lets the owner unlock THIS guest chat from inside it, which is the
         # only way to do it: Telegram does not tell the bot who sent a guest
@@ -4219,15 +4415,16 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
         "validate": lambda d: "" if d[0].strip() else "send an emoji",
         "done": "automation reaction updated."},
     "bizpersona": {
-        "prompts": ["\U0001f3ad <b>Automation - mimic persona</b>\n\nSend the path of "
-                    "the markdown file that describes how you write, or "
-                    "<code>default</code> for the built-in mimic prompt.\n"
+        "prompts": ["\U0001f3ad <b>Automation persona</b>\n\nSend the path of "
+                    "the markdown file describing how you write (used in both "
+                    "assistant and mimic modes), or <code>default</code> to go "
+                    "back to the bundled ones.\n"
                     "<i>Type cancel to abort.</i>"],
         "save": lambda d: {"biz_persona_path": (
-            "" if d[0].strip().lower() in ("default", "reset", "auto")
-            else d[0].strip()[:400])},
-        "validate": lambda d: "" if d[0].strip() else "send a path, or 'default'",
-        "done": "mimic persona updated - used on the next automation turn."},
+            "" if d[0].strip().lower() in _BIZ_PERSONA_RESET
+            else os.path.expanduser(d[0].strip())[:400])},
+        "validate": _biz_persona_arg_ok,
+        "done": "automation persona updated - used on the next automation turn."},
     "bizscope": {
         "prompts": ["\U0001f3af <b>Automation - scope</b>\n\nSend a chat id to include "
                     "(repeat per id), <code>all</code> to answer every business chat, or "
@@ -4248,16 +4445,18 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
         "prompts": ["\U0001f550 <b>Automation - window start</b>\n\nSend the start as "
                     "<code>HH:MM</code> (24h, e.g. <code>09:00</code>).\n"
                     "<i>Type cancel to abort.</i>"],
-        "save": lambda d: {"biz_window_start": d[0].strip()[:5]},
-        "validate": lambda d: "" if _biz_hhmm(d[0], -1) >= 0 else "send HH:MM, e.g. 09:00",
+        "save": lambda d: {"biz_window_start": _biz_norm_hhmm(d[0])},
+        "validate": lambda d: ("" if _biz_norm_hhmm(d[0])
+                               else "send a time: 9:00, 0900 or 9"),
         "done": "window start updated."},
     "bizwinend": {
         "prompts": ["\U0001f551 <b>Automation - window end</b>\n\nSend the end as "
                     "<code>HH:MM</code> (24h, e.g. <code>23:00</code> - earlier than "
                     "the start means the window wraps past midnight).\n"
                     "<i>Type cancel to abort.</i>"],
-        "save": lambda d: {"biz_window_end": d[0].strip()[:5]},
-        "validate": lambda d: "" if _biz_hhmm(d[0], -1) >= 0 else "send HH:MM, e.g. 23:00",
+        "save": lambda d: {"biz_window_end": _biz_norm_hhmm(d[0])},
+        "validate": lambda d: ("" if _biz_norm_hhmm(d[0])
+                               else "send a time: 23:00, 2300 or 23"),
         "done": "window end updated."},
     "bizdays": {
         "prompts": ["\U0001f4c5 <b>Automation - window days</b>\n\nSend a day "
@@ -4267,6 +4466,24 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
         "save": lambda d: {"biz_window_days": _biz_days_patch(d[0])},
         "validate": lambda d: "" if _biz_days_ok(d[0]) else "send a day name, 'all', or 'clear'",
         "done": "window days updated."},
+    "bizidledur": {
+        "prompts": ["\u23f3 <b>Idle reply delay</b>\n\nSend how long ATRA waits "
+                    "before answering when you are away — <code>10s</code>, "
+                    "<code>2m</code>, <code>1h</code>, or <code>0</code> for "
+                    "immediately.\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"biz_idle_delay_min": (_dur_to_s(d[0], "m") or 0) / 60.0},
+        "validate": lambda d: ("" if _dur_to_s(d[0], "m") is not None
+                               else "send a duration, e.g. 10s, 2m, 1h or 0"),
+        "done": "idle reply delay updated."},
+    "bizownidledur": {
+        "prompts": ["\U0001f4c4 <b>Owner idle threshold</b>\n\nSend how long "
+                    "without a message from you counts as idle — <code>10m</code>, "
+                    "<code>1h</code>, or <code>0</code> to never count as idle.\n"
+                    "<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"biz_owner_idle_min": (_dur_to_s(d[0], "m") or 0) / 60.0},
+        "validate": lambda d: ("" if _dur_to_s(d[0], "m") is not None
+                               else "send a duration, e.g. 10m, 1h or 0"),
+        "done": "owner idle threshold updated."},
     "wladd": {
         "prompts": ["🛡 <b>Add to whitelist</b>\n\nSend the user id (or @username).\n"
                     "<i>Type cancel to abort.</i>"],
@@ -4284,9 +4501,13 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
                     "should start fresh.\n<i>Type cancel to abort.</i>"],
         "build": lambda d: f"!wipe {d[0]}"},
     "cooldown": {
-        "prompts": ["⏱ <b>Cooldown</b>\n\nSend the seconds a stranger waits before the "
-                    "canned reply may repeat.\n<i>Type cancel to abort.</i>"],
-        "build": lambda d: f"!setcooldown {d[0]}"},
+        "prompts": ["⏱ <b>Cooldown</b>\n\nSend how long a stranger waits before the "
+                    "canned reply may repeat — a duration like <code>10m</code>, "
+                    "<code>30s</code>, <code>1h</code> (or plain seconds).\n"
+                    "<i>Type cancel to abort.</i>"],
+        "validate": lambda d: ("" if _dur_to_s(d[0], "s") is not None
+                               else "send a duration, e.g. 10m, 30s, 1h"),
+        "build": lambda d: f"!setcooldown {d[0].strip()}"},
     "unauth": {
         "prompts": ["👾 <b>Stranger reply</b>\n\nSend the exact text a stranger gets as "
                     "the canned reply.\n<i>Type cancel to abort.</i>"],
@@ -4394,11 +4615,13 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
                                else "send a single branch name with no spaces"),
         "done": "✅ update branch updated."},
     "uptimeout": {
-        "prompts": ["⌛ <b>Update timeout</b>\n\nSend the seconds git plus the test suite may "
-                    "take (10–1800).\n<i>Type cancel to abort.</i>"],
-        "save": lambda d: {"update_timeout_s": int(d[0].strip())},
-        "validate": lambda d: ("" if d[0].strip().isdigit() and 10 <= int(d[0].strip()) <= 1800
-                               else "send a whole number of seconds between 10 and 1800"),
+        "prompts": ["⌛ <b>Update timeout</b>\n\nSend how long git plus the test suite may "
+                    "take (10s–30m) — a duration like <code>30s</code>, "
+                    "<code>10m</code>, <code>1h</code>.\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"update_timeout_s": _dur_to_s(d[0], "s")},
+        "validate": lambda d: ("" if (lambda s: s is not None and 10 <= s <= 1800)
+                                            (_dur_to_s(d[0], "s"))
+                               else "send a duration between 10s and 30m, e.g. 30s or 10m"),
         "done": "✅ update timeout updated."},
 }
 
@@ -4809,7 +5032,8 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     view = "cool"
                     body = (f"<b>⏱ Cooldown</b> — how long a stranger waits before the "
                             f"canned reply may repeat\ncurrent: <b>{st.get('unauthorized_cooldown_s')}s</b>\n"
-                            "Tap a preset, or type <code>!setcooldown &lt;seconds&gt;</code>")
+                            "Tap a preset, tap \u270f\ufe0f to type a duration like "
+                            "<code>10m</code>, or use <code>!setcooldown 10m</code>")
             elif action == "gate":
                 # v3.3: `panel:gate` with no sub used to match no branch at all and
                 # land back on the home grid with no body — the reported bug. An
@@ -4894,21 +5118,21 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                                       if nxt == "window" else "")
                                    + f" (owner {_esc(str(_owner_id()))})")
                     elif _ts == "bizidledelay":
-                        nxt = int(_tg_next("bizidledelay", st))
+                        nxt = _tg_next("bizidledelay", st)
                         save_settings({"biz_idle_delay_min": nxt})
                         st = settings()
-                        note = f"\u23f3 idle reply delay → <b>{nxt} min</b>"
+                        note = f"\u23f3 idle reply delay → <b>{_fmt_min(nxt)}</b>"
                         await _log("\u23f3 Chat Automation idle delay",
-                                   f"Idle reply delay → <b>{nxt} min</b> "
+                                   f"Idle reply delay → <b>{_fmt_min(nxt)}</b> "
                                    f"(owner idle after "
-                                   f"{_esc(str(st.get('biz_owner_idle_min')))} min)")
+                                   f"{_fmt_min(st.get('biz_owner_idle_min'))})")
                     elif _ts == "bizownidle":
-                        nxt = int(_tg_next("bizownidle", st))
+                        nxt = _tg_next("bizownidle", st)
                         save_settings({"biz_owner_idle_min": nxt})
                         st = settings()
-                        note = f"\U0001f4c4 owner idle after <b>{nxt} min</b>"
+                        note = f"\U0001f4c4 owner idle after <b>{_fmt_min(nxt)}</b>"
                         await _log("\U0001f4c4 Owner idle threshold",
-                                   f"Owner counts as idle after <b>{nxt} min</b> "
+                                   f"Owner counts as idle after <b>{_fmt_min(nxt)}</b> "
                                    f"(owner {_esc(str(_owner_id()))})")
                     elif _ts in _TOGGLES:
                         key, label = _TOGGLES[_ts]

@@ -2451,5 +2451,137 @@ finally:
     mod._BIZ_CONN.pop("770011", None)
     mod._ADAPTER["adapter"] = _old_ad3
 
+# ------------------------------------------- typed durations + bundled personas
+print("\n[31] typed durations, time normalising, bundled personas")
+
+_prev31 = {k: mod.settings().get(k) for k in (
+    "unauthorized_cooldown_s", "update_timeout_s", "biz_idle_delay_min",
+    "biz_owner_idle_min", "biz_window_start", "biz_window_end",
+    "biz_persona_path")}
+try:
+    # _dur_to_s — the point of the feature: type what people actually say
+    check(mod._dur_to_s("10s", "s") == 10, "duration 10s parses")
+    check(mod._dur_to_s("10m", "s") == 600, "duration 10m parses")
+    check(mod._dur_to_s("1h", "s") == 3600, "duration 1h parses")
+    check(mod._dur_to_s("1h30m", "s") == 5400, "compound 1h30m parses")
+    check(mod._dur_to_s("10", "s") == 10, "bare number keeps the default unit")
+    check(mod._dur_to_s("10x", "s") is None, "unknown unit is rejected")
+    check(mod._dur_to_s("", "s") is None, "empty input is rejected")
+    check(mod._dur_to_s("-5m", "s") is None, "a negative duration is rejected")
+
+    # display of what was stored
+    check(mod._fmt_min(10) == "10m", "10 min renders as 10m")
+    check(mod._fmt_min(0.5) == "30s", "half a minute renders as 30s")
+    check(mod._fmt_min(0) == "0", "zero renders as 0")
+
+    # window times: a plain number is enough
+    check(mod._biz_norm_hhmm("9") == "09:00", "'9' normalises to 09:00")
+    check(mod._biz_norm_hhmm("0900") == "09:00", "'0900' normalises to 09:00")
+    check(mod._biz_norm_hhmm("2359") == "23:59", "'2359' normalises to 23:59")
+    check(mod._biz_norm_hhmm("9:05") == "09:05", "'9:05' normalises to 09:05")
+    check(mod._biz_norm_hhmm("25:00") == "", "an impossible time is rejected")
+    check(mod._biz_hhmm("0900", -1) == 540, "_biz_hhmm reads plain numbers")
+
+    # cycling from a typed (non-preset) value steps ABOVE it, not back to 0
+    check(mod._next_preset(1.5, [0, 1, 2, 5, 10, 15, 30], 0) == 2,
+          "cycle from a typed 90s steps up instead of snapping to 0")
+    check(mod._next_preset(10, [0, 1, 2, 5, 10, 15, 30], 0) == 15,
+          "cycle from a preset steps to the next one")
+
+    # !setcooldown takes a duration
+    out31 = asyncio.run(mod._bang_execute(None, "-100555", "!setcooldown 10m"))
+    check(mod.settings().get("unauthorized_cooldown_s") == 600,
+          "!setcooldown 10m stores 600 seconds")
+    check(bool(out31) and "600" in out31, "!setcooldown reports the stored value")
+    asyncio.run(mod._bang_execute(None, "-100555", "!setcooldown junk"))
+    check(mod.settings().get("unauthorized_cooldown_s") == 600,
+          "a junk cooldown is refused, not stored")
+
+    # wizard flows accept durations end to end
+    for flow, key, sample, want in (
+            ("uptimeout", "update_timeout_s", "10m", 600.0),
+            ("bizidledur", "biz_idle_delay_min", "10s", 10 / 60),
+            ("bizownidledur", "biz_owner_idle_min", "2h", 120.0)):
+        mod._WIZARD.clear()
+        check(bool(mod._wizard_start("-100555", flow)), f"{flow} wizard opens")
+        asyncio.run(mod._wizard_feed(None, "-100555", sample))
+        got31 = float(mod.settings().get(key))
+        check(abs(got31 - want) < 1e-9,
+              f"{flow} accepts '{sample}' (got {got31!r})")
+        check("-100555" not in mod._WIZARD, f"{flow} wizard closed")
+    # a non-duration must re-prompt, not kill the flow or store garbage
+    mod._WIZARD.clear()
+    mod._wizard_start("-100555", "bizidledur")
+    out31 = asyncio.run(mod._wizard_feed(None, "-100555", "banana"))
+    check(bool(out31) and "\u26a0" in out31 and "-100555" in mod._WIZARD,
+          "a non-duration re-prompts and keeps the wizard open")
+    mod._WIZARD.clear()
+
+    # window wizard normalises plain numbers instead of storing them raw
+    mod._wizard_start("-100555", "bizwinstart")
+    asyncio.run(mod._wizard_feed(None, "-100555", "9"))
+    check(mod.settings().get("biz_window_start") == "09:00",
+          "window start accepts '9'")
+    mod._WIZARD.clear()
+    mod._wizard_start("-100555", "bizwinend")
+    asyncio.run(mod._wizard_feed(None, "-100555", "2300"))
+    check(mod.settings().get("biz_window_end") == "23:00",
+          "window end accepts '2300'")
+    mod._WIZARD.clear()
+
+    # every duration setting offers a typed-entry button somewhere
+    d31 = [b.callback_data for row in mod._help_keyboard("tg", arg="bizidledelay:biz")
+           for b in row]
+    check(any(x.endswith("panel:wiz:bizidledur") for x in d31),
+          "idle-delay confirm offers a typed value")
+    d31 = [b.callback_data for row in mod._help_keyboard("tg", arg="bizownidle:biz")
+           for b in row]
+    check(any(x.endswith("panel:wiz:bizownidledur") for x in d31),
+          "owner-idle confirm offers a typed value")
+    check(any(b.callback_data.endswith("panel:wiz:cooldown")
+              for row in mod._help_keyboard("cool") for b in row),
+          "cooldown page offers typed entry")
+    check(any(b.callback_data.endswith("panel:cool:300")
+              for row in mod._help_keyboard("cool") for b in row),
+          "cooldown presets survive next to the new button")
+    check(all(f in mod._WIZ_FLOWS for f in
+              ("bizidledur", "bizownidledur", "cooldown", "uptimeout",
+               "bizwinstart", "bizwinend")),
+          "every duration flow is registered")
+
+    # 0 really means 0 — it used to fall through to the 10-minute default
+    check(mod._owner_idle({"biz_owner_idle_min": 0}) is False,
+          "owner idle threshold 0 means never idle")
+
+    # bundled personas: one per mode, and the assistant one is NOT the guest
+    a31 = mod._biz_persona({}, "assistant")
+    m31 = mod._biz_persona({}, "mimic")
+    check("ATRA" in a31 and "guest session" not in a31 and "guest link" not in a31,
+          "assistant persona is the automation one, not the guest one")
+    check("first person" in m31.lower(), "mimic persona speaks as the owner")
+    check("never invent" in m31.lower() and "no logs" in m31.lower(),
+          "mimic persona carries the no-invention and no-leak rules")
+    check((mod.PLUGIN_DIR / "assets" / "automation.md").is_file()
+          and (mod.PLUGIN_DIR / "assets" / "mimic.md").is_file(),
+          "both persona files are packaged")
+    check(mod._biz_persona({"biz_persona_path": str(PERSONA)}, "assistant")
+          .startswith("# ATRA"), "an explicit persona path still wins")
+
+    # the persona wizard refuses a path that is not a file — that is the bug
+    # which stored a chat message as biz_persona_path
+    check(mod._biz_persona_arg_ok(["default"]) == "",
+          "persona wizard accepts 'default'")
+    check(mod._biz_persona_arg_ok([""]) != "",
+          "persona wizard rejects an empty answer")
+    check(mod._biz_persona_arg_ok(["no/such/file.md"]) != "",
+          "persona wizard rejects a path that does not exist")
+    _tmp31 = P(tempfile.mkdtemp()) / "mine.md"
+    _tmp31.write_text("# mine\n", encoding="utf-8")
+    check(mod._biz_persona_arg_ok([str(_tmp31)]) == "",
+          "persona wizard accepts a real file")
+finally:
+    mod.save_settings(_prev31)
+    mod._WIZARD.clear()
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)
