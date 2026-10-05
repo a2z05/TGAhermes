@@ -36,7 +36,7 @@ PY=$(find_python)
 
 # Only these files are copied. settings.json, state.json and anything learned
 # at runtime are never touched: an update must not reset the owner's config.
-FILES=(__init__.py bizauto.py selfupdate.py plugin.yaml README.md AGENT.md settings.example.json)
+FILES=(__init__.py bizauto.py userbridge.py selfupdate.py plugin.yaml README.md AGENT.md settings.example.json)
 DIRS=(tests scripts assets)
 
 # Never copy the identity file that holds the owner's real ids: it stays
@@ -110,6 +110,17 @@ case "${1:-check}" in
         echo "  $rel"
       done < <(find "$REPO/$d" -type f ! -path '*/__cache__/*' ! -name '*.pyc')
     done
+    # Full unlock bridge: vendored telethon lives only in the deploy dir —
+    # the repo never carries it and the Hermes venv is left alone.
+    if [ ! -d "$DEPLOY/deps/telethon" ]; then
+      if command -v uv >/dev/null 2>&1; then
+        echo "--- bridge deps: installing telethon into deps/ ---"
+        uv pip install --target "$DEPLOY/deps" telethon >/dev/null 2>&1 \
+          || echo "  WARN: bridge deps failed — Full unlock stays inert"
+      else
+        echo "  WARN: uv not found — bridge deps missing (Full unlock inert)"
+      fi
+    fi
     echo "--- drift after copy ---"
     drift && echo "  in sync"
     tests

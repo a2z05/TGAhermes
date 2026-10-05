@@ -8,3 +8,8 @@ state.json
 __pycache__/
 *.pyc
 bizauto.db
+
+# Full unlock bridge: per-install session copy, credentials, vendored deps.
+user.session
+userbridge.json
+deps/

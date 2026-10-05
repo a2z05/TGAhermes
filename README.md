@@ -122,6 +122,44 @@ on every use, so edits apply immediately — no restart. Start from
 [`settings.example.json`](settings.example.json) if you'd rather edit a file
 than send commands.
 
+## Full unlock — act as you ⚠️
+
+**Panel → Access → 🔓 Full unlock (act as you).** The Bot API gives a bot
+connected to your business account no way to set or read reactions inside
+business chats, and it never will. This bridge connects a **copy of your own
+Telegram session (MTProto)** to the gateway so ATRA acts **as you** there —
+first power: send reactions as you and see reaction updates live. The panel
+confirm screen spells out the whole trade before you apply it.
+
+**DANGER — read before enabling.** A user account running automation can trip
+Telegram flood limits or get banned. Nobody has been banned so far, but that
+is luck, not a guarantee. Enabling the toggle means you accept that risk; the
+warning is shown in the confirm screen and posted to the log when applied.
+
+How it stays contained:
+
+- the live session file is only read **once**, through SQLite's backup API
+  (`scripts/setup_userbridge.py`) — the bridge works on its own copy in the
+  deploy dir and never opens the original;
+- credentials live in `userbridge.json` (mode 600) beside the copy — not in
+  the repo, not in `settings.json`;
+- telethon is vendored into `deps/` in the deploy dir only (`sync.sh` does
+  it on deploy) — the Hermes venv is not modified;
+- the listener reports reactions only from business chats and the log group;
+  the rest of your account's update traffic is ignored;
+- flipping the toggle off drops the connection and stops the listener in one
+  tap, and each plugin load reuses the running connection instead of stacking
+  another one.
+
+Setup (owner session copy + credentials):
+
+```bash
+python3 scripts/setup_userbridge.py   # verify prints the owner match
+./scripts/sync.sh deploy              # installs deps/telethon, reloads
+```
+
+Key: `user_bridge` in `settings.example.json` (default `false`).
+
 ## Updating
 
 Open `!panel` → **🔧 System** → **Check for update**, then **Install

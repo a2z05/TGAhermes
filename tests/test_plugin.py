@@ -2379,5 +2379,77 @@ async def _t29():
 
 asyncio.run(_t29())
 
+
+# [30] Regression: a friend's business chat and their plain DM with the bot
+# share the same numeric chat id, so "chat has business history" alone used to
+# inject EVERY plain reply (and typing/clarify/media) of that person into the
+# owner's personal DM as if the owner had written it. Delivery must follow the
+# CURRENT turn: plain -> bot, business -> owner, no event seen -> old behaviour
+# (boot sweep / ledger redelivery still lands as the owner).
+print("\n[30] delivery follows the current turn, not chat history")
+try:
+    _orig_bck = mod._biz_chat_known
+    _old_ad3 = mod._ADAPTER.get("adapter")
+    mod._biz_chat_known = lambda cid: str(cid) == "770011"
+    ad3 = FakeAdapter()
+    mod._ADAPTER["adapter"] = ad3
+    mod._install_wraps(ad3)
+    mod._BIZ_CONN["770011"] = "bc_boot"
+
+    async def t30():
+        # no event seen yet: old behaviour — owner delivery for a known chat
+        mod._BIZ_CTX.pop("770011", None)
+        await ad3.send("770011", "boot sweep")
+        check(any(kw.get("business_connection_id") == "bc_boot"
+                  for kw in ad3._bot.sent),
+              "no ctx: known business chat still sends as the owner")
+        check(not any(c[0] == "send" for c in ad3.calls),
+              "no ctx: bot passthrough not used")
+        ad3._bot.sent.clear()
+        ad3.calls.clear()
+
+        # plain turn: the same chat must be delivered by the bot
+        mod._biz_mark("770011", "plain")
+        await ad3.send("770011", "plain reply")
+        check(any(c[0] == "send" and c[1] == "770011" for c in ad3.calls),
+              "plain turn: reply delivered by the bot")
+        check(not any("business_connection_id" in kw for kw in ad3._bot.sent),
+              "plain turn: no business_connection_id injected")
+        ad3._bot.sent.clear()
+        ad3.calls.clear()
+
+        # business turn: back to the owner
+        mod._biz_mark("770011", "business")
+        await ad3.send("770011", "biz reply")
+        check(any(kw.get("business_connection_id") == "bc_boot"
+                  for kw in ad3._bot.sent),
+              "business turn: reply delivered as the owner")
+        check(not any(c[0] == "send" for c in ad3.calls),
+              "business turn: bot passthrough not used")
+        ad3._bot.sent.clear()
+        ad3.calls.clear()
+
+        # the final of a non-business event re-marks the chat plain
+        # (authoritative even if an admission hook never ran)
+        mod._BIZ_CTX.pop("770011", None)
+        pev = FakeEvent(text="hi", source=FakeSource("770011"))
+        await ad3.send_final_ledgered(pev, "k", "final", {}, reply_to=None)
+        check(mod._BIZ_CTX.get("770011") == "plain",
+              "plain final marks the chat plain for following sends")
+
+        # a business final keeps the business mark
+        bev = FakeEvent(text="hi", source=FakeSource("770011"))
+        bev.metadata = {"business_connection_id": "bc_test",
+                        "business_chat_id": "770011"}
+        mod._biz_mark("770011", "business")
+        check(mod._BIZ_CTX.get("770011") == "business",
+              "business mark survives until a plain event replaces it")
+    asyncio.run(t30())
+finally:
+    mod._biz_chat_known = _orig_bck
+    mod._BIZ_CTX.pop("770011", None)
+    mod._BIZ_CONN.pop("770011", None)
+    mod._ADAPTER["adapter"] = _old_ad3
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

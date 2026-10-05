@@ -139,6 +139,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     #   "gate" — the same rules as the guest tool gate above (default)
     #   "full" — no tool gating (the old whitelisted behavior)
     "whitelist_perms": {},          # {"<user_id>": "talk"|"gate"|"full"}
+    "user_bridge": False,           # Full unlock: owner-session bridge (act as you)
     # What a locked guest session answers (rate-limited by the cooldown).
     "guest_locked_reply": "This session is locked by the owner.",
     # !update — pull a newer version of this plugin from git
@@ -153,10 +154,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "biz_warn_text": "",             # "" = per-language default (bizauto catalog)
     "biz_react": True,               # drop the emoji on the automation reply
     "biz_react_emoji": "\U0001f47e",
+    "biz_media": True,               # photo/video/gif/sticker/doc/voice → agent + panel
     "biz_larp": False,               # imitate the owner's style from history
     "biz_persona_path": "",          # mimic persona file; "" = built-in mimic prompt
     "biz_scope": [],                 # [] = every business chat; else only these ids
     "biz_deny_tools": [],            # extra tools locked on automation chats
+    "biz_full_access": False,        # unlock every tool on business chats (owner accepts risk)
 
 }
 
@@ -385,19 +388,24 @@ async def _react(chat_id: Any, message_id: Any, emoji: str) -> bool:
     ad = _ADAPTER.get("adapter")
     if not ad or not emoji or message_id in (None, ""):
         return False
+    ok = False
     try:
         fn = getattr(ad, "_set_reaction", None)
-        if fn is None:
-            return False
-        ok = bool(await fn(str(chat_id), str(message_id), emoji))
-        if not ok and _biz_chat_known(str(chat_id)) and str(chat_id) not in _REACT_WARNED:
-            _REACT_WARNED.add(str(chat_id))
-            logger.info("[TGAhermes] reaction NOT delivered — Telegram gives bots no reaction "
-                        "API inside connected business chats: chat=%s", chat_id)
-        return ok
+        if fn is not None:
+            ok = bool(await fn(str(chat_id), str(message_id), emoji))
     except Exception:
         logger.debug("[TGAhermes] reaction failed", exc_info=True)
-        return False
+    if not ok and _biz_wants_owner(str(chat_id)):
+        # Full unlock: the Bot API refuses inside business chats — fall back
+        # to the owner's own session (see userbridge.py). Never for plain
+        # turns: the ids collide with the owner's own DMs with the same
+        # people, so a fallback here could react to an unrelated message.
+        ok = await _ub_react(ad, chat_id, message_id, emoji)
+    if not ok and _biz_wants_owner(str(chat_id)) and str(chat_id) not in _REACT_WARNED:
+        _REACT_WARNED.add(str(chat_id))
+        logger.info("[TGAhermes] reaction NOT delivered — bot cannot react here and "
+                    "the owner-session bridge is off/unavailable: chat=%s", chat_id)
+    return ok
 
 
 # ---------------------------------------------------------------- reaction updates (see reactions)
@@ -407,6 +415,127 @@ async def _react(chat_id: Any, message_id: Any, emoji: str) -> bool:
 # automation turn of that chat via _LAST_REACTION.
 _LAST_REACTION: Dict[str, Any] = {}
 _REACT_WARNED: set = set()
+
+
+# Owner-session bridge ("Full unlock — act as you"): lazy import (loader-safe),
+# one listener kick per module load, one shared note path for both sources.
+userbridge: Any = None
+_UB_STATE: Dict[str, Any] = {"kicked": False}
+
+_BRIDGE_ON_LOG = (
+    "<b>Warning — Full unlock (act as you) is ON.</b>\n"
+    "ATRA now acts <b>as your own Telegram account</b> from a session copy: "
+    "reactions inside business chats are set and seen through your identity.\n\n"
+    "<b>\u26a0\ufe0f Risk:</b> user-account automation can trip Telegram flood "
+    "limits or get your account banned. Nobody has been banned so far, but that "
+    "is luck, not a guarantee. The live session file is never touched — the "
+    "bridge keeps its own copy; credentials stay in a 600 file outside the "
+    "repo.\nTurn it off any time: Access → Full unlock."
+)
+
+
+def _ub_mod() -> Any:
+    """Import the owner-session bridge on first use (mirror the bizauto chain:
+    package-relative first, bare top-level, then file spec — the suite loads
+    this module standalone, the gateway loads it as a package)."""
+    global userbridge
+    if userbridge is None:
+        try:
+            import importlib as _ila
+            userbridge = _ila.import_module(".userbridge", __name__)
+        except Exception:
+            pass
+        if userbridge is None:
+            try:
+                import importlib as _ila
+                userbridge = _ila.import_module("userbridge")
+            except Exception:
+                pass
+        if userbridge is None:
+            try:
+                import importlib.util as _ilu
+                _ub_path = Path(__file__).parent / "userbridge.py"
+                if _ub_path.is_file():
+                    _spec = _ilu.spec_from_file_location("tga_userbridge", _ub_path)
+                    if _spec is not None and _spec.loader is not None:
+                        _ubm = _ilu.module_from_spec(_spec)
+                        _spec.loader.exec_module(_ubm)
+                        userbridge = _ubm
+            except Exception:
+                logger.debug("[TGAhermes] userbridge unavailable", exc_info=True)
+    return userbridge
+
+
+def _note_reaction(chat_id: str, msg_id: str, label: str,
+                   source: str = "gateway") -> None:
+    """Remember + log one reaction event (gateway hook or owner session)."""
+    _LAST_REACTION[str(chat_id)] = (str(label), str(msg_id), time.time())
+    while len(_LAST_REACTION) > 64:
+        _LAST_REACTION.pop(next(iter(_LAST_REACTION)), None)
+    head = ("🎭 Chat Automation — reaction" if source == "user"
+            else "👾 Chat Automation — reaction")
+    tail = "<i> · as you (owner session)</i>" if source == "user" else ""
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_log(
+            head,
+            f"<b>Reaction:</b> {_esc(str(label))} on message "
+            f"<code>{_esc(str(msg_id))}</code>"
+            f"\n<b>Chat:</b> <code>{_esc(str(chat_id))}</code>{tail}"))
+    except RuntimeError:
+        logger.debug("[TGAhermes] reaction log skipped (no running loop)", exc_info=True)
+
+
+def _ub_cb(chat_id: str, msg_id: int, label: str) -> None:
+    """Reaction update from the owner's account → note (biz + log chats only)."""
+    chat = str(chat_id)
+    if not (_biz_chat_known(chat)
+            or chat == str(settings().get("log_channel") or "")):
+        return  # the account sees every chat; only ours is reported
+    _note_reaction(chat, str(msg_id), str(label), source="user")
+
+
+async def _ub_start(anchor: Any = None) -> None:
+    ub = _ub_mod()
+    if ub is None:
+        logger.warning("[TGAhermes] owner-session bridge module not importable")
+        return
+    try:
+        ok = await ub.start_listener(anchor or _ADAPTER.get("adapter"), _ub_cb)
+        logger.info("[TGAhermes] owner-session reaction listener start=%s", ok)
+    except Exception:
+        logger.warning("[TGAhermes] owner-session listener failed", exc_info=True)
+
+
+async def _ub_stop(anchor: Any = None) -> None:
+    ub = _ub_mod()
+    if ub is None:
+        return
+    try:
+        await ub.stop_listener(anchor or _ADAPTER.get("adapter"))
+    except Exception:
+        logger.debug("[TGAhermes] owner-session stop failed", exc_info=True)
+
+
+async def _ub_apply(on: bool) -> None:
+    if on:
+        await _ub_start()
+    else:
+        await _ub_stop()
+
+
+async def _ub_react(ad: Any, chat_id: Any, message_id: Any, emoji: str) -> bool:
+    """Fallback: set a reaction AS THE OWNER when the Bot API cannot."""
+    if not settings().get("user_bridge"):
+        return False
+    ub = _ub_mod()
+    if ub is None:
+        return False
+    try:
+        return bool(await ub.react(ad, str(chat_id), int(message_id), str(emoji)))
+    except Exception:
+        logger.warning("[TGAhermes] owner-session react failed", exc_info=True)
+        return False
 
 
 def _on_gateway_event(platform: str = "", event_type: str = "",
@@ -420,17 +549,7 @@ def _on_gateway_event(platform: str = "", event_type: str = "",
         return
     emojis = [str(e)[:16] for e in (payload.get("emojis") or [])][:6]
     label = " ".join(emojis) or "(custom emoji)"
-    _LAST_REACTION[chat_id] = (label, msg_id, time.time())
-    while len(_LAST_REACTION) > 64:
-        _LAST_REACTION.pop(next(iter(_LAST_REACTION)), None)
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_log(
-            "\U0001f47e Chat Automation — reaction",
-            f"<b>Reaction:</b> {_esc(label)} on message <code>{_esc(msg_id)}</code>"
-            f"\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"))
-    except RuntimeError:
-        logger.debug("[TGAhermes] reaction log skipped (no running loop)")
+    _note_reaction(chat_id, msg_id, label)
 
 
 # ---------------------------------------------------------------- answerGuestQuery helpers
@@ -1012,6 +1131,34 @@ def _biz_chat_known(chat_id: Any) -> bool:
         return False
 
 
+# Last admitted event kind per chat. A chat id alone must never decide delivery:
+# a friend's business chat and their plain DM with the bot share the same
+# numeric id, and "has business history" was injecting every plain bot reply
+# (and its typing/clarify/media) into the owner's personal DM as if the owner
+# had written it. Business turns mark themselves; every other admitted event
+# marks plain; send_final_ledgered re-marks authoritatively at reply time.
+_BIZ_CTX: Dict[str, str] = {}
+
+def _biz_mark(chat_id: Any, kind: str) -> None:
+    if not chat_id:
+        return
+    if len(_BIZ_CTX) > 400:
+        _BIZ_CTX.clear()
+    _BIZ_CTX[str(chat_id)] = kind
+
+
+def _biz_wants_owner(chat_id: Any) -> bool:
+    """True when a send into this chat should go out as the owner (business).
+
+    A known business chat whose current turn is plain must be delivered by
+    the bot. Before any event is seen (boot sweep / ledger redelivery) keep
+    the old chat-history behaviour so recovery still lands as the owner."""
+    ctx = _BIZ_CTX.get(str(chat_id or ""))
+    if ctx:
+        return ctx == "business"
+    return _biz_chat_known(chat_id)
+
+
 def _biz_list_patch(key: str, raw: str) -> list:
     """Wizard input -> updated list: 'all' clears, '-x' removes, 'x' adds."""
     cur = [str(x) for x in (settings().get(key) or [])]
@@ -1238,6 +1385,7 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
         md["business_chat_id"] = chat_id
         md["biz_lang"] = lang
         md["biz_mode"] = mode
+    _biz_mark(chat_id, "business")
     try:
         event.source.user_id = uid or event.source.user_id
     except Exception:
@@ -1389,7 +1537,7 @@ def _install_wraps(adapter: Any) -> None:
 
     async def send(chat_id: Any, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> "SendResult":
-        if _biz_chat_known(chat_id):
+        if _biz_wants_owner(chat_id):
             _ok = await _biz_send(adapter, chat_id, str(content or ""))
             return SendResult(success=bool(_ok), message_id=None)
         if _is_guest_chat(chat_id):
@@ -1413,10 +1561,16 @@ def _install_wraps(adapter: Any) -> None:
             else:
                 logger.info("[TGAhermes] empty final for guest query %s", gqid)
             return SendResult(success=True, message_id=None), adapter
+        _fchat = getattr(getattr(event, "source", None), "chat_id", "")
         if str(md.get("business_connection_id") or ""):
+            _biz_mark(_fchat, "business")
             return await _biz_deliver(adapter, event,
                                       str(md["business_connection_id"]),
                                       text_content)
+        # Non-business final: every send belonging to this turn (including the
+        # delivery below) must go out as the bot, even for chats with business
+        # history — otherwise the reply lands in the owner's personal DM.
+        _biz_mark(_fchat, "plain")
         result, who = await _orig_sfl(event, session_key, text_content, metadata,
                                       reply_to=reply_to,
                                       is_ephemeral_response=is_ephemeral_response)
@@ -1431,7 +1585,7 @@ def _install_wraps(adapter: Any) -> None:
     adapter.send_final_ledgered = send_final_ledgered
 
     async def send_clarify(chat_id, question, choices, clarify_id, session_key, metadata=None):
-        if _biz_chat_known(chat_id):
+        if _biz_wants_owner(chat_id):
             try:
                 from tools.clarify_gateway import mark_awaiting_text
                 if choices:
@@ -1556,7 +1710,7 @@ def _install_wraps(adapter: Any) -> None:
     adapter._notify_turn_error = _notify_turn_error
 
     async def send_typing(chat_id, metadata=None):
-        if _biz_chat_known(chat_id):
+        if _biz_wants_owner(chat_id):
             _bc = _BIZ_CONN.get(str(chat_id) or "") or _active_bcid()
             if _bc:
                 try:
@@ -1637,7 +1791,7 @@ def _install_wraps(adapter: Any) -> None:
                     if chat is None and args:
                         chat = args[0]
                     chat = str(chat or "")
-                    if chat and _biz_chat_known(chat) and "business_connection_id" not in kwargs:
+                    if chat and _biz_wants_owner(chat) and "business_connection_id" not in kwargs:
                         _bc = _BIZ_CONN.get(chat) or _active_bcid()
                         if _bc:
                             kwargs["business_connection_id"] = _bc
@@ -2314,6 +2468,7 @@ _TOGGLES: Dict[str, Tuple[str, str]] = {
     "bizlarp": ("biz_larp", "\U0001f3ad LARP voice"),
     "bizmedia": ("biz_media", "\U0001f5bc\ufe0f Media in + out"),
     "bizfull": ("biz_full_access", "\U0001f513 Full access (all tools)"),
+    "userbridge": ("user_bridge", "\U0001f513 Full unlock (act as you)"),
 }
 
 
@@ -2334,6 +2489,27 @@ def _tg_next(sub: str, st: Dict[str, Any]) -> Any:
     return not bool(st.get(ent[0]))
 
 
+def _ub_cfm(st: Dict[str, Any]) -> str:
+    """Confirm screen for Full unlock: explanation + the danger warning."""
+    nxt = _tg_next("userbridge", st)
+    head = ("<b>\U0001f513 Full unlock (act as you)</b>\n"
+            f"now: <b>{'on' if st.get('user_bridge') else 'off'}</b> → "
+            f"<b>{'on' if nxt else 'off'}</b>\n\n")
+    if not nxt:
+        return (head + "Tap ✅ Apply to drop the owner-session connection and "
+                "stop the reaction listener, ✖ Cancel to go back.")
+    return (head +
+            "Connects a <b>copy of your own Telegram session</b> to the gateway "
+            "so ATRA acts <b>as you</b> where the Bot API cannot: reactions "
+            "inside business chats — set them, see them live.\n\n"
+            "<b>\u26a0\ufe0f DANGER:</b> a user account running automation can trip "
+            "Telegram flood limits or get banned. Nobody has been banned so far, "
+            "but that is luck, not a guarantee. The live session file is never "
+            "touched (read-once backup copy), credentials live outside the repo, "
+            "and you can turn this off any time.\n\n"
+            "Tap ✅ Apply to change, ✖ Cancel to go back.")
+
+
 def _tg_view(sub: str, origin: str, st: Dict[str, Any]) -> str:
     """Confirm screen body — now → next, nothing applied until Apply."""
     if sub == "mode":
@@ -2351,6 +2527,8 @@ def _tg_view(sub: str, origin: str, st: Dict[str, Any]) -> str:
                 "assistant: ATRA answers as itself · mimic: writes in your voice · "
                 "off: stay silent\n\n"
                 "Tap ✅ Apply to change, ✖ Cancel to go back.")
+    if sub == "userbridge":
+        return _ub_cfm(st)
     ent = _TOGGLES.get(sub)
     if not ent:
         return "❌ unknown setting."
@@ -2391,6 +2569,8 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
                     "<b>strict</b> nothing · <b>balanced</b> reads only · "
                     "<b>open</b> anything — a stranger could act on this box.\n\n"
                     "Tap ✅ Apply to change, ✖ Cancel to go back.")
+        if sub == "userbridge":
+            return _ub_cfm(st)
         ent = _TOGGLES.get(sub)
         if not ent:
             return "❌ unknown setting."
@@ -2631,6 +2811,8 @@ _CATS: Dict[str, List[Dict[str, Any]]] = {
         {"kind": "cmd", "label": "➕ Add a friend", "cb": "panel:wiz:wladd"},
         {"kind": "cmd", "label": "➖ Remove a friend", "cb": "panel:wiz:wldel"},
         {"kind": "cmd", "label": "🎚 Set a friend's level", "cb": "panel:wiz:wlperm"},
+        {"kind": "bool", "key": "user_bridge", "sub": "userbridge",
+         "label": "\U0001f513 Full unlock (act as you) \u26a0\ufe0f"},
         {"kind": "cmd", "label": "🩺 Auth debug", "cb": "panel:wiz:authdbg"},
     ],
     "system": [
@@ -3859,6 +4041,10 @@ def _sweep_stale() -> None:
 
 
 async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **_) -> Optional[dict]:
+    if not _UB_STATE.get("probe"):
+        _UB_STATE["probe"] = 1
+        logger.info("[TGAhermes] probe: dispatch entered (bridge=%r)",
+                    settings().get("user_bridge"))
     _bump_owner_seen(event)  # Chat Automation: owner presence for warn-first
     """Observe + console: bang commands (skip), owner reactions, group mentions, owner mirror."""
     chat_for_error: Any = None
@@ -3869,6 +4055,10 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
         _plat = getattr(getattr(event, "source", None), "platform", None)
         if getattr(_plat, "value", _plat) != "telegram":
             return None
+        _md0 = getattr(event, "metadata", None) or {}
+        _biz_mark(getattr(getattr(event, "source", None), "chat_id", ""),
+                  "business" if (_md0.get("business_connection_id")
+                                 or _md0.get("business_chat_id")) else "plain")
         if getattr(event, "internal", False):
             return None
         st = settings()
@@ -3882,6 +4072,9 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
             if ad is not None:
                 _ADAPTER["adapter"] = ad
         if ad is None:
+            if not _UB_STATE.get("probe_ad"):
+                _UB_STATE["probe_ad"] = 1
+                logger.info("[TGAhermes] probe: dispatch early-return (no adapter)")
             return None
         # Hot-reload rewire trigger: see _maybe_rewire — one check on the first
         # dispatched message makes the adapter rewire, the factory's per-deploy
@@ -3891,6 +4084,26 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
         # after ANY factory re-run.
         _maybe_rewire()
         _sweep_stale()
+        # Full unlock: arm the owner-session listener on the first inbound
+        # after a (re)load — dispatch always runs inside the gateway loop.
+        if not _UB_STATE.get("probe_kick_zone"):
+            _UB_STATE["probe_kick_zone"] = 1
+            logger.info("[TGAhermes] probe: reached kick zone (kicked=%r)",
+                        _UB_STATE["kicked"])
+        if not _UB_STATE["kicked"] and settings().get("user_bridge"):
+            _UB_STATE["kicked"] = True
+            try:
+                asyncio.get_running_loop().create_task(_ub_start(ad))
+                logger.info("[TGAhermes] owner-session listener kick dispatched")
+            except RuntimeError:
+                _UB_STATE["kicked"] = False
+                logger.info("[TGAhermes] owner-session listener kick deferred (no loop)")
+            except Exception:
+                _UB_STATE["kicked"] = False
+                logger.warning("[TGAhermes] owner-session listener kick failed",
+                               exc_info=True)
+        elif not settings().get("user_bridge"):
+            logger.info("[TGAhermes] owner-session kick skipped (user_bridge off)")
         # Push file-side allow_from into the adapter's wire-time snapshot. A CLI
         # `hermes config set` writes the file but never reaches the running
         # prefilter, so without this a freshly whitelisted user keeps bouncing
@@ -4198,6 +4411,12 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                             await _log("🛡 Guest owner access",
                                        f"{'enabled' if on else 'disabled'} for "
                                        "unlocked guest chats")
+                        elif _ts == "userbridge":
+                            await _ub_apply(on)
+                            await _log("🔓 Full unlock — act as you",
+                                       _BRIDGE_ON_LOG if on else
+                                       "<b>disabled</b> — owner session "
+                                       "connection dropped, listener stopped.")
                     else:
                         note = "❌ unknown setting."
                         view = "settings"
@@ -5330,6 +5549,19 @@ def register(ctx) -> None:
         ctx.register_hook("pre_tool_call", _on_pre_tool_call)
         ctx.register_hook("post_tool_call", _on_post_tool_call)
         ctx.register_hook("gateway_platform_event", _on_gateway_event)
+        # Full unlock: arm the owner-session listener now if we are already
+        # inside the gateway loop; the first inbound dispatch arms it otherwise.
+        if settings().get("user_bridge"):
+            try:
+                asyncio.get_running_loop().create_task(_ub_start())
+                _UB_STATE["kicked"] = True
+                logger.info("[TGAhermes] register kick dispatched (bridge on)")
+            except RuntimeError:
+                logger.info("[TGAhermes] register kick deferred (no loop, bridge on)")
+            except Exception:
+                logger.warning("[TGAhermes] register kick failed", exc_info=True)
+        else:
+            logger.info("[TGAhermes] register kick skipped (bridge off)")
         ctx.register_tool(name="telegram_admin", toolset="telegram_admin",
                           schema=_TOOL_SCHEMA, handler=_tool_handler_json,
                           description=_TOOL_DESCRIPTION, emoji="\U0001f6e1️", is_async=True,

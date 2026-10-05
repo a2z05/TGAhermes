@@ -1,5 +1,6 @@
 {
   "owner_id": "YOUR_TELEGRAM_USER_ID",
+  "user_bridge": false,
   "log_channel": null,
   "unauthorized_reply": "I only serve to my owner",
   "unauthorized_cooldown_s": 3600,
