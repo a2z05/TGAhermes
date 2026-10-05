@@ -2070,7 +2070,7 @@ _flows = {_c[len("panel:wiz:"):] for _c in _cat_cbs if _c.startswith("panel:wiz:
 check(not [f for f in _flows if f not in mod._WIZ_FLOWS],
       "every wizard flow a category offers exists")
 _subs = {_c.split(":")[2] for _c in _cat_cbs if _c.startswith("panel:tg:")}
-check(not [s for s in _subs if s not in ("mode", *mod._TOGGLES)],
+check(not [s for s in _subs if s not in (*mod._TENUMS, *mod._TOGGLES)],
       "every confirm sub-key a category offers resolves")
 check(all(len(_c.encode()) <= 64 for _c in _cat_cbs),
       "category callbacks inside Telegram's 64-byte cap")

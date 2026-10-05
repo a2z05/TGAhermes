@@ -36,6 +36,7 @@ registry lives in ``state.json``. Persona: ``<hermes_home>/assets/guest_persona.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import html
 import json
 import logging
@@ -47,7 +48,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -136,9 +137,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # --- whitelisted-friend permissions ------------------------------
     # Per-user tool level for a whitelisted friend's own DM session:
     #   "talk" — only the safe read-only set (web, vision, skills)
-    #   "gate" — the same rules as the guest tool gate above (default)
-    #   "full" — no tool gating (the old whitelisted behavior)
-    "whitelist_perms": {},          # {"<user_id>": "talk"|"gate"|"full"}
+    #   "free" — everything works except destructive/credential tools
+    #            (default; "gate" is accepted as its old name)
+    #   "full" — no tool gating at all (the old whitelisted behavior)
+    "whitelist_perms": {},          # {"<user_id>": "talk"|"free"|"full"}
     "user_bridge": False,           # Full unlock: owner-session bridge (act as you)
     # What a locked guest session answers (rate-limited by the cooldown).
     "guest_locked_reply": "This session is locked by the owner.",
@@ -161,6 +163,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "biz_deny_tools": [],            # extra tools locked on automation chats
     "biz_full_access": False,        # unlock every tool on business chats (owner accepts risk)
 
+    # --- automation schedule / session separation (owner-set, per chat overridable) ---
+    "biz_schedule": "always",        # always | off | window  — master switch
+    "biz_window_start": "00:00",     # window mode only, HH:MM local
+    "biz_window_end": "23:59",       # window mode only (may wrap past midnight)
+    "biz_window_days": [],           # [] = every day; else ["mon","tue",...]
+    "biz_idle_delay_min": 0,         # wait this long when the owner was idle
+    "biz_owner_idle_min": 10,        # owner counts as idle after this many minutes
+    "biz_sessions_split": True,      # whitelisted DM != automation session
 }
 
 _FALLBACK_PERSONA = """I'm ATRA — named after Atropos, the Greek Fate who cuts the thread.
@@ -1039,15 +1049,31 @@ def _active_bcid() -> str:
 
 
 
-def _owner_idle() -> bool:
-    """Warn-first gate: True when the owner has not talked to ATRA for 15 min.
+def _owner_idle_for(st: Optional[Dict[str, Any]] = None) -> float:
+    """Minutes the owner has been silent. Cold process = 0.0 (just seen)."""
+    last = _OWNER_LAST_SEEN.get("t") or 0.0
+    if not last:
+        return 0.0
+    return max(0.0, (time.monotonic() - last) / 60.0)
+
+
+def _owner_idle(st: Optional[Dict[str, Any]] = None) -> bool:
+    """Warn-first gate: True when the owner has not talked to ATRA for the
+    configured window (default 10 min, owner-tunable via biz_owner_idle_min).
 
     The Bot API exposes no online status, so presence is inferred from the
     owner's own inbound traffic; a cold process starts idle (warn on)."""
-    last = _OWNER_LAST_SEEN.get("t") or 0.0
-    if not last:
-        return True
-    return (time.monotonic() - last) > 900.0
+    _s = st if isinstance(st, dict) else settings()
+    try:
+        need = float(_s.get("biz_owner_idle_min") or 10)
+    except Exception:
+        need = 10.0
+    if need <= 0:
+        return False
+    quiet = _owner_idle_for(_s)
+    if quiet <= 0.0:
+        return True   # never seen this process: treat as idle (fail loud, not silent)
+    return quiet >= need
 
 
 def _bump_owner_seen(event: Any) -> None:
@@ -1072,6 +1098,126 @@ def _bump_owner_seen(event: Any) -> None:
 # (Persian/Arabic from the local untracked JSON), keeping this file audit-clean.
 
 _BIZ_MODE_ORDER = ("assistant", "mimic", "off")
+_BIZ_THREAD_PREFIX = "bizauto:"
+_BIZ_SCHEDULE_ORDER = ("always", "window", "off")
+_BIZ_DAY_CODES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_BIZ_DAY_SET = set(_BIZ_DAY_CODES)
+
+
+def _biz_sched_st(st: Optional[Dict[str, Any]] = None) -> str:
+    """Master automation switch: always | window | off."""
+    _s = st if isinstance(st, dict) else settings()
+    v = str(_s.get("biz_schedule") or "always").strip().lower()
+    return v if v in _BIZ_SCHEDULE_ORDER else "always"
+
+
+def _biz_hhmm(value: Any, fallback: int) -> int:
+    """'HH:MM' -> minutes since midnight. Tolerant: bad input never raises."""
+    try:
+        s = str(value or "").strip()
+        if not s or ":" not in s:
+            return fallback
+        hh, mm = s.split(":", 1)
+        h, m = int(hh), int(mm)
+        if 0 <= h <= 24 and 0 <= m < 60:
+            return min(24 * 60, h * 60 + m)
+    except Exception:
+        pass
+    return fallback
+
+
+def _biz_window_now(now: Optional[datetime.datetime] = None) -> int:
+    return (now or datetime.datetime.now()).hour * 60 + (now or datetime.datetime.now()).minute
+
+
+def _biz_day_code(raw: Any) -> str:
+    """Resolve wizard input to a stored day code. Accepts any unique prefix so
+    'f', 'fr' and 'Fri' all land on 'fri' — requiring the full three letters
+    silently dropped the day instead of setting it, which read as a dead button.
+    Returns '' for 'all'/'clear'/'reset' and for anything unrecognised."""
+    s = str(raw or "").strip().lower()
+    if not s or s in ("all", "clear", "reset"):
+        return ""
+    hits = [c for c in _BIZ_DAY_SET if c.startswith(s)]
+    return hits[0] if len(hits) == 1 else ""
+
+
+def _biz_days_ok(raw: Any) -> bool:
+    """Wizard input: 'all', 'clear', or a day name/prefix."""
+    s = str(raw or "").strip().lower()
+    if s in ("all", "clear", "reset"):
+        return True
+    return bool(_biz_day_code(s))
+
+
+def _biz_days_patch(raw: Any) -> List[str]:
+    """Toggle one day in biz_window_days; 'all'/'clear' empties it (= every day)."""
+    day = _biz_day_code(raw)
+    cur = [str(d).strip().lower()[:3] for d in (settings().get("biz_window_days") or [])]
+    if not day:
+        return []
+    return [d for d in cur if d != day] + [day]
+
+
+def _biz_in_window(st: Optional[Dict[str, Any]] = None,
+                   now: Optional[datetime.datetime] = None) -> bool:
+    """True when the current local time is inside the owner's window.
+
+    Handles a window that wraps past midnight (e.g. 23:00 -> 07:00) and a
+    day-of-week filter; an empty day list means every day.
+    """
+    _s = st if isinstance(st, dict) else settings()
+    n = now or datetime.datetime.now()
+    days = {str(d).strip().lower()[:3] for d in (_s.get("biz_window_days") or [])}
+    if days and _BIZ_DAY_CODES[n.weekday()] not in days:
+        return False
+    start = _biz_hhmm(_s.get("biz_window_start"), 0)
+    end = _biz_hhmm(_s.get("biz_window_end"), 24 * 60 - 1)
+    if start == end:
+        return True
+    cur = n.hour * 60 + n.minute
+    if start < end:
+        return start <= cur <= end
+    return cur >= start or cur <= end   # wraps midnight
+
+
+def _biz_should_answer(st: Optional[Dict[str, Any]] = None,
+                       now: Optional[datetime.datetime] = None) -> Tuple[bool, str]:
+    """Master gate for the automation path. Returns (answer_now, reason).
+
+    This is the switch the owner asked for: automation fully off, always on,
+    or only inside a time window — evaluated before any brain work so a closed
+    window costs nothing and says nothing to the customer.
+    """
+    _s = st if isinstance(st, dict) else settings()
+    sched = _biz_sched_st(_s)
+    if sched == "off":
+        return False, "automation is switched off"
+    if sched == "window":
+        # Split the day filter from the clock check: both land in the log line,
+        # and "outside the configured window" on a filtered weekday sends you
+        # hunting the hours instead of the days list.
+        n = now or datetime.datetime.now()
+        days = {str(d).strip().lower()[:3] for d in (_s.get("biz_window_days") or [])}
+        if days and _BIZ_DAY_CODES[n.weekday()] not in days:
+            return False, f"today ({_BIZ_DAY_CODES[n.weekday()]}) is not in the allowed days"
+        if not _biz_in_window(_s, now):
+            return False, "outside the configured window"
+    return True, "in schedule"
+
+
+def _biz_idle_delay_s(st: Optional[Dict[str, Any]] = None) -> float:
+    """Seconds an automation turn waits when the owner is idle.
+
+    0 means answer immediately. The owner's example: idle threshold 10 min,
+    then wait 5 min before ATRA steps in — so a human who is away and returns
+    gets a chance to answer first.
+    """
+    _s = st if isinstance(st, dict) else settings()
+    try:
+        return max(0.0, float(_s.get("biz_idle_delay_min") or 0) * 60.0)
+    except Exception:
+        return 0.0
 
 
 def _biz_db_path() -> Path:
@@ -1305,6 +1451,27 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
                    f"\n<b>Text:</b> <i>{_esc(text[:500])}</i>"
                    f"\n<b>Action:</b> {_esc(action)}", buttons=prof)
         return
+    # --- master schedule switch: closed = silent, zero brain cost ----------
+    _in_sched, _why = _biz_should_answer(st)
+    if not _in_sched:
+        await _log("🤖 Chat Automation — held back",
+                   f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"
+                   f"\n<b>Text:</b> <i>{_esc(text[:300])}</i>"
+                   f"\n<b>Action:</b> {_esc(_why)} — nothing sent", buttons=prof)
+        return
+    # --- idle delay: owner was away -> hold the answer briefly ------------
+    _delay = _biz_idle_delay_s(st)
+    if _delay > 0 and _owner_idle(st):
+        _quiet = _owner_idle_for(st)
+        try:
+            await _log("🤖 Chat Automation — waiting for owner",
+                       f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"
+                       f"\n<b>Owner idle:</b> {_quiet:.1f} min · "
+                       f"<b>holding:</b> {_delay / 60.0:.1f} min "
+                       f"<i>(answer this without me if I am back)</i>", buttons=prof)
+        except Exception:
+            logger.debug("[TGAhermes] idle-delay log failed", exc_info=True)
+        await asyncio.sleep(_delay)
     # --- first-contact warning: once per chat, before ATRA's first reply ----
     warned = False
     if store is not None:
@@ -1343,7 +1510,12 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
             msg, msg_type, update_id=getattr(update, "update_id", None))
     except Exception:
         logger.exception("[TGAhermes] failed to build automation event")
-        await _biz_send(adapter, chat_id, "⚠️ Something went wrong — please try again.")
+        try:
+            await _log("Automation error (silent)",
+                       f"chat <code>{_esc(chat_id)}</code> · build failed")
+        except Exception:
+            logger.debug("[TGAhermes] automation build-failure log failed",
+                         exc_info=True)
         return
     event.text = adapter._clean_bot_trigger_text(event.text or "") or ""
     if msg_type is not MessageType.TEXT and not event.text:
@@ -1386,6 +1558,10 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
         md["biz_lang"] = lang
         md["biz_mode"] = mode
     _biz_mark(chat_id, "business")
+    if bool(st.get("biz_sessions_split", True)):
+        # Automation account-direct chats get their OWN session, separate from
+        # the whitelisted DM with the same person: same human, different hat.
+        event.source.thread_id = f"bizauto:{chat_id}"
     try:
         event.source.user_id = uid or event.source.user_id
     except Exception:
@@ -1598,8 +1774,15 @@ def _install_wraps(adapter: Any) -> None:
                 await _biz_send(adapter, chat_id, _qtext)
                 return SendResult(success=True, message_id=None)
             except Exception as _ce:
+                # Silent: no error text may leave through the automation path.
                 logger.warning("[TGAhermes] business clarify send failed: %s", _ce)
-                return SendResult(success=False, error=str(_ce))
+                try:
+                    await _log("Automation error (silent)",
+                               f"chat <code>{_esc(chat_id)}</code> · clarify failed")
+                except Exception:
+                    logger.debug("[TGAhermes] clarify-failure log failed",
+                                 exc_info=True)
+                return SendResult(success=True, message_id=None)
         if not _is_guest_chat(chat_id):
             return await _orig_sc(chat_id, question, choices, clarify_id, session_key, metadata)
         try:
@@ -1656,18 +1839,25 @@ def _install_wraps(adapter: Any) -> None:
         md = getattr(event, "metadata", None) or {}
         gqid = md.get("guest_query_id")
         if str(md.get("business_connection_id") or ""):
-            # A customer chat never sees a raw traceback: log it, apologise.
+            # Automation errors are log-channel only by design: the customer must
+            # never receive an error/notification/cron-style message through the
+            # automation path. Attempt counter + log entry, no outbound send.
             logger.error("[TGAhermes] automation turn failed: %s", e)
+            try:
+                _biz_err_total = int(globals().get("_BIZ_ERR_TOTAL", 0) or 0) + 1
+                globals()["_BIZ_ERR_TOTAL"] = _biz_err_total
+            except Exception:
+                _biz_err_total = -1
             _esrc = getattr(event, "source", None)
             _ecid = str(getattr(_esrc, "chat_id", "") or "")
-            if _ecid:
-                try:
-                    await _biz_send(adapter, _ecid,
-                                    "⚠️ Something went wrong — please try again "
-                                    "in a moment.")
-                except Exception:
-                    logger.debug("[TGAhermes] automation error notice failed",
-                                 exc_info=True)
+            try:
+                await _log("Automation error (silent)",
+                           f"chat <code>{_esc(_ecid)}</code> · "
+                           f"total <b>{_biz_err_total}</b> · "
+                           f"<code>{_esc(f'{type(e).__name__}: {e}'[:300])}</code>")
+            except Exception:
+                logger.debug("[TGAhermes] automation error log failed",
+                             exc_info=True)
             return None
         if not gqid:
             result = await _orig_nte(event, e)
@@ -1775,8 +1965,14 @@ def _install_wraps(adapter: Any) -> None:
     # photos/files/gifs/stickers/typing in automation chats leave as the owner
     # instead of failing as a bot that is not in that chat.
     _biz_bot = getattr(adapter, "_bot", None)
-    if _biz_bot is not None and not getattr(_biz_bot, "_tga_biz_media", False):
-        setattr(_biz_bot, "_tga_biz_media", True)
+    # NB: PTB 22.8 Bot/ExtBot are slotted — setting arbitrary attributes on the bot
+    # instance raises and used to abort the whole install. The "already wrapped" marker
+    # lives on the adapter, which is a normal object.
+    if _biz_bot is not None and not getattr(adapter, "_tga_biz_media", False):
+        try:
+            setattr(adapter, "_tga_biz_media", True)
+        except Exception:
+            logger.debug("[TGAhermes] adapter marker failed", exc_info=True)
         for _bn in ("send_photo", "send_video", "send_audio", "send_document",
                     "send_animation", "send_sticker", "send_video_note", "send_voice",
                     "send_media_group", "send_chat_action", "send_location",
@@ -1999,10 +2195,13 @@ def _is_authorized_user(uid: str, owner: str = "") -> bool:
 # ------------------------------------------------------------- access-control helpers
 # Whitelisted friends carry a permission level for their own DM session:
 #   talk — only the safe read-only set (web/vision/skills)
-#   gate — the guest tool gate's rules, deny list included (default)
-#   full — no tool gating (the old whitelisted behavior)
-_FRIEND_LEVELS = ("talk", "gate", "full")
-_FRIEND_LEVEL_LABEL = {"talk": "💬 talk only", "gate": "🛡 gated", "full": "🔓 full"}
+#   free — everything works except destructive/credential tools (default;
+#          "gate" is accepted as its old name)
+#   full — no tool gating at all (the old whitelisted behavior)
+_FRIEND_LEVELS = ("talk", "free", "full")
+_FRIEND_LEVEL_LABEL = {"talk": "💬 talk only", "free": "🛠 free", "full": "🔓 full"}
+# "gate" was the old name for "free" — old configs keep working.
+_FRIEND_LEVEL_ALIASES = {"gate": "free"}
 
 
 def _friend_level(uid: str) -> str:
@@ -2010,8 +2209,9 @@ def _friend_level(uid: str) -> str:
     uid = str(uid or "")
     if uid and uid == str(_owner_id() or ""):
         return "full"
-    lvl = str((settings().get("whitelist_perms") or {}).get(uid) or "gate").lower()
-    return lvl if lvl in _FRIEND_LEVELS else "gate"
+    lvl = str((settings().get("whitelist_perms") or {}).get(uid) or "free").lower()
+    lvl = _FRIEND_LEVEL_ALIASES.get(lvl, lvl)
+    return lvl if lvl in _FRIEND_LEVELS else "free"
 
 
 def _adapter_allow_raw() -> Any:
@@ -2243,6 +2443,10 @@ def _known_guests_view(st: Dict[str, Any]) -> str:
 def _help_view(key: str, st: Optional[Dict[str, Any]] = None) -> str:
     """One section (or the full list) as HTML."""
     st = st or settings()
+    if key == "sessions":
+        # The session page is LIVE data, not help text: it renders whatever is
+        # running right now so the 🛑/🧹 buttons next to it mean something.
+        return _sessions_body(st=st)
     if key == "full":
         return _help_text(st)
     if key in _CATS:
@@ -2468,8 +2672,17 @@ _TOGGLES: Dict[str, Tuple[str, str]] = {
     "bizlarp": ("biz_larp", "\U0001f3ad LARP voice"),
     "bizmedia": ("biz_media", "\U0001f5bc\ufe0f Media in + out"),
     "bizfull": ("biz_full_access", "\U0001f513 Full access (all tools)"),
-    "userbridge": ("user_bridge", "\U0001f513 Full unlock (act as you)"),
+    "userbridge": ("user_bridge", "🔓 Full unlock (act as you)"),
+    "bizsplit": ("biz_sessions_split", "🧮 split automation vs whitelist sessions"),
 }
+
+
+# Confirm sub-keys that CYCLE through an ordered list instead of flipping a
+# boolean. They are deliberately NOT in _TOGGLES: that registry feeds the
+# generic on/off writer, and a 3-way or numeric setting must never be reduced to
+# a bool by it. `_tg_next` / `_tg_view` / the Apply writer branch on them by name.
+_TENUMS: Tuple[str, ...] = ("mode", "bizmode", "bizsched",
+                            "bizidledelay", "bizownidle")
 
 
 def _tg_next(sub: str, st: Dict[str, Any]) -> Any:
@@ -2483,6 +2696,24 @@ def _tg_next(sub: str, st: Dict[str, Any]) -> Any:
         order_b = list(_BIZ_MODE_ORDER)
         return (order_b[(order_b.index(cur_b) + 1) % len(order_b)]
                 if cur_b in order_b else "assistant")
+    if sub == "bizsched":
+        cur_s = _biz_sched_st(st)
+        order_s = list(_BIZ_SCHEDULE_ORDER)
+        return order_s[(order_s.index(cur_s) + 1) % len(order_s)]
+    if sub == "bizidledelay":
+        order_d = [0, 1, 2, 5, 10, 15, 30]
+        try:
+            cur_d = int(st.get("biz_idle_delay_min") or 0)
+        except Exception:
+            cur_d = 0
+        return order_d[(order_d.index(cur_d) + 1) % len(order_d)] if cur_d in order_d else 0
+    if sub == "bizownidle":
+        order_o = [0, 5, 10, 15, 30, 60]
+        try:
+            cur_o = int(st.get("biz_owner_idle_min") or 10)
+        except Exception:
+            cur_o = 10
+        return order_o[(order_o.index(cur_o) + 1) % len(order_o)] if cur_o in order_o else 10
     ent = _TOGGLES.get(sub)
     if not ent:
         return None
@@ -2526,6 +2757,38 @@ def _tg_view(sub: str, origin: str, st: Dict[str, Any]) -> str:
                 f"<b>{_MODE_LABEL.get(nxt_b, nxt_b)}</b>\n\n"
                 "assistant: ATRA answers as itself · mimic: writes in your voice · "
                 "off: stay silent\n\n"
+                "Tap ✅ Apply to change, ✖ Cancel to go back.")
+    if sub == "bizsched":
+        cur_s = _biz_sched_st(st)
+        nxt_s = _tg_next("bizsched", st)
+        lmap = {"always": "always answer", "window": "inside window only",
+                "off": "switched off"}
+        body = (f"<b>\U0001f4d5 Automation schedule</b>\n"
+                f"now: <b>{lmap.get(cur_s, cur_s)}</b> → "
+                f"<b>{lmap.get(nxt_s, nxt_s)}</b>\n\n"
+                "always: answer every chat · window: only inside the window "
+                "below (days + HH:MM, may wrap midnight) · off: never answer.\n\n"
+                "Tap ✅ Apply to change, ✖ Cancel to go back.")
+        if nxt_s == "window":
+            body += (f"\n\nwindow: <b>{_esc(str(st.get('biz_window_start') or '00:00'))}</b>"
+                     f"–<b>{_esc(str(st.get('biz_window_end') or '23:59'))}</b>")
+        return body
+    if sub == "bizidledelay":
+        cur_d = int(st.get("biz_idle_delay_min") or 0) if str(st.get("biz_idle_delay_min") or 0).lstrip("-").isdigit() else 0
+        nxt_d = _tg_next("bizidledelay", st)
+        return (f"<b>\u23f3 Idle reply delay</b>\n"
+                f"now: <b>{cur_d} min</b> → <b>{nxt_d} min</b>\n\n"
+                "When you have been silent longer than the idle threshold below, "
+                "ATRA waits this long before answering — you get the chance to "
+                "answer first. 0 = answer immediately.\n\n"
+                "Tap ✅ Apply to change, ✖ Cancel to go back.")
+    if sub == "bizownidle":
+        cur_o = int(st.get("biz_owner_idle_min") or 10) if str(st.get("biz_owner_idle_min") or 10).lstrip("-").isdigit() else 10
+        nxt_o = _tg_next("bizownidle", st)
+        return (f"<b>\U0001f4c4 Owner idle threshold</b>\n"
+                f"now: <b>{cur_o} min</b> → <b>{nxt_o} min</b>\n\n"
+                "After this many minutes without a message from you, you count "
+                "as idle (warn-first and the idle delay both use it). 0 = never idle.\n\n"
                 "Tap ✅ Apply to change, ✖ Cancel to go back.")
     if sub == "userbridge":
         return _ub_cfm(st)
@@ -2652,19 +2915,21 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
 
     if kind == "wl":                      # panel:cfm:wl:<uid>:<level>
         uid, _, lvl = (arg or "").partition(":")
+        lvl = _FRIEND_LEVEL_ALIASES.get(lvl, lvl)
         if lvl in _FRIEND_LEVELS:
             cur = _friend_level(uid)
             return ("<b>🛡 Permission level</b>\n"
                     f"<code>{_esc(uid)}</code>: <b>"
                     f"{_FRIEND_LEVEL_LABEL.get(cur, cur)}</b> → <b>"
                     f"{_FRIEND_LEVEL_LABEL[lvl]}</b>\n\n"
-                    "<b>talk</b> safe read-only tools · <b>gate</b> the guest tool "
-                    "rules · <b>full</b> no tool gating.\n\n"
+                    "<b>talk</b> read-only tools · <b>free</b> everything except "
+                    "destructive/credential tools · <b>full</b> no tool gating at "
+                    "all.\n\n"
                     "Tap ✅ Apply to change, ✖ Cancel to go back.")
         return ("<b>🛡 Permission level</b>\n"
                 "Pick the level on this page.\n\n"
-                "<b>talk</b> safe read-only tools · <b>gate</b> the guest tool "
-                "rules · <b>full</b> no tool gating.")
+                "<b>talk</b> read-only tools · <b>free</b> everything except "
+                "destructive/credential tools · <b>full</b> no tool gating at all.")
 
     if kind == "gate":                    # panel:cfm:gate:<origin>:<grant|revoke>:<chat>
         word, _, chat = (arg or "").partition(":")
@@ -2744,9 +3009,24 @@ _CATS: Dict[str, List[Dict[str, Any]]] = {
         {"kind": "bool", "key": "biz_media", "sub": "bizmedia",
          "label": "\U0001f5bc\ufe0f Media in + out"},
         {"kind": "bool", "key": "biz_full_access", "sub": "bizfull",
-         "label": "\U0001f513 Full access (tools + admin in this chat)"},
+         "label": "🔓 Full access (tools + admin in this chat)"},
+        # --- when ATRA answers automation chats at all ---
+        {"kind": "enum", "key": "biz_schedule", "sub": "bizsched",
+         "label": "📕 Schedule (always / window / off)"},
+        {"kind": "text", "key": "biz_window_start", "flow": "bizwinstart",
+         "label": "🕐 Window start (HH:MM)"},
+        {"kind": "text", "key": "biz_window_end", "flow": "bizwinend",
+         "label": "🕑 Window end (HH:MM)"},
+        {"kind": "list", "key": "biz_window_days", "cb": "panel:wiz:bizdays",
+         "label": "📅 Window days (all when empty)"},
+        {"kind": "enum", "key": "biz_owner_idle_min", "sub": "bizownidle",
+         "label": "📄 You count as idle after (min)"},
+        {"kind": "enum", "key": "biz_idle_delay_min", "sub": "bizidledelay",
+         "label": "⏳ ATRA waits this long when you are away (min)"},
+        {"kind": "bool", "key": "biz_sessions_split", "sub": "bizsplit",
+         "label": "🧮 Separate automation vs whitelist sessions"},
         {"kind": "cmd", "cb": "panel:bizconn",
-         "label": "\U0001f50c Connection status"},
+         "label": "🔌 Connection status"},
     ],
     "log": [
         {"kind": "chan", "key": "log_channel", "label": "Log channel"},
@@ -2997,7 +3277,7 @@ def _wl_view(st: Dict[str, Any], note: str = "") -> str:
     if not friends:
         lines += ["", "No friends yet — tap ➕ Add a friend; the wizard asks for the id."]
     for uid in friends:
-        lvl = str((st.get("whitelist_perms") or {}).get(uid) or "gate")
+        lvl = _friend_level(uid)
         lines.append(f"• <code>{_esc(uid)}</code> — {_FRIEND_LEVEL_LABEL.get(lvl, lvl)} "
                      f"— tap to change level or remove")
     lines += [
@@ -3019,8 +3299,8 @@ def _wlfr_view(uid: str, st: Dict[str, Any]) -> str:
         f"level: <b>{_FRIEND_LEVEL_LABEL.get(lvl, lvl)}</b>",
         "",
         "<b>talk</b> — safe read-only tools (web, vision, skills)",
-        "<b>gate</b> — same rules as the guest tool gate",
-        "<b>full</b> — no tool gating",
+        "<b>free</b> — everything except destructive/credential tools",
+        "<b>full</b> — no tool gating at all",
         "",
         "Tap a level to apply immediately (same code as "
         "<code>!whitelist perms</code>). Removing asks for a confirm.",
@@ -3135,14 +3415,14 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         for _wuid in _read_allow_from():
             if _wuid == _wowner:
                 continue
-            _wlvl = str((st.get("whitelist_perms") or {}).get(_wuid) or "gate")
+            _wlvl = _friend_level(_wuid)
             add((f"{_FRIEND_LEVEL_LABEL.get(_wlvl, _wlvl)} · {_wuid}",
                  f"panel:wlfr:{_wuid}"))
         add(("➕ Add a friend — wizard", "panel:wiz:wladd"))
         add(("📋 Users", "panel:out:users"), ("🛡 Whitelist text", "panel:out:whitelist"))
         add(("🔍 Auth debug", "panel:wiz:authdbg"))
     elif view == "wlfr":
-        _frlvl = str((st.get("whitelist_perms") or {}).get(arg or "") or "gate")
+        _frlvl = _friend_level(arg or "")
         for _fl in _FRIEND_LEVELS:
             add(((f"✅ " if _fl == _frlvl else "") + _FRIEND_LEVEL_LABEL[_fl],
                  f"panel:wllvl:{arg}:{_fl}"))
@@ -3203,11 +3483,19 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         add((f"🛠 Tool {_mark('tool_enabled')}", "panel:tg:tool:status"),
             (f"👑 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:status"))
     elif view == "sessions":
-        if chat_id:
+        # One 🛑 per LIVE turn (index into _SESS_SNAP — a session key is
+        # longer than Telegram's 64-byte callback_data) and one 🧹 per open
+        # stored session. The body must render first: it is what refreshes
+        # both snapshots the buttons point at.
+        for _i, _k in enumerate(_SESS_SNAP[:8]):
+            _lane = "automation" if _BIZ_THREAD_PREFIX in _k else "chat"
+            _who = _esc(_k.rsplit(":", 1)[-1][:20])
+            add((f"🛑 Stop {_lane} {_who}", f"sessstop:{_i}"))
+        for _c in _SESS_WIPES[:8]:
+            add((f"🧹 Wipe {_esc(_c)}", f"wipe:{_c}"))
+        if chat_id and str(chat_id) not in _SESS_WIPES:
             add((f"🧹 Wipe this chat", f"wipe:{chat_id}"))
-        if log:
-            add((f"🧹 Wipe log chat", f"wipe:{log}"))
-        add(("⚙️ Settings", "panel:out:settings"))
+        add(("🔄 Refresh", "help:sessions"), ("⚙️ Settings", "panel:out:settings"))
     elif view == "bot":
         add((f"🛠 Tool {_mark('tool_enabled')}", "panel:tg:tool:bot"),
             (f"👑 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:bot"))
@@ -3238,7 +3526,11 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         add(("📜 Full help", "help:full"))
     if view == "cool":
         add(*[(f"{n}s", f"panel:cool:{n}") for n in (0, 60, 300, 3600)])
-    if chat_id and view in ("panel", "sessions", "access"):
+    if chat_id and view in ("panel", "sessions", "access") \
+            and (view != "sessions" or str(chat_id) not in _SESS_WIPES):
+        # In the sessions view every open chat already got its own 🧹 above —
+        # repeating it there just doubles the button. Everywhere else this
+        # stays: it is the panel's one-click "wipe where I'm standing".
         add((f"🧹 Wipe this chat", f"wipe:{chat_id}"))
     return rows
 
@@ -3381,11 +3673,13 @@ async def _whitelist_cmd(adapter: Any, arg: str) -> str:
     if sub in ("perms", "level"):
         bits2 = val.split(maxsplit=1)
         if len(bits2) != 2:
-            return ("Usage: <code>!whitelist perms &lt;user_id&gt; talk|gate|full</code>\n"
-                    "💬 talk = web/vision only · 🛡 gate = guest tool rules · 🔓 full = everything")
+            return ("Usage: <code>!whitelist perms &lt;user_id&gt; talk|free|full</code>\n"
+                    "💬 talk = web/vision only · 🛠 free = everything except "
+                    "destructive tools · 🔓 full = everything")
         target, lvl = bits2[0], bits2[1].strip().lower()
+        lvl = _FRIEND_LEVEL_ALIASES.get(lvl, lvl)
         if lvl not in _FRIEND_LEVELS:
-            return f"Unknown level <code>{_esc(lvl)}</code> — use talk, gate or full."
+            return f"Unknown level <code>{_esc(lvl)}</code> — use talk, free or full."
         if target != owner and target not in _read_allow_from():
             return f"<code>{_esc(target)}</code> is not whitelisted — add them first."
         perms = dict(settings().get("whitelist_perms") or {})
@@ -3571,6 +3865,139 @@ def _auth_debug(uid: str = "") -> str:
     return "\n".join(x for x in lines if x)
 
 
+def _session_key_for(adapter: Any, chat_id: Any) -> Optional[str]:
+    """Best-effort gateway session key for this chat (owner rail: stop).
+
+    Mirrors how the handle derives keys: walks the adapter's live sessions and
+    matches the trailing chat segment. None when nothing matches — the caller
+    then answers "nothing was running" instead of cancelling blindly.
+    """
+    try:
+        active = getattr(adapter, "_active_sessions", None) or {}
+        keys = list(active.keys())
+    except Exception:
+        keys = []
+    if not keys or chat_id is None:
+        return None
+    want = str(chat_id)
+    for k in keys:
+        ks = str(k)
+        if ks == want or ks.endswith(":" + want) or ks.endswith("/" + want):
+            return ks
+    for k in keys:
+        if want and want in str(k):
+            return str(k)
+    return None
+
+
+# Live session keys as the panel last rendered them: Telegram caps callback_data
+# at 64 bytes and a real session key ("agent:main:telegram:group:<id>:<uid>")
+# blows past that, so a stop button carries only an index into this snapshot.
+_SESS_SNAP: List[str] = []
+_SESS_WIPES: List[str] = []   # chat ids of open stored sessions, for 🧹 buttons
+
+
+def _sessions_body(adapter: Any = None, st: Optional[Dict[str, Any]] = None) -> str:
+    """Owner view: live turns + per-chat session rows (guest / friend / biz).
+
+    Sync on purpose — the panel body builder is sync, and this needs to render
+    there. Guest chatter lands in isolated one-person sessions; whitelisted
+    friends run their own DM session; automation turns run a split bizauto
+    session with the SAME human — three lanes, listed separately so you can see
+    at a glance which session type is actually busy.
+    """
+    global _SESS_SNAP, _SESS_WIPES
+    _SESS_WIPES = []
+    if adapter is None:
+        adapter = _ADAPTER.get("adapter")
+    lines: List[str] = ["\U0001f9f5 <b>Sessions</b>",
+                        "<b>Live now</b>"]
+    live = 0
+    snap: List[str] = []
+    try:
+        active = getattr(adapter, "_active_sessions", None) or {}
+        tasks = getattr(adapter, "_session_tasks", None) or {}
+        for k in list(active.keys()):
+            live += 1
+            ks = str(k)
+            snap.append(ks)
+            lane = "automation" if _BIZ_THREAD_PREFIX in ks else "chat"
+            busy = "busy" if k in tasks else "finishing"
+            _who = ks.rsplit(":", 1)[-1]
+            lines.append(f"\u2022 <b>{lane}</b> {_esc(_who)} \u2014 {busy}")
+    except Exception:
+        lines.append("\u2022 <i>live list unavailable</i>")
+    _SESS_SNAP = snap
+    if not live:
+        lines.append("<i>nothing running right now</i>")
+    try:
+        db = _hermes_home() / "state.db"
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            # The sessions table has no updated_at — it is last_activity_at,
+            # and the old column name made this whole query throw, so the view
+            # always read "no stored sessions yet" no matter what was stored.
+            rows = con.execute(
+                "SELECT source, chat_id, id, last_activity_at, ended_at "
+                "FROM sessions ORDER BY last_activity_at DESC LIMIT 12").fetchall()
+        finally:
+            con.close()
+    except Exception:
+        rows = []
+    if rows:
+        lines.append("")
+        lines.append("<b>Recent sessions</b> (type \u2014 chat \u2014 session id):")
+        _owner = str(_owner_id() or "")
+        _wl = {str(u) for u in _read_allow_from()}
+        for src, cid, sid, upd, ended in rows:
+            tag = str(cid or "")
+            sid_s = str(sid or "")
+            # Label by WHO owns the lane, not just membership: the owner's own
+            # session used to read as "friend" (they are in their own
+            # allowlist), and a business customer read as "other".
+            if _BIZ_THREAD_PREFIX in sid_s or _biz_chat_known(tag):
+                lane = "automation" if _BIZ_THREAD_PREFIX in sid_s else "business"
+            elif not tag or tag == "None":
+                # cron/internal runs persist a NULL chat_id — they are not
+                # chats, so label them instead of implying an unknown person.
+                lane = "cron" if str(sid_s).startswith("cron_") else "internal"
+            elif tag == _owner:
+                lane = "owner"
+            elif tag.startswith(GUEST_CHAT_PREFIX):
+                lane = "guest"
+            elif tag in _wl:
+                lane = "friend"
+            elif tag.startswith("-"):
+                lane = "group"
+            else:
+                lane = "dm"
+            age = ""
+            try:
+                secs = max(0, int(time.time()) - int(upd or 0))
+                age = f" · idle {_esc(_humanize(secs))}"
+            except Exception:
+                pass
+            state = "open" if ended is None else "ended"
+            if state == "open" and cid is not None and str(cid).strip() \
+                    and str(cid) != "None" and str(cid) not in _SESS_WIPES:
+                _SESS_WIPES.append(str(cid))
+            lines.append(f"\u2022 {lane} <b>[{state}]</b> \u2014 "
+                         f"<code>{_esc(str(cid))}</code>{age}\n"
+                         f"    <code>{_esc(str(sid)[:60])}</code>")
+    else:
+        lines.append("<i>no stored sessions yet</i>")
+    lines.append("")
+    lines.append("Tap 🛑 next to a live turn to stop it, 🧹 to wipe that "
+                 "chat's history. CLI: <code>!stop [chat_id]</code> · "
+                 "<code>!wipe &lt;chat_id&gt;</code>.")
+    return "\n".join(lines)
+
+
+async def _sessions_view(adapter: Any) -> str:
+    """Async wrapper: the bang command predates the sync panel body."""
+    return _sessions_body(adapter)
+
+
 async def _bang_execute(adapter: Any, chat_id: str, text: str,
                         session_store: Any = None) -> Optional[str]:
     """Run one bang command; returns the reply text (the caller decides delivery)."""
@@ -3580,7 +4007,31 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
     st = settings()
     reply: Optional[str] = None
 
-    if cmd == "!help":
+    if cmd in ("!stop", "!st"):
+        # Stop the turn ATRA is running for this chat — or for another chat,
+        # when its id is given: !stop -100123 cancels that chat's session too.
+        _target = arg.strip() or str(chat_id)
+        _k = _session_key_for(adapter, _target)
+        _cancelled = False
+        if _k:
+            try:
+                _active = getattr(adapter, "_active_sessions", {}) or {}
+                if _k in _active:
+                    await adapter.cancel_session_processing(_k)
+                    _cancelled = True
+            except Exception as e:
+                reply = f"\u274c stop failed: {_esc(type(e).__name__)}: {_esc(str(e)[:200])}"
+        if reply is None:
+            reply = ("\u2705 stopped \u2014 nothing was running here."
+                     if not _cancelled else
+                     "\u2705 stopped \u2014 the running turn was cancelled and "
+                     "queued messages were dropped.")
+            await _log("\U0001f6d1 Turn stopped",
+                       f"Owner stopped the turn in <code>{_esc(chat_id)}</code>"
+                       + (f" (session <code>{_esc(_k)}</code>)" if _k else ""))
+    elif cmd == "!sessions":
+        reply = await _sessions_view(adapter)
+    elif cmd == "!help":
         reply = _help_text(st)
     elif cmd == "!panel":
         reply = _panel_text(st)
@@ -3793,6 +4244,29 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
         "save": lambda d: {"biz_deny_tools": _biz_list_patch("biz_deny_tools", d[0])},
         "validate": lambda d: "" if d[0].strip() else "send a tool name, 'all', or '-name'",
         "done": "automation tool lock updated."},
+    "bizwinstart": {
+        "prompts": ["\U0001f550 <b>Automation - window start</b>\n\nSend the start as "
+                    "<code>HH:MM</code> (24h, e.g. <code>09:00</code>).\n"
+                    "<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"biz_window_start": d[0].strip()[:5]},
+        "validate": lambda d: "" if _biz_hhmm(d[0], -1) >= 0 else "send HH:MM, e.g. 09:00",
+        "done": "window start updated."},
+    "bizwinend": {
+        "prompts": ["\U0001f551 <b>Automation - window end</b>\n\nSend the end as "
+                    "<code>HH:MM</code> (24h, e.g. <code>23:00</code> - earlier than "
+                    "the start means the window wraps past midnight).\n"
+                    "<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"biz_window_end": d[0].strip()[:5]},
+        "validate": lambda d: "" if _biz_hhmm(d[0], -1) >= 0 else "send HH:MM, e.g. 23:00",
+        "done": "window end updated."},
+    "bizdays": {
+        "prompts": ["\U0001f4c5 <b>Automation - window days</b>\n\nSend a day "
+                    "to toggle it (<code>mon tue wed thu fri sat sun</code>), "
+                    "<code>all</code> for every day, or <code>clear</code> to "
+                    "reset to all.\n<i>Type cancel to abort.</i>"],
+        "save": lambda d: {"biz_window_days": _biz_days_patch(d[0])},
+        "validate": lambda d: "" if _biz_days_ok(d[0]) else "send a day name, 'all', or 'clear'",
+        "done": "window days updated."},
     "wladd": {
         "prompts": ["🛡 <b>Add to whitelist</b>\n\nSend the user id (or @username).\n"
                     "<i>Type cancel to abort.</i>"],
@@ -3827,8 +4301,8 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
                     "user id.\n<i>Type cancel to abort.</i>",
                     "🛡 <b>Step 2/2</b> — send the level:\n"
                     "  <b>talk</b> — safe tools only (web, vision, skills)\n"
-                    "  <b>gate</b> — same rules as the guest tool gate\n"
-                    "  <b>full</b> — no tool gating\n"
+                    "  <b>free</b> — everything except destructive/credential tools\n"
+                    "  <b>full</b> — no tool gating at all\n"
                     "<i>Type cancel to abort.</i>"],
         "build": lambda d: f"!whitelist perms {d[0]} {d[1]}"},
     "authdbg": {
@@ -4196,6 +4670,8 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
             _braw = getattr(event, "raw_message", None)
             if getattr(_braw, "business_connection_id", None):
                 return None
+            if str(getattr(src, "thread_id", "") or "").startswith(_BIZ_THREAD_PREFIX):
+                return None   # automation session: Chat Automation already logged it
             in_group = (src.chat_type or "") in ("group", "supergroup", "forum", "channel")
             is_friend = uid in _read_allow_from()
             if is_friend or in_group:   # stranger DMs = guest zone, already logged there
@@ -4299,6 +4775,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             elif action == "wllvl":
                 # v3.3: changing a friend's permission level confirms first.
                 lvl = bits[4] if len(bits) > 4 else ""
+                lvl = _FRIEND_LEVEL_ALIASES.get(lvl, lvl)
                 if sub and lvl in _FRIEND_LEVELS:
                     view, arg = "cfm", f"wl:wl:{sub}:{lvl}"
                     body = _cfm_view("wl", f"{sub}:{lvl}", st)
@@ -4400,6 +4877,38 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                                 f"<b>{_MODE_LABEL.get(nxt, nxt)}</b>")
                         await _log("\U0001f916 Chat Automation",
                                    f"Mode → <b>{nxt}</b> "
+                                   f"(owner {_esc(str(_owner_id()))})")
+                    elif _ts == "bizsched":
+                        nxt = _tg_next("bizsched", st)
+                        save_settings({"biz_schedule": nxt})
+                        st = settings()
+                        note = (f"\U0001f4d5 schedule → <b>{_esc(nxt)}</b>"
+                                + (f" ({_esc(str(st.get('biz_window_start')))}"
+                                   f"–{_esc(str(st.get('biz_window_end')))})"
+                                   if nxt == "window" else ""))
+                        await _log("\U0001f4d5 Chat Automation schedule",
+                                   f"Schedule → <b>{_esc(nxt)}</b>"
+                                   + (f" · window "
+                                      f"{_esc(str(st.get('biz_window_start')))}"
+                                      f"–{_esc(str(st.get('biz_window_end')))}"
+                                      if nxt == "window" else "")
+                                   + f" (owner {_esc(str(_owner_id()))})")
+                    elif _ts == "bizidledelay":
+                        nxt = int(_tg_next("bizidledelay", st))
+                        save_settings({"biz_idle_delay_min": nxt})
+                        st = settings()
+                        note = f"\u23f3 idle reply delay → <b>{nxt} min</b>"
+                        await _log("\u23f3 Chat Automation idle delay",
+                                   f"Idle reply delay → <b>{nxt} min</b> "
+                                   f"(owner idle after "
+                                   f"{_esc(str(st.get('biz_owner_idle_min')))} min)")
+                    elif _ts == "bizownidle":
+                        nxt = int(_tg_next("bizownidle", st))
+                        save_settings({"biz_owner_idle_min": nxt})
+                        st = settings()
+                        note = f"\U0001f4c4 owner idle after <b>{nxt} min</b>"
+                        await _log("\U0001f4c4 Owner idle threshold",
+                                   f"Owner counts as idle after <b>{nxt} min</b> "
                                    f"(owner {_esc(str(_owner_id()))})")
                     elif _ts in _TOGGLES:
                         key, label = _TOGGLES[_ts]
@@ -4518,6 +5027,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     body = _gate_view(st, note)
                 elif _kind == "wl":
                     _wuid, _, _wlvl = _pay.partition(":")
+                    _wlvl = _FRIEND_LEVEL_ALIASES.get(_wlvl, _wlvl)
                     view = "wl"
                     if _wuid and _wlvl in _FRIEND_LEVELS:
                         out = await _bang_execute(ad, _msg_chat_id(q.message) or "",
@@ -4613,6 +5123,35 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                            f"uid <code>{_esc(_uid)}</code> in <code>{_esc(_chat)}</code> (button)")
             except Exception as e:
                 await q.answer(f"Failed: {str(e)[:80]}")
+            return
+        if data.startswith(f"{_CB_PREFIX}sessstop:"):
+            # 🛑 on a live turn: cancel that session's in-flight processing.
+            # The button carries an index because a full session key ("agent:
+            # main:telegram:group:<id>:<uid>") exceeds callback_data's 64 bytes.
+            _idx_s = data.split(":", 2)[2]
+            try:
+                _idx = int(_idx_s)
+            except ValueError:
+                _idx = -1
+            _key = _SESS_SNAP[_idx] if 0 <= _idx < len(_SESS_SNAP) else None
+            if not _key:
+                await q.answer("that turn already finished", show_alert=False)
+                return
+            _cancel = getattr(ad, "cancel_session_processing", None)
+            if _cancel is None:
+                await q.answer("session control unavailable", show_alert=True)
+                return
+            try:
+                await _cancel(_key)
+                await q.answer("stopped ✅", show_alert=False)
+                await _log("🛑 Session stopped",
+                           f"<code>{_esc(_key)}</code> (panel button)")
+            except Exception as _e:
+                logger.warning("[TGAhermes] sessstop failed: %s", _e)
+                await q.answer(f"stop failed: {str(_e)[:70]}", show_alert=True)
+            # Re-render so the button disappears with its turn.
+            _s2 = settings()
+            await _panel_edit(q, _sessions_body(st=_s2), "sessions", _s2)
             return
         if data.startswith(f"{_CB_PREFIX}wipe:"):
             _chat = data.split(":", 2)[2]
@@ -5049,20 +5588,26 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
         _bchat = str(session_id).split(":", 1)[-1]
     if _bchat and _biz_chat_known(_bchat):
         st_b = settings()
+        # The customer must never receive an error/notification for a blocked
+        # tool: the refusal below is agent-facing ONLY — log it, and the agent
+        # answers without the tool. Nothing error-like goes out over the
+        # automation connection.
+        def _biz_quiet_refusal(_n: str) -> str:
+            return (f"BLOCKED (policy, not a transient error): `{_n}` is not available "
+                    f"in this chat. Do NOT relay this message, any error, or any "
+                    f"notification to the customer — answer now without the tool.")
         if st_b.get("biz_full_access"):
             # Full access: every tool except credentials — vault reads paste
             # secrets straight into a customer conversation, those stay locked.
             if name.startswith("browser_vault"):
                 _cnt = _bump_block(session_id)
-                return {"action": "block",
-                        "message": _biz_refusal(name, repeats=max(0, _cnt - 1))}
+                return {"action": "block", "message": _biz_quiet_refusal(name)}
             return None
         if name in _biz_denied(st_b) or _tripwire_danger(name, args):
             _cnt = _bump_block(session_id)
             logger.warning("[TGAhermes] automation tool refused: %s (block#%d)",
                            name, _cnt)
-            return {"action": "block",
-                    "message": _biz_refusal(name, repeats=max(0, _cnt - 1))}
+            return {"action": "block", "message": _biz_quiet_refusal(name)}
         return None
     info = _guest_session_info(session_id)
     if info is None:
@@ -5075,16 +5620,25 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
             owner = str(_owner_id() or "")
             if uid and uid != owner and uid in _read_allow_from():
                 level = _friend_level(uid)
-                danger = level != "full" and (
-                    level == "talk"
-                    or name in _guest_allowed(frozenset())
-                    or _tripwire_danger(name, args))
-                if danger:
-                    count = _bump_block(session_id)
-                    logger.warning("[TGAhermes] friend tool refused: %s (uid=%s level=%s block#%d)",
-                                   name, uid, level, count)
-                    return {"action": "block",
-                            "message": _friend_refusal(name, uid, level, repeats=count - 1)}
+                # A whitelisted friend in their OWN DM is trusted to get work
+                # done: everything runs EXCEPT the things that break the box —
+                # the NEVER tools (credentials, acting-as-you, spawning work),
+                # the tripwires (destructive args/paths), and for talk-level
+                # friends anything that is not read/talk. The old gate wired
+                # 'gate' friends into the full guest blocklist, so half the
+                # tools a friend would reasonably ask for were refused.
+                if level != "full":
+                    hard = (name in GUEST_NEVER_TOOLS
+                            or _tripwire_danger(name, args))
+                    if level == "talk":
+                        hard = hard or name not in (*GUEST_SAFE_TOOLS,
+                                                    *GUEST_READ_TOOLS)
+                    if hard:
+                        count = _bump_block(session_id)
+                        logger.warning("[TGAhermes] friend tool refused: %s (uid=%s level=%s block#%d)",
+                                       name, uid, level, count)
+                        return {"action": "block",
+                                "message": _friend_refusal(name, uid, level, repeats=count - 1)}
         return None
     st = settings()
     # The owner has full access in their own DM, so gating them in their guest
