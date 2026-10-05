@@ -20,15 +20,29 @@ DEPLOY=${TGM_DEPLOY:-$(cd "$REPO/../.." && pwd)/plugins/$(basename "$REPO")}
 # the interpreter that runs Hermes, not a bare python3. Look for one that can
 # actually import them; TGM_PYTHON overrides the search entirely.
 find_python() {
-  local c
+  local c d p
   for c in "${TGM_PYTHON:-}" "${HERMES_PYTHON:-}" \
            "$(command -v python3 2>/dev/null)"; do
     [ -n "$c" ] && [ -x "$c" ] || continue
     "$c" -c "import telegram" >/dev/null 2>&1 && { echo "$c"; return 0; }
   done
-  for c in /hermes/.venv/bin/python "$(dirname "$(dirname "$REPO")")"/hermes/.venv/bin/python; do
-    [ -x "$c" ] && "$c" -c "import telegram" >/dev/null 2>&1 && { echo "$c"; return 0; }
+  # Walk up from the repo looking for the Hermes venv. A checkout keeps it at
+  # <root>/hermes/.venv or <root>/.venv, and the repo itself usually sits at
+  # <root>/projects/<name> — so climbing covers both, plus the container's
+  # /hermes/.venv, without ever naming a host path (the pre-push audit blocks
+  # those, and a literal one would not survive a move anyway).
+  d=$REPO
+  while :; do
+    for p in "$d/hermes/.venv/bin/python" "$d/.venv/bin/python"; do
+      [ -x "$p" ] && "$p" -c "import telegram" >/dev/null 2>&1 && { echo "$p"; return 0; }
+    done
+    [ "$d" = "/" ] && break
+    d=$(dirname "$d")
   done
+  # Invoked from inside a venv already? Reuse it rather than guessing.
+  if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    "$VIRTUAL_ENV/bin/python" -c "import telegram" >/dev/null 2>&1 && { echo "$VIRTUAL_ENV/bin/python"; return 0; }
+  fi
   echo "${TGM_PYTHON:-python3}"
 }
 RELOAD=${TGM_RELOAD:-}
