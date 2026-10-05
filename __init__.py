@@ -389,10 +389,48 @@ async def _react(chat_id: Any, message_id: Any, emoji: str) -> bool:
         fn = getattr(ad, "_set_reaction", None)
         if fn is None:
             return False
-        return bool(await fn(str(chat_id), str(message_id), emoji))
+        ok = bool(await fn(str(chat_id), str(message_id), emoji))
+        if not ok and _biz_chat_known(str(chat_id)) and str(chat_id) not in _REACT_WARNED:
+            _REACT_WARNED.add(str(chat_id))
+            logger.info("[TGAhermes] reaction NOT delivered — Telegram gives bots no reaction "
+                        "API inside connected business chats: chat=%s", chat_id)
+        return ok
     except Exception:
         logger.debug("[TGAhermes] reaction failed", exc_info=True)
         return False
+
+
+# ---------------------------------------------------------------- reaction updates (see reactions)
+# Telegram delivers message_reaction updates only for chats the bot is actually
+# in (groups where it is admin, its own DMs) — never for connected business
+# chats. Whatever does arrive is logged for the owner and surfaced to the next
+# automation turn of that chat via _LAST_REACTION.
+_LAST_REACTION: Dict[str, Any] = {}
+_REACT_WARNED: set = set()
+
+
+def _on_gateway_event(platform: str = "", event_type: str = "",
+                      payload: Any = None, **_) -> None:
+    """gateway_platform_event hook: normalised reaction envelope → log + note."""
+    if platform != "telegram" or event_type != "reaction" or not isinstance(payload, dict):
+        return
+    chat_id = str(payload.get("chat_id") or "")
+    msg_id = str(payload.get("message_id") or "")
+    if not chat_id or not msg_id:
+        return
+    emojis = [str(e)[:16] for e in (payload.get("emojis") or [])][:6]
+    label = " ".join(emojis) or "(custom emoji)"
+    _LAST_REACTION[chat_id] = (label, msg_id, time.time())
+    while len(_LAST_REACTION) > 64:
+        _LAST_REACTION.pop(next(iter(_LAST_REACTION)), None)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_log(
+            "\U0001f47e Chat Automation — reaction",
+            f"<b>Reaction:</b> {_esc(label)} on message <code>{_esc(msg_id)}</code>"
+            f"\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"))
+    except RuntimeError:
+        logger.debug("[TGAhermes] reaction log skipped (no running loop)")
 
 
 # ---------------------------------------------------------------- answerGuestQuery helpers
@@ -1029,7 +1067,7 @@ async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -
                 ok = True
                 mid = getattr(sent, "message_id", None)
                 st0 = settings()
-                if mid and st0.get("biz_react") and st0.get("auto_react"):
+                if mid and st0.get("biz_react"):
                     _spawn(_react(chat_id, mid, st0.get("biz_react_emoji") or "\U0001f47e"))
             except Exception as e:
                 logger.warning("[TGAhermes] automation reply failed (chat=%s): %s",
@@ -1147,13 +1185,23 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     # --- build the event the same way the guest path does -------------------
     try:
         from gateway.platforms.event import MessageType
+        msg_type = MessageType.TEXT
+        if st.get("biz_media"):
+            _has_media = any(getattr(msg, _a, None) for _a in
+                             ("photo", "video", "animation", "sticker",
+                              "document", "audio", "voice", "video_note"))
+            if _has_media:
+                msg_type = adapter._media_message_type(msg)
         event = adapter._build_message_event(
-            msg, MessageType.TEXT, update_id=getattr(update, "update_id", None))
+            msg, msg_type, update_id=getattr(update, "update_id", None))
     except Exception:
         logger.exception("[TGAhermes] failed to build automation event")
         await _biz_send(adapter, chat_id, "⚠️ Something went wrong — please try again.")
         return
     event.text = adapter._clean_bot_trigger_text(event.text or "") or ""
+    if msg_type is not MessageType.TEXT and not event.text:
+        _kind = str(getattr(msg_type, "name", "") or "media").lower()
+        event.text = "[" + _kind + "]"
     persona = _biz_persona(st, mode)
     first = str(getattr(user, "first_name", "") or "")
     last = str(getattr(user, "last_name", "") or "")
@@ -1177,6 +1225,10 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     if st.get("biz_larp"):
         identity += ("\nStyle: imitate the owner's tone from the conversation history "
                      "above (LARP) — match vocabulary, length and rhythm.")
+    _note = _LAST_REACTION.pop(chat_id, None)
+    if _note:
+        identity += (f"\nLatest reaction update in this chat: {_note[0]} on message {_note[1]} "
+                     "(treat as recent context).")
     event.channel_prompt = f"{persona}{identity}"
     md = event.metadata
     if isinstance(md, dict):
@@ -1505,7 +1557,7 @@ def _install_wraps(adapter: Any) -> None:
 
     async def send_typing(chat_id, metadata=None):
         if _biz_chat_known(chat_id):
-            _bc = _BIZ_CONN.get(str(chat_id) or "")
+            _bc = _BIZ_CONN.get(str(chat_id) or "") or _active_bcid()
             if _bc:
                 try:
                     await adapter._bot.send_chat_action(chat_id=chat_id,
@@ -1564,6 +1616,39 @@ def _install_wraps(adapter: Any) -> None:
     _wrap_media("send_document", "document", url_pos=1, name_pos=4)
     _wrap_media("send_voice", "voice", url_pos=1)
     _wrap_media("send_multiple_images", "photo", url_pos=1)
+
+    # Business media/action: inject the connection id at the Bot boundary so
+    # photos/files/gifs/stickers/typing in automation chats leave as the owner
+    # instead of failing as a bot that is not in that chat.
+    _biz_bot = getattr(adapter, "_bot", None)
+    if _biz_bot is not None and not getattr(_biz_bot, "_tga_biz_media", False):
+        setattr(_biz_bot, "_tga_biz_media", True)
+        for _bn in ("send_photo", "send_video", "send_audio", "send_document",
+                    "send_animation", "send_sticker", "send_video_note", "send_voice",
+                    "send_media_group", "send_chat_action", "send_location",
+                    "send_contact", "send_venue", "send_dice"):
+            _borig = getattr(_biz_bot, _bn, None)
+            if _borig is None or getattr(_borig, "_tga_biz", False):
+                continue
+
+            def _bwrap(_o):
+                async def _bw(*args, **kwargs):
+                    chat = kwargs.get("chat_id")
+                    if chat is None and args:
+                        chat = args[0]
+                    chat = str(chat or "")
+                    if chat and _biz_chat_known(chat) and "business_connection_id" not in kwargs:
+                        _bc = _BIZ_CONN.get(chat) or _active_bcid()
+                        if _bc:
+                            kwargs["business_connection_id"] = _bc
+                    return await _o(*args, **kwargs)
+                _bw._tga_biz = True
+                return _bw
+            try:
+                setattr(_biz_bot, _bn, _bwrap(_borig))
+            except Exception:
+                logger.debug("[TGAhermes] bot media wrap failed: %s", _bn, exc_info=True)
+
     logger.info("[TGAhermes] outbound wraps installed (v2)")
 
 
@@ -2227,6 +2312,8 @@ _TOGGLES: Dict[str, Tuple[str, str]] = {
     "bizwarn": ("biz_warn_first", "\u26a0\ufe0f first-contact warning"),
     "bizreact": ("biz_react", "\U0001f47e automation reply reaction"),
     "bizlarp": ("biz_larp", "\U0001f3ad LARP voice"),
+    "bizmedia": ("biz_media", "\U0001f5bc\ufe0f Media in + out"),
+    "bizfull": ("biz_full_access", "\U0001f513 Full access (all tools)"),
 }
 
 
@@ -2474,6 +2561,10 @@ _CATS: Dict[str, List[Dict[str, Any]]] = {
          "label": "\U0001f3af Scope (all chats when empty)"},
         {"kind": "list", "key": "biz_deny_tools", "cb": "panel:wiz:bizdeny",
          "label": "\U0001f512 Locked tools"},
+        {"kind": "bool", "key": "biz_media", "sub": "bizmedia",
+         "label": "\U0001f5bc\ufe0f Media in + out"},
+        {"kind": "bool", "key": "biz_full_access", "sub": "bizfull",
+         "label": "\U0001f513 Full access (tools + admin in this chat)"},
         {"kind": "cmd", "cb": "panel:bizconn",
          "label": "\U0001f50c Connection status"},
     ],
@@ -4407,7 +4498,8 @@ async def _on_private_text(adapter: Any, update: Any, context: Any = None) -> No
 # ---------------------------------------------------------------- telegram_admin tool
 
 _TOOL_DESCRIPTION = (
-    "Telegram admin actions — owner session only; the bot must be admin in the target chat. "
+    "Telegram admin actions — owner's DM, the owner's log group, or a full-access "
+    "automation chat; the bot must be admin in the target chat. "
     "delete_message, ban_user, unban_user, mute_user, unmute_user, get_member, chat_info, "
     "react (set a reaction), send_dm (bot DMs a user), pin_message, unpin_message, "
     "bang (run any !console command — setlog/setowner/whitelist/wipe/settings/...). "
@@ -4444,14 +4536,20 @@ def _tool_check(**_) -> bool:
 
 
 def _tool_owner_ok(session_id: Any) -> bool:
-    """Owner-session gate: telegram sessions must be the owner's DM; other sources are local/owner."""
+    """Owner-session gate: the owner's DM, his private log group, local
+    sources, or a full-access Chat Automation session (bang stays owner-DM-
+    only at the call site)."""
     row = _session_row(session_id)
     if not row:
         return False
     source, chat_id = row
     if source != "telegram":
         return True  # cli/cron/local sessions live on the owner's machine
-    return bool(_owner_id()) and chat_id == _owner_id()
+    if bool(_owner_id()) and chat_id == _owner_id():
+        return True
+    if chat_id and chat_id == str(settings().get("log_channel") or ""):
+        return True  # his own log group — the inner circle he already trusts
+    return bool(settings().get("biz_full_access")) and _biz_chat_known(chat_id)
 
 
 # ---------------------------------------------------------------- guest safety gate
@@ -4731,7 +4829,16 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
     elif session_id:
         _bchat = str(session_id).split(":", 1)[-1]
     if _bchat and _biz_chat_known(_bchat):
-        if name in _biz_denied(settings()) or _tripwire_danger(name, args):
+        st_b = settings()
+        if st_b.get("biz_full_access"):
+            # Full access: every tool except credentials — vault reads paste
+            # secrets straight into a customer conversation, those stay locked.
+            if name.startswith("browser_vault"):
+                _cnt = _bump_block(session_id)
+                return {"action": "block",
+                        "message": _biz_refusal(name, repeats=max(0, _cnt - 1))}
+            return None
+        if name in _biz_denied(st_b) or _tripwire_danger(name, args):
             _cnt = _bump_block(session_id)
             logger.warning("[TGAhermes] automation tool refused: %s (block#%d)",
                            name, _cnt)
@@ -4906,6 +5013,10 @@ async def _tool_handler(args: Dict[str, Any], session_id: Any = None, **_) -> Di
     if not _tool_owner_ok(session_id):
         return {"ok": False, "error": "owner-only: telegram_admin runs only from the owner's session"}
     action = str(args.get("action") or "")
+    if action == "bang":
+        _row = _session_row(session_id)
+        if _row and (_row[0] != "telegram" or _row[1] != _owner_id()):
+            return {"ok": False, "error": "owner-only: bang runs only from the owner's session"}
 
     # Update runs before the bot check on purpose: a plugin update should still
     # work when Telegram is disconnected, and it must never post anything.
@@ -5218,6 +5329,7 @@ def register(ctx) -> None:
         ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch)
         ctx.register_hook("pre_tool_call", _on_pre_tool_call)
         ctx.register_hook("post_tool_call", _on_post_tool_call)
+        ctx.register_hook("gateway_platform_event", _on_gateway_event)
         ctx.register_tool(name="telegram_admin", toolset="telegram_admin",
                           schema=_TOOL_SCHEMA, handler=_tool_handler_json,
                           description=_TOOL_DESCRIPTION, emoji="\U0001f6e1️", is_async=True,
