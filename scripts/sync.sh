@@ -45,7 +45,9 @@ find_python() {
   fi
   echo "${TGM_PYTHON:-python3}"
 }
-RELOAD=${TGM_RELOAD:-}
+# Default to the real control-socket reloader: a deploy that does not
+# reload leaves the gateway serving the OLD code, silently.
+RELOAD=${TGM_RELOAD:-/opt/data/scripts/tgm_reload.py}
 PY=$(find_python)
 
 # Only these files are copied. settings.json, state.json and anything learned
@@ -61,12 +63,20 @@ EXCLUDE=(.audit-identities.json)
 # of a turn is how a live session gets corrupted.
 reload() {
   if [ -z "$RELOAD" ] || [ ! -f "$RELOAD" ]; then
-    echo "--- hot reload: skipped (set TGM_RELOAD to the reload script) ---"
+    echo "--- hot reload: skipped (no reloader at '$RELOAD') ---"
     return 0
   fi
   echo "--- hot reload ---"
-  "$PY" "$RELOAD" 2>&1 | grep -o "'reloaded': [A-Za-z]*" | head -1
-  "$PY" "$RELOAD" 2>&1 | grep -o "'hooks': \[[^]]*\]" | grep -o "'TGAhermes'.*" || true
+  # Run ONCE: the script is not idempotent-cheap and a second reload would
+  # re-wire handlers mid-flight for no reason.
+  local out
+  if ! out="$("$PY" "$RELOAD" 2>&1)"; then
+    printf '%s\n' "$out" | tail -2
+    echo "--- hot reload: FAILED (deployed, but the gateway still runs the old code) ---"
+    return 0
+  fi
+  printf '%s\n' "$out" | grep -o "'reloaded': [A-Za-z]*" | head -1
+  printf '%s\n' "$out" | grep -o "'adapters_rewired': [0-9]*" | head -1
 }
 
 drift() {
