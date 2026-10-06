@@ -12,7 +12,7 @@ Restores the Atropos guest-mode behavior on Hermes 0.21.5+ as a plugin (no core 
   group/channel with inline buttons (profile / info / ban / delete). Errors of GUEST turns
   only go to the log channel (owner DM fallback when no channel is configured).
 * **Bang command console** (log channel or owner DM, owner only):
-  ``!help !users !send !settings !setlog !setowner !whitelist add|remove|list|perms
+  ``!help !run !users !send !settings !setlog !setowner !whitelist add|remove|list|perms
   !gs list|open|lock|reset !gate show|allow|deny !auth [user_id] !wipe [chat_id]
   !setunauthorized !seterror !seterrorfa !setreact !setmedia !setcooldown`` — texts/ids
   editable live. Every chat (DM / group / guest) is its own session; ``!wipe`` (or the 🧹
@@ -2558,6 +2558,7 @@ def _help_sections(st: Optional[Dict[str, Any]] = None) -> list:
          "<b>⚡ Actions</b> — guided flows (log here, whitelist, DM, wipe, updates)\n"
          "<code>!settings</code> — editable settings\n"
          "<code>!users</code> — who used the bot\n"
+         "<code>!run</code> — restart Hermes (starts it too, if it is down)\n"
          "<code>!panel</code> — this glass-button panel (same as !help)"),
         ("log", "📡 Log",
          f"now: <code>{log_now}</code>\n"
@@ -4240,6 +4241,11 @@ async def _sessions_view(adapter: Any) -> str:
     return _sessions_body(adapter)
 
 
+# `!run` bounces the gateway through scripts/hermes_run.sh — a constant so the
+# tests can point it at /bin/true instead of actually restarting ATRA.
+_RUN_SCRIPT = "/opt/data/scripts/hermes_run.sh"
+
+
 async def _bang_execute(adapter: Any, chat_id: str, text: str,
                         session_store: Any = None) -> Optional[str]:
     """Run one bang command; returns the reply text (the caller decides delivery)."""
@@ -4281,6 +4287,32 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
         reply = _fmt_users()
     elif cmd == "!settings":
         reply = _settings_summary()
+    elif cmd in ("!run", "!restart"):
+        # Restart Hermes from the panel. The child is detached into its own
+        # session and sleeps 3s first, so this reply is delivered before the
+        # gateway dies — and because it is detached, killing this process does
+        # not take the restart down with it. hermes_run.sh handles every state:
+        # healthy, wedged, crash-looping or already dead.
+        try:
+            subprocess.Popen(
+                ["bash", "-c", "sleep 3; exec bash \"$1\" auto",
+                 "hermes-run", _RUN_SCRIPT],
+                cwd="/opt/data", start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL)
+            reply = ("🔄 restarting Hermes — this message lands first, then the "
+                     "gateway bounces and comes back (≈10–30s).\n"
+                     "If it does not return: "
+                     "<code>bash /opt/data/scripts/hermes_run.sh start</code> "
+                     "on the box, or type <code>!run</code> again — the script "
+                     "also starts it from a dead state.")
+            await _log("🔁 Hermes restart",
+                       f"Owner ran <code>{_esc(cmd)}</code> from "
+                       f"<code>{_esc(str(chat_id))}</code> — bouncing "
+                       f"<code>gateway-default</code> via s6")
+        except Exception as e:
+            reply = (f"❌ could not start the restart: {_esc(type(e).__name__)}"
+                     f": {_esc(str(e)[:200])}")
     elif cmd == "!send":
         bits = arg.split(maxsplit=1)
         if len(bits) == 2:

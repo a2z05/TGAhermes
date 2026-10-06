@@ -684,6 +684,20 @@ check(r10 and "!whitelist" in r10 and "!wipe" in r10, "help lists whitelist + wi
 check(r10 and "Sessions" in r10 and "Whitelist" not in r10.split("Access")[0], "help grouped")
 check(r10 and "Unknown" not in r10, "help not unknown")
 
+# --- !run: restarts the gateway through scripts/hermes_run.sh.
+# The script is swapped for /bin/true so the suite can never bounce ATRA.
+_run_script_before = mod._RUN_SCRIPT
+mod._RUN_SCRIPT = "/bin/true"
+try:
+    rrun = asyncio.run(mod._bang_execute(ad10, "900000001", "!run"))
+finally:
+    mod._RUN_SCRIPT = _run_script_before
+check(rrun and "restarting" in rrun, "!run replies with the restart notice")
+check(mod._RUN_SCRIPT.endswith("hermes_run.sh"),
+      "!run targets scripts/hermes_run.sh")
+check("!run" in (asyncio.run(
+    mod._bang_execute(ad10, "900000001", "!help")) or ""), "help lists !run")
+
 # --- !wipe: session store scoping
 class FakeStore:
     def __init__(self):
