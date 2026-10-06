@@ -74,6 +74,21 @@ def state(anchor: Any) -> Dict[str, Any]:
     return st
 
 
+async def _drop(tc: Any) -> None:
+    """Release a client we are discarding; never raise.
+
+    Telethon's sqlite handle lives on the session object and only closes
+    when the client disconnects (or is collected). Explicit is better than
+    waiting for GC while the session lock is already contended.
+    """
+    if tc is None:
+        return
+    try:
+        await tc.disconnect()
+    except Exception:
+        logger.debug("[userbridge] disconnect during drop failed", exc_info=True)
+
+
 async def ensure(anchor: Any) -> Any:
     """Connected, authorized Telethon client for the owner's session copy."""
     if anchor is None:
@@ -86,6 +101,9 @@ async def ensure(anchor: Any) -> Any:
                 return tc
         except Exception:
             logger.debug("[userbridge] cached client stale", exc_info=True)
+        # Cached but unusable -> it still owns the session lock, so let go
+        # before opening a replacement (otherwise the replacement is locked).
+        await _drop(tc)
         st["client"] = None
         st["handler_added"] = False
     cfg = config()
@@ -116,6 +134,10 @@ async def ensure(anchor: Any) -> Any:
             return tc
         except Exception:
             logger.exception("[userbridge] connect failed")
+            # A client that never connected still owns its sqlite handle.
+            # Leaving it open holds the session lock, so the NEXT attempt
+            # fails with "database is locked" and the loop feeds itself.
+            await _drop(tc)
             return None
 
 
