@@ -1,7 +1,8 @@
 #!/bin/bash
-# test_hermes_run.sh — exercise /opt/data/scripts/hermes_run.sh WITHOUT bouncing
+# test_hermes_run.sh — exercise the gateway's own run script WITHOUT bouncing
 # the live gateway: s6, curl and the health endpoint are stubbed, everything else
-# (the decision tree) is the real script.
+# (the decision tree) is the real script. The path comes from the same place the
+# plugin gets it, because a literal host path here fails the pre-push audit.
 #
 #   bash tests/test_hermes_run.sh
 set -u

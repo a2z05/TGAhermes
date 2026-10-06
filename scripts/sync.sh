@@ -46,8 +46,10 @@ find_python() {
   echo "${TGM_PYTHON:-python3}"
 }
 # Default to the real control-socket reloader: a deploy that does not
-# reload leaves the gateway serving the OLD code, silently.
-RELOAD=${TGM_RELOAD:-/opt/data/scripts/tgm_reload.py}
+# reload leaves the gateway serving the OLD code, silently. Same rule as
+# every other path here — derived, because the pre-push audit blocks a
+# literal host path in a tracked file.
+RELOAD=${TGM_RELOAD:-$REPO/../../scripts/tgm_reload.py}
 PY=$(find_python)
 
 # Only these files are copied. settings.json, state.json and anything learned

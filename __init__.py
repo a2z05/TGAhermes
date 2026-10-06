@@ -1148,6 +1148,18 @@ def _biz_sched_st(st: Optional[Dict[str, Any]] = None) -> str:
     return v if v in _BIZ_SCHEDULE_ORDER else "always"
 
 
+# The home board labels a single line "automation", but biz_mode and
+# biz_schedule are two different keys and only biz_schedule gates anything.
+# Printing the mode alone made a paused schedule read as ON — the reported
+# "the panel says it's on, automation says it's off". The badge is the gate's
+# own verdict, so the board can never disagree with what actually runs.
+_BIZ_SCHED_BADGE = {"always": "✅ always", "window": "🗓 window", "off": "⏸ off"}
+
+
+def _biz_sched_badge(st: Optional[Dict[str, Any]] = None) -> str:
+    return _BIZ_SCHED_BADGE.get(_biz_sched_st(st), "⏸ off")
+
+
 def _biz_norm_hhmm(raw: Any) -> str:
     """Any time the owner might type -> canonical 'HH:MM', or '' when unusable.
 
@@ -2784,8 +2796,8 @@ def _panel_text(st: Optional[Dict[str, Any]] = None, note: str = "") -> str:
         f"\U0001f4e3 mentions <b>{_b('log_group_mentions')}</b>",
         f"\U0001f4e6 updates: <b>{'on' if st.get('update_enabled', True) else 'locked'}</b> · "
         f"\U0001f3ad persona: <b>{'custom' if st.get('persona_path') else 'default'}</b>",
-        f"\U0001f4bc automation: <b>"
-        f"{_MODE_LABEL.get(str(st.get('biz_mode') or 'assistant'), 'assistant')}</b> · "
+        f"\U0001f4bc automation: <b>{_biz_sched_badge(st)}</b> · "
+        f"mode: <b>{_MODE_LABEL.get(str(st.get('biz_mode') or 'assistant'), 'assistant')}</b> · "
         f"\U0001f310 lang: <b>{_esc(str(st.get('biz_lang') or 'auto'))}</b>",
     ]
     if note:
@@ -4241,9 +4253,10 @@ async def _sessions_view(adapter: Any) -> str:
     return _sessions_body(adapter)
 
 
-# `!run` bounces the gateway through scripts/hermes_run.sh — a constant so the
+# `!run` bounces the gateway through the run script — a constant so the
 # tests can point it at /bin/true instead of actually restarting ATRA.
-_RUN_SCRIPT = "/opt/data/scripts/hermes_run.sh"
+# Derived, never a host path: this file is pushed to a public repo.
+_RUN_SCRIPT = str(_hermes_home() / "scripts" / "hermes_run.sh")
 
 
 async def _bang_execute(adapter: Any, chat_id: str, text: str,
@@ -4297,13 +4310,13 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
             subprocess.Popen(
                 ["bash", "-c", "sleep 3; exec bash \"$1\" auto",
                  "hermes-run", _RUN_SCRIPT],
-                cwd="/opt/data", start_new_session=True,
+                cwd=str(_hermes_home()), start_new_session=True,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL)
             reply = ("🔄 restarting Hermes — this message lands first, then the "
                      "gateway bounces and comes back (≈10–30s).\n"
                      "If it does not return: "
-                     "<code>bash /opt/data/scripts/hermes_run.sh start</code> "
+                     f"<code>bash {_esc(_RUN_SCRIPT)} start</code> "
                      "on the box, or type <code>!run</code> again — the script "
                      "also starts it from a dead state.")
             await _log("🔁 Hermes restart",
@@ -5143,6 +5156,24 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                                           f"!whitelist remove {sub}")
                 st = settings()
                 body = _wl_view(st, note=out or f"🗑 removed <code>{_esc(sub)}</code>")
+            elif action == "tg" and sub == "bizmode":
+                # Cycling assistant → mimic → off is not a destructive action,
+                # and the owner asked for it to land on a single tap. The
+                # confirm screen here was the extra step that let a mode read
+                # as an on/off switch: mode and biz_schedule are different
+                # keys, and only schedule gates anything.
+                origin = bits[4] if len(bits) > 4 else "settings"
+                nxt = _tg_next("bizmode", st)
+                save_settings({"biz_mode": nxt})
+                st = settings()
+                _view = origin if origin in _VIEW_LABEL else "biz"
+                note = (f"\U0001f916 automation mode → "
+                        f"<b>{_MODE_LABEL.get(nxt, nxt)}</b>")
+                await _log("\U0001f916 Chat Automation",
+                           f"Mode → <b>{nxt}</b> "
+                           f"(owner {_esc(str(_owner_id()))})")
+                view, arg = _view, f"bizmode:{_view}"
+                body = _view_body(_view, st, note, arg=f"bizmode:{_view}")
             elif action == "tg" and sub:
                 # confirm screen: panel:tg:<sub-key>:<origin> — changes nothing yet
                 origin = bits[4] if len(bits) > 4 else "settings"

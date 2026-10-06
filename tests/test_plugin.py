@@ -2264,6 +2264,78 @@ async def _t27():
 asyncio.run(_t27())
 
 
+# [27b] Regression: the home board printed biz_mode under the label
+# "automation", so a paused biz_schedule read as ON while the gate answered
+# "automation is switched off" — the reported contradiction. And the mode row
+# routed through a confirm screen, so a mode tap looked like an on/off switch
+# when only biz_schedule gates anything.
+print("\n[27b] home board tells the truth, mode applies on one tap")
+check(mod._biz_sched_badge({"biz_schedule": "off"}) == "⏸ off",
+      "paused schedule badges as off")
+check(mod._biz_sched_badge({"biz_schedule": "always"}) == "✅ always",
+      "running schedule badges as always")
+_home = mod._panel_text({"biz_schedule": "off", "biz_mode": "assistant"})
+check("⏸ off" in _home, "home board shows the gate verdict, not just the mode")
+check("mode: <b>" in _home,
+      "mode stays on its own labelled half so the two keys never merge")
+check("automation: <b>assistant" not in _home,
+      "mode is no longer printed under the bare 'automation' label")
+
+
+async def _t27b():
+    _orig = dict(mod.settings())
+    _orig_log = mod._log
+    edited, answered, titles = [], [], []
+
+    async def _edit(text=None, **kw):
+        edited.append((text, kw))
+
+    async def _ans(*a, **kw):
+        answered.append(a)
+
+    async def _slog(title, body="", buttons=None):
+        titles.append(str(title))
+
+    def _q(data):
+        return NS(from_user=NS(id=900000001), data=data,
+                  message=NS(chat=NS(id="900000001"), edit_text=_edit), answer=_ans)
+
+    mod._log = _slog
+    try:
+        mod.save_settings({"biz_mode": "assistant"})
+
+        # one tap: no confirm screen, the value lands immediately
+        edited.clear()
+        await mod._on_callback(NS(callback_query=_q("tgm:panel:tg:bizmode:biz")))
+        await asyncio.sleep(0.02)
+        check(mod.settings().get("biz_mode") == "mimic",
+              "mode tap writes on the first press (no Apply step)")
+        check(not any("panel:cfmok:tg:bizmode" in (b or "")
+                      for _t, kw in edited
+                      for mk in (kw.get("reply_markup"),)
+                      if mk for r in mk.inline_keyboard for b in [r2.callback_data
+                                                                 for r2 in r]),
+              "mode tap never builds an Apply button")
+        check(any("Chat Automation" in t for t in titles),
+              "mode change is logged under the Chat Automation title")
+        check(edited and edited[0][1].get("parse_mode") == "HTML",
+              "re-render after a mode tap is HTML")
+
+        # origin "biz" stays inside the Chat Automation category
+        check("Chat Automation" in edited[0][0],
+              "mode tap lands back on the Chat Automation page")
+
+        # the key it writes is biz_mode only — schedule is untouched
+        check(mod.settings().get("biz_schedule") == _orig.get("biz_schedule"),
+              "a mode tap never touches the schedule master switch")
+    finally:
+        mod._log = _orig_log
+        mod.save_settings(_orig)
+
+
+asyncio.run(_t27b())
+
+
 # [28] Regression: the gateway loads the plugin AS A PACKAGE, so the loader's
 # relative-import branch must yield a real module. Initializing the package
 # attribute before the import used to shadow the submodule (fromlist saw the
