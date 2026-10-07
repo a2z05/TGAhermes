@@ -42,6 +42,7 @@ _DEPS = os.path.join(_HERE, "deps")
 _CFG = os.path.join(_HERE, "userbridge.json")
 
 ReactionCallback = Callable[[str, int, str], Any]
+MessageCallback = Callable[[str, int], Any]  # chat_id, msg_id: he spoke
 
 
 def _deps() -> None:
@@ -185,6 +186,29 @@ def _handler(st: Dict[str, Any]) -> Callable[[Any], Awaitable[None]]:
     return _on_update
 
 
+def _msg_handler(st: Dict[str, Any]) -> Callable[[Any], Awaitable[None]]:
+    """The owner posted from his own client.
+
+    The Bot API hands the connected bot nothing for a message the OWNER
+    writes inside a business chat, so this is the only stream that ever
+    shows he has taken the thread back."""
+
+    async def _on_msg(event: Any) -> None:
+        try:
+            from telethon import utils as tl_utils
+            cb = st.get("msg_cb")
+            peer = getattr(event, "peer", None)
+            if cb is None or peer is None:
+                return
+            res = cb(str(tl_utils.get_peer_id(peer)),
+                     int(getattr(event, "id", 0) or 0))
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception:
+            logger.debug("[userbridge] message update dropped", exc_info=True)
+    return _on_msg
+
+
 async def _loop(anchor: Any, st: Dict[str, Any]) -> None:
     """Reconnect forever; the owner's account stream stays open."""
     while not st.get("stop"):
@@ -197,6 +221,11 @@ async def _loop(anchor: Any, st: Dict[str, Any]) -> None:
                 _deps()
                 from telethon import events
                 tc.add_event_handler(_handler(st), events.NewReaction)
+                # his own messages, wherever they were written from: the
+                # Bot API never shows the owner replying in a business
+                # chat, this is the only stream that does.
+                tc.add_event_handler(_msg_handler(st),
+                                     events.NewMessage(incoming=False))
                 st["handler_added"] = True
             await tc.run_until_disconnected()
         except asyncio.CancelledError:
@@ -210,12 +239,14 @@ async def _loop(anchor: Any, st: Dict[str, Any]) -> None:
             await asyncio.sleep(3)
 
 
-async def start_listener(anchor: Any, on_reaction: ReactionCallback) -> bool:
-    """Start (or rebind) the reaction listener on this anchor's state."""
+async def start_listener(anchor: Any, on_reaction: ReactionCallback,
+                         on_message: MessageCallback = None) -> bool:
+    """Start (or rebind) the reaction + message listeners on this anchor."""
     if anchor is None:
         return False
     st = state(anchor)
     st["cb"] = on_reaction
+    st["msg_cb"] = on_message
     if config() is None:
         return False
     task = st.get("task")
@@ -241,6 +272,7 @@ async def stop_listener(anchor: Any) -> None:
             pass
     tc = st.pop("client", None)
     st["handler_added"] = False
+    st.pop("msg_cb", None)
     if tc is not None:
         try:
             await tc.disconnect()

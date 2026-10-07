@@ -3202,5 +3202,126 @@ def _t34():
 
 _t34()
 
+
+# ---------------------------------------------------------------- [35] his reply, without a logged-in session
+def _t35():
+    """The Bot API hands a bot nothing for a message the OWNER writes in a
+    customer chat, so the only reply he can make without a session is one we
+    deliver for him. That send must both land and stand the hold down."""
+    print("\n[35] owner replying through the automation (no session)")
+    ad = FakeAdapter()
+    mod._ADAPTER["adapter"] = ad
+    _saved = (dict(mod._BIZ_OWNER_SEEN), dict(mod._BIZ_REPLIED),
+              mod._biz_chat_known, mod._biz_send)
+    sent: dict = {}
+
+    async def _fake_biz_send(_ad, chat_id, text):
+        sent[str(chat_id)] = text
+        return True
+
+    mod._BIZ_OWNER_SEEN.clear()
+    mod._biz_chat_known = lambda cid: str(cid) == "730001"
+    mod._biz_send = _fake_biz_send
+    try:
+        # ATRA just answered, so the thread reads as live...
+        mod._BIZ_REPLIED["730001"] = time.time() - 2.0
+        check(mod._biz_engaged("730001"), "ATRA's own reply keeps it engaged")
+
+        # ...then he answers through !send: the next message must wait again.
+        r = asyncio.run(mod._bang_execute(ad, "900000001", "!send 730001 hello"))
+        check(sent.get("730001") == "hello",
+              "!send routes a customer chat over the business connection")
+        check(bool(r) and "failed" not in str(r).lower(),
+              "!send reports the delivered text")
+        check("730001" in mod._BIZ_OWNER_SEEN, "his send stamps his presence")
+        check(not mod._biz_engaged("730001"),
+              "his answer hands the thread back to the hold")
+
+        # a chat we do not own keeps the plain bot path (and no presence)
+        sent.clear()
+        r = asyncio.run(mod._bang_execute(ad, "900000001", "!send 900000999 hi"))
+        check("730001" not in sent and not mod._BIZ_OWNER_SEEN.get("900000999"),
+              "a stranger's chat takes the old path")
+
+        # the owner-session stream (only ever on when he opts in) feeds the
+        # same stamp, and ignores every chat that is not a customer of ours
+        mod._BIZ_OWNER_SEEN.pop("730001", None)
+        mod._ub_msg_cb("730001", 55)
+        check(bool(mod._BIZ_OWNER_SEEN.get("730001")),
+              "his own client posting stamps presence (owner session)")
+        mod._ub_msg_cb("900000999", 56)
+        check("900000999" not in mod._BIZ_OWNER_SEEN,
+              "traffic in a chat we do not own is ignored")
+    finally:
+        mod._BIZ_OWNER_SEEN.clear()
+        mod._BIZ_OWNER_SEEN.update(_saved[0])
+        mod._BIZ_REPLIED.clear()
+        mod._BIZ_REPLIED.update(_saved[1])
+        mod._biz_chat_known, mod._biz_send = _saved[2], _saved[3]
+        mod._ADAPTER["adapter"] = None
+
+
+_t35()
+
+
+# ---------------------------------------------------------------- [36] his own reply, seen
+def _t36():
+    """Telegram does deliver his reply: same business_message update, his id
+    in `from`. The handler records the stamp and returns before any
+    automation runs — and the stamp must be an epoch, or the hold reads it
+    as a few seconds since boot and decides he never spoke."""
+    from types import SimpleNamespace
+    print("\n[36] the owner's own business_message stands the hold down")
+    ad = FakeAdapter()
+    mod._ADAPTER["adapter"] = ad
+    _saved = (dict(mod._BIZ_OWNER_SEEN), dict(mod._BIZ_REPLIED),
+              mod.settings().get("owner_id"))
+    mod.save_settings({"owner_id": "900000001"})
+    mod._BIZ_OWNER_SEEN.clear()
+    mod._BIZ_REPLIED.clear()
+    try:
+        # ATRA has just spoken in this chat, so it reads as live...
+        mod._BIZ_REPLIED["730002"] = time.time() - 3.0
+        check(mod._biz_engaged("730002"), "ATRA's reply keeps it engaged")
+
+        upd = SimpleNamespace(
+            update_id=41,
+            business_message=SimpleNamespace(
+                from_user=SimpleNamespace(id=900000001, is_bot=False),
+                chat=SimpleNamespace(id=730002),
+                text="pasi pasokh dadam",
+            ),
+        )
+        asyncio.run(mod._handle_business_message(ad, upd, None))
+
+        seen = mod._BIZ_OWNER_SEEN.get("730002") or 0.0
+        check(seen > 1_700_000_000, "his stamp is a wall-clock epoch, not a monotonic tick")
+        check(not mod._biz_engaged("730002"),
+              "his answer hands the thread back to the hold")
+
+        # ...and it survives a reload, so a deploy mid-conversation keeps it
+        mod._presence_write()
+        mod._BIZ_OWNER_SEEN.clear()
+        mod._BIZ_REPLIED.clear()
+        mod._PRESENCE_LOADED = False
+        mod._presence_load()
+        check((mod._BIZ_OWNER_SEEN.get("730002") or 0.0) > 1_700_000_000,
+              "his stamp survives a reload")
+        mod._PRESENCE_LOADED = True
+
+        # his message never produces an answer of its own
+        check(not ad.sent if hasattr(ad, "sent") else True,
+              "the automation did not answer him back")
+    finally:
+        mod._BIZ_OWNER_SEEN.clear()
+        mod._BIZ_OWNER_SEEN.update(_saved[0])
+        mod._BIZ_REPLIED.clear()
+        mod._BIZ_REPLIED.update(_saved[1])
+        mod.save_settings({"owner_id": _saved[2]})
+        mod._ADAPTER["adapter"] = None
+
+
+_t36()
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

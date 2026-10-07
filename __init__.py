@@ -504,14 +504,29 @@ def _ub_cb(chat_id: str, msg_id: int, label: str) -> None:
     _note_reaction(chat, str(msg_id), str(label), source="user")
 
 
+def _ub_msg_cb(chat_id: str, msg_id: int) -> None:
+    """The owner posted in a customer chat from his own client.
+
+    No Bot API update ever carries this, so the hold is only correct as
+    long as the owner-session stream is feeding it."""
+    chat = str(chat_id)
+    if not _biz_chat_known(chat):
+        return  # the account sees every chat; only ours matters here
+    _BIZ_OWNER_SEEN[chat] = time.time()
+    _presence_write()
+    logger.info("[TGAhermes] owner presence chat=%s msg=%s (owner session)",
+                chat, msg_id)
+
+
 async def _ub_start(anchor: Any = None) -> None:
     ub = _ub_mod()
     if ub is None:
         logger.warning("[TGAhermes] owner-session bridge module not importable")
         return
     try:
-        ok = await ub.start_listener(anchor or _ADAPTER.get("adapter"), _ub_cb)
-        logger.info("[TGAhermes] owner-session reaction listener start=%s", ok)
+        ok = await ub.start_listener(anchor or _ADAPTER.get("adapter"),
+                                     _ub_cb, _ub_msg_cb)
+        logger.info("[TGAhermes] owner-session listener start=%s (reactions + messages)", ok)
     except Exception:
         logger.warning("[TGAhermes] owner-session listener failed", exc_info=True)
 
@@ -1021,11 +1036,11 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
 # --- Chat Automation wiring: connection map + owner presence ---------------
 _BIZ_CONN: Dict[str, str] = {}             # chat_id -> business_connection_id (live)
 _BIZ_ACTIVE_ID: str = ""                   # last attached connection id (see _on_business_connection)
-# chat_id -> monotonic ts of the owner's own last message IN THAT chat.
+# chat_id -> wall-clock ts of the owner's own last message IN THAT chat.
 # The reply window is per conversation: a message only cancels ATRA's hold
 # when the owner posts in THAT chat during the window — his traffic anywhere
-# else must never clear it. In-memory only: one monotonic clock, and it is
-# meaningless across a restart.
+# else must never clear it. Both stamps survive a reload (state.json) and
+# line up with the store's own reply timestamps.
 _BIZ_OWNER_SEEN: Dict[str, float] = {}
 _BIZ_REPLIED: Dict[str, float] = {}
 # Both stamps are wall-clock epochs, not monotonic: they have to survive a
@@ -1726,7 +1741,13 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
         # entry hold. Recorded here because an owner turn never reaches the
         # gateway dispatch hook: it is filtered out just below.
         if chat_id:
-            _BIZ_OWNER_SEEN[chat_id] = time.monotonic()
+            # Wall-clock like every other stamp: a monotonic value is a few
+            # seconds since boot, and the hold compares it against an epoch
+            # — it would read as "owner never spoke" forever.
+            _BIZ_OWNER_SEEN[chat_id] = time.time()
+            _presence_write()
+            logger.info("[TGAhermes] owner presence chat=%s (his own reply)",
+                        chat_id)
         return  # the owner's own traffic is not automation
     st = settings()
     mode = str(st.get("biz_mode") or "assistant")
@@ -4663,11 +4684,28 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
         if len(bits) == 2:
             target, msg = bits[0], bits[1]
             try:
-                bot = getattr(adapter, "_bot", None)
-                await bot.send_message(chat_id=target, text=msg[:4000])
-                reply = f"✅ DM sent to <code>{_esc(target)}</code> ({len(msg)} chars)"
-                await _log("📨 Bot DM sent",
-                           f"<b>To:</b> <code>{_esc(target)}</code>\n<b>Text:</b> <i>{_esc(msg[:500])}</i>")
+                if _biz_chat_known(target):
+                    # A customer's chat has no bot member — the raw send is
+                    # 403. The business connection is also the only reply he
+                    # can use without handing over a session, and once it
+                    # lands the thread is HIS: the hold stands down and the
+                    # next message waits for him again.
+                    if await _biz_send(adapter, target, msg[:4000]):
+                        _BIZ_OWNER_SEEN[str(target)] = time.time()
+                        _presence_write()
+                        logger.info("[TGAhermes] owner presence chat=%s (owner send)",
+                                    str(target))
+                        reply = f"✅ Sent to <code>{_esc(target)}</code> ({len(msg)} chars)"
+                        await _log("📨 Bot DM sent",
+                                   f"<b>To:</b> <code>{_esc(target)}</code>\n<b>Text:</b> <i>{_esc(msg[:500])}</i>")
+                    else:
+                        reply = f"❌ business send failed for <code>{_esc(target)}</code>"
+                else:
+                    bot = getattr(adapter, "_bot", None)
+                    await bot.send_message(chat_id=target, text=msg[:4000])
+                    reply = f"✅ DM sent to <code>{_esc(target)}</code> ({len(msg)} chars)"
+                    await _log("📨 Bot DM sent",
+                               f"<b>To:</b> <code>{_esc(target)}</code>\n<b>Text:</b> <i>{_esc(msg[:500])}</i>")
             except Exception as e:
                 # failure is already visible inline as this reply — no log-channel detour
                 reply = f"❌ {type(e).__name__}: {_esc(str(e)[:300])}"
