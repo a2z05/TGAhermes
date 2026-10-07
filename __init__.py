@@ -1043,6 +1043,9 @@ _BIZ_ACTIVE_ID: str = ""                   # last attached connection id (see _o
 # line up with the store's own reply timestamps.
 _BIZ_OWNER_SEEN: Dict[str, float] = {}
 _BIZ_REPLIED: Dict[str, float] = {}
+# When each automation turn was dispatched: a reply generated afterwards
+# must not land on top of an owner who took the thread while it wrote.
+_BIZ_TURN: Dict[str, float] = {}
 # Both stamps are wall-clock epochs, not monotonic: they have to survive a
 # reload and line up with the store's own reply timestamps.
 _PRESENCE_TTL = 7 * 24 * 3600.0
@@ -1111,7 +1114,8 @@ def _bump_owner_seen(event: Any) -> None:
         logger.debug("[TGAhermes] owner presence update failed", exc_info=True)
 
 
-def _biz_engaged(chat_id: Any, store: Any = None) -> bool:
+def _biz_engaged(chat_id: Any, store: Any = None,
+                 delay: Optional[float] = None) -> bool:
     """True when ATRA has already spoken in this chat and the owner has not
     come back to it since the entry grace for THIS conversation is spent.
 
@@ -1142,7 +1146,16 @@ def _biz_engaged(chat_id: Any, store: Any = None) -> bool:
         if _last > 0.0:
             _at = _last
             _BIZ_REPLIED[_cid] = _at
-    _out = bool(_at) and _at > (_BIZ_OWNER_SEEN.get(_cid) or 0.0)
+    _seen = _BIZ_OWNER_SEEN.get(_cid) or 0.0
+    _out = bool(_at) and _at > _seen
+    # He posted inside the wait window and an answer that was already
+    # writing landed on top of his text: the thread is his, so the next
+    # message still waits. Without this the in-flight reply outranks his
+    # presence stamp and the chat never re-arms.
+    if delay is None:
+        delay = _biz_idle_delay_s(settings())
+    if _out and _seen and delay and (time.time() - _seen) < float(delay):
+        _out = False
     # One line per message: this is the decision that decides whether he
     # waits, and without its inputs a wrong hold can only be guessed at.
     logger.info(
@@ -1600,6 +1613,21 @@ async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -
     except Exception:
         logger.debug("[TGAhermes] turn marker release failed", exc_info=True)
     ok = False
+    _seen_at = _BIZ_OWNER_SEEN.get(chat_id) or 0.0
+    _turn_at = _BIZ_TURN.get(chat_id) or 0.0
+    if chat_id and _turn_at and _seen_at >= _turn_at:
+        # He posted while this reply was being written: the thread is his
+        # now, so the generated text goes nowhere.
+        logger.info("[TGAhermes] Chat Automation drop (owner took the thread) "
+                    "chat=%s", chat_id)
+        try:
+            await _log("🤖 Chat Automation stood down",
+                       f"chat <code>{_esc(chat_id)}</code>\n"
+                       f"<b>Action:</b> you replied while it was writing, "
+                       f"the reply was dropped")
+        except Exception:
+            logger.debug("[TGAhermes] drop log failed", exc_info=True)
+        return SendResult(success=False, message_id=None), adapter
     if chat_id and text_content and str(text_content).strip():
         ok, sent = await _biz_try_send(adapter, chat_id, str(text_content),
                                        preferred=str(bcid or ""))
@@ -1815,7 +1843,7 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     # it; his traffic anywhere else never does.
     _delay = _biz_idle_delay_s(st)
     _t0 = time.time()
-    if _delay > 0 and _biz_engaged(chat_id, store):
+    if _delay > 0 and _biz_engaged(chat_id, store, _delay):
         logger.info("[TGAhermes] Chat Automation skip hold: engaged chat=%s",
                     chat_id)
         _delay = 0.0
@@ -1849,6 +1877,9 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
                 except Exception:
                     logger.debug("[TGAhermes] stand-down log failed", exc_info=True)
                 return
+    # Dispatch time for this chat: a reply generated after this must not be
+    # delivered if he posts before it comes back.
+    _BIZ_TURN[str(chat_id)] = time.time()
     # --- first-contact warning: once per chat, before ATRA's first reply ----
     # His own text, when he wrote one, goes out verbatim that is his call to
     # make. When he left the field empty the old path still fired the canned
@@ -2082,6 +2113,21 @@ def _bizconn_view(st: Dict[str, Any], note: str = "") -> str:
     return "\n".join(lines)
 
 
+_STATUS_PREFIXES = ("⏳ Working", "⚡ Interrupting", "⏳ Queued",
+                    "⏩ Steered", "💾", "⚙")
+
+
+def _is_status_bubble(text: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
+    """Gateway chatter (heartbeats, steer acks, tool progress) that must
+    never reach a customer talking with the owner: only ATRA's real reply
+    lands there. Metadata marks every mid-turn send; the prefix list is the
+    fallback for status text sent without it."""
+    md = metadata or {}
+    if md.get("_interim_send") or md.get("non_conversational"):
+        return True
+    return (text or "").lstrip().startswith(_STATUS_PREFIXES)
+
+
 def _install_wraps(adapter: Any) -> None:
     # Re-run on EVERY factory load (no early return): these closures must
     # belong to the CURRENT module instance. A wrap left over from an older
@@ -2117,6 +2163,10 @@ def _install_wraps(adapter: Any) -> None:
     async def send(chat_id: Any, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> "SendResult":
         if _biz_wants_owner(chat_id):
+            if _is_status_bubble(str(content or ""), metadata):
+                logger.info("[TGAhermes] status bubble kept out of the "
+                            "business chat=%s", chat_id)
+                return SendResult(success=True, message_id=None)
             _ok = await _biz_send(adapter, chat_id, str(content or ""))
             return SendResult(success=bool(_ok), message_id=None)
         if _is_guest_chat(chat_id):

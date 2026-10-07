@@ -3340,5 +3340,90 @@ def _t36():
 
 _t36()
 
+def _t37():
+    """Three leaks into a customer chat, each closed: gateway status bubbles
+    ("⏳ Working…"), a reply generated while the owner was answering, and a
+    thread that reads engaged seconds after he took it back."""
+    from types import SimpleNamespace
+    print("\n[37] no status bubble, no reply on top of him, no stale engaged")
+    ad = FakeAdapter()
+    mod._ADAPTER["adapter"] = ad
+    _saved = (dict(mod._BIZ_OWNER_SEEN), dict(mod._BIZ_REPLIED),
+              dict(mod._BIZ_TURN), dict(mod._BIZ_CTX),
+              mod._biz_chat_known, mod._biz_send, mod._biz_try_send,
+              mod.settings().get("biz_idle_delay_min"))
+    mod._BIZ_OWNER_SEEN.clear()
+    mod._BIZ_REPLIED.clear()
+    mod._BIZ_TURN.clear()
+    mod._BIZ_CTX.clear()
+    mod.save_settings({"biz_idle_delay_min": 7})
+    sent = []
+
+    async def _fake_biz_send(_ad, chat_id, text):
+        sent.append((str(chat_id), text))
+        return True
+
+    async def _fake_try_send(_ad, chat_id, text, preferred=""):
+        sent.append((str(chat_id), text))
+        return True, NS(message_id=77)
+
+    mod._biz_chat_known = lambda cid: str(cid) == "730001"
+    mod._biz_send = _fake_biz_send
+    mod._biz_try_send = _fake_try_send
+    try:
+        # (a) the working heartbeat and friends never reach the customer
+        check(mod._is_status_bubble("\u23f3 Working"),
+              "the working heartbeat is a status bubble")
+        check(mod._is_status_bubble("typing", {"_interim_send": True}),
+              "an interim send is status chatter however it is phrased")
+        check(not mod._is_status_bubble("your order shipped"),
+              "a normal reply is not a status bubble")
+        mod._install_wraps(ad)
+        asyncio.run(ad.send("730001", "\u23f3 Working", metadata={"_interim_send": True}))
+        check(not sent, "status bubble kept out of the business chat")
+        asyncio.run(ad.send("730001", "your order shipped"))
+        check(sent and sent[-1][1] == "your order shipped",
+              "the real reply still goes over the business connection")
+        sent.clear()
+        asyncio.run(ad.send("900000999", "\u23f3 Working"))
+        check(not sent, "another chat keeps its own status line")
+
+        # (b) a reply written while he answered must be dropped, not sent
+        ev = NS(metadata={}, source=NS(chat_id="730001"))
+        mod._BIZ_TURN["730001"] = time.time() - 5.0
+        mod._BIZ_OWNER_SEEN["730001"] = time.time()
+        r = asyncio.run(mod._biz_deliver(ad, ev, "bc", "already written"))
+        check(not sent, "he posted after the dispatch: nothing goes out")
+        check(not getattr(r[0], "success", True),
+              "the drop reports no delivery")
+        mod._BIZ_OWNER_SEEN["730001"] = time.time() - 60.0
+        asyncio.run(mod._biz_deliver(ad, ev, "bc", "already written"))
+        check(sent and sent[-1][1] == "already written",
+              "he had not spoken: the reply goes out as before")
+
+        # (c) inside the wait window his presence beats a newer reply stamp
+        mod._BIZ_REPLIED["730001"] = time.time()
+        mod._BIZ_OWNER_SEEN["730001"] = time.time() - 30.0
+        check(not mod._biz_engaged("730001"),
+              "he spoke inside the window: the next message waits")
+        mod._BIZ_OWNER_SEEN["730001"] = time.time() - 500.0
+        check(mod._biz_engaged("730001"),
+              "window spent with no word from him: engaged again")
+    finally:
+        mod._BIZ_OWNER_SEEN.clear()
+        mod._BIZ_OWNER_SEEN.update(_saved[0])
+        mod._BIZ_REPLIED.clear()
+        mod._BIZ_REPLIED.update(_saved[1])
+        mod._BIZ_TURN.clear()
+        mod._BIZ_TURN.update(_saved[2])
+        mod._BIZ_CTX.clear()
+        mod._BIZ_CTX.update(_saved[3])
+        mod._biz_chat_known, mod._biz_send, mod._biz_try_send = _saved[4], _saved[5], _saved[6]
+        mod.save_settings({"biz_idle_delay_min": _saved[7]})
+        mod._ADAPTER["adapter"] = None
+
+
+_t37()
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)
