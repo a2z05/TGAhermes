@@ -3145,6 +3145,28 @@ def _t34():
                   "replied-after-owner reads as engaged")
             check(not mod._biz_engaged("910222"),
                   "a chat we never spoke in is not engaged")
+
+            # the store's last reply counts even when its own delivery
+            # status said otherwise: waiting again is the worse failure
+            class _Row:
+                def chat_state(self, cid):
+                    # inbound bumps last_at; only replied_at proves we spoke
+                    if str(cid) == "910444":
+                        return {"chat_id": cid, "last_at": time.time(),
+                                "replied_at": None, "replies": 0}
+                    return {"chat_id": cid, "last_at": time.time(),
+                            "replied_at": time.time() - 5.0,
+                            "last_status": "ok"}
+            _real_store = mod._biz_store
+            mod._biz_store = lambda: _Row()
+            try:
+                check(mod._biz_engaged("910333"),
+                      "the store's reply stamp engages the chat")
+                check(not mod._biz_engaged("910444"),
+                      "inbound activity alone (replied_at unset) never engages")
+            finally:
+                mod._biz_store = _real_store
+            mod._BIZ_REPLIED.pop("910333", None)
             mod._biz_idle_delay_s = lambda st: 1.5
             _t = time.monotonic()
             ad = _Ad()

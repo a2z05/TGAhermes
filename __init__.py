@@ -1091,11 +1091,12 @@ def _bump_owner_seen(event: Any) -> None:
         if _cid:
             _BIZ_OWNER_SEEN[_cid] = time.time()
             _presence_write()
+            logger.info("[TGAhermes] owner presence chat=%s", _cid)
     except Exception:
         logger.debug("[TGAhermes] owner presence update failed", exc_info=True)
 
 
-def _biz_engaged(chat_id: Any) -> bool:
+def _biz_engaged(chat_id: Any, store: Any = None) -> bool:
     """True when ATRA has already spoken in this chat and the owner has not
     come back to it since — the entry grace for THIS conversation is spent.
 
@@ -1107,24 +1108,33 @@ def _biz_engaged(chat_id: Any) -> bool:
     _presence_load()
     _cid = str(chat_id or "")
     _at = _BIZ_REPLIED.get(_cid)
+    _last = 0.0
     if not _at:
         # No stamp of our own: the store still knows when the last reply
-        # actually went out, so a live thread stays live across reloads.
-        store = _biz_store()
+        # went out, so a live thread stays live across reloads. It is the
+        # reply stamp, NOT last_at — remember_chat moves last_at for every
+        # inbound message, which would call a chat engaged the moment its
+        # customer says hello.
+        if store is None:
+            store = _biz_store()
         state = None
         if store is not None:
             try:
                 state = store.chat_state(_cid)
             except Exception:
                 logger.debug("[TGAhermes] chat state lookup failed", exc_info=True)
-        state = state or {}
-        _last = float(state.get("last_at") or 0.0)
-        if _last > 0.0 and str(state.get("last_status") or "") == "ok":
+        _last = float((state or {}).get("replied_at") or 0.0)
+        if _last > 0.0:
             _at = _last
             _BIZ_REPLIED[_cid] = _at
-    if not _at:
-        return False
-    return _at > (_BIZ_OWNER_SEEN.get(_cid) or 0.0)
+    _out = bool(_at) and _at > (_BIZ_OWNER_SEEN.get(_cid) or 0.0)
+    # One line per message: this is the decision that decides whether he
+    # waits, and without its inputs a wrong hold can only be guessed at.
+    logger.info(
+        "[TGAhermes] Chat Automation engaged? chat=%s engaged=%s "
+        "replied_at=%s owner_seen=%s store_replied_at=%s",
+        _cid, _out, _at or 0.0, _BIZ_OWNER_SEEN.get(_cid) or 0.0, _last)
+    return _out
 
 
 def _active_bcid() -> str:
@@ -1583,6 +1593,7 @@ async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -
             st0 = settings()
             if mid and st0.get("biz_react"):
                 _spawn(_react(chat_id, mid, st0.get("biz_react_emoji") or "\U0001f47e"))
+    logger.info("[TGAhermes] reply delivered=%s chat=%s", bool(ok), chat_id)
     store = _biz_store()
     if store is not None and chat_id:
         try:
@@ -1783,7 +1794,7 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     # it; his traffic anywhere else never does.
     _delay = _biz_idle_delay_s(st)
     _t0 = time.time()
-    if _delay > 0 and _biz_engaged(chat_id):
+    if _delay > 0 and _biz_engaged(chat_id, store):
         logger.info("[TGAhermes] Chat Automation skip hold: engaged chat=%s",
                     chat_id)
         _delay = 0.0

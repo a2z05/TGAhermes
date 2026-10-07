@@ -281,10 +281,17 @@ class BizStore:
                     warned_lang TEXT,
                     replies   INTEGER DEFAULT 0,
                     last_at   REAL,
-                    last_status TEXT
+                    last_status TEXT,
+                    replied_at REAL
                 );
                 """
             )
+            # installs that predate the column: last_at also counts inbound
+            # messages, so "when did I last actually reply" had nowhere to live.
+            try:
+                c.execute("ALTER TABLE biz_chats ADD COLUMN replied_at REAL")
+            except sqlite3.OperationalError:
+                pass
             c.commit()
         finally:
             c.close()
@@ -374,11 +381,11 @@ class BizStore:
         c = sqlite3.connect(str(self.path))
         try:
             c.execute(
-                "INSERT INTO biz_chats (chat_id, first_seen, replies, last_at, last_status) "
-                "VALUES (?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET "
+                "INSERT INTO biz_chats (chat_id, first_seen, replies, last_at, last_status, replied_at) "
+                "VALUES (?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET "
                 "replies=biz_chats.replies+1, last_at=excluded.last_at, "
-                "last_status=excluded.last_status",
-                (str(chat_id), time.time(), 1, time.time(), status))
+                "last_status=excluded.last_status, replied_at=excluded.replied_at",
+                (str(chat_id), time.time(), 1, time.time(), status, time.time()))
             c.commit()
         finally:
             c.close()
