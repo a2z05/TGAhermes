@@ -1027,6 +1027,48 @@ _BIZ_ACTIVE_ID: str = ""                   # last attached connection id (see _o
 # else must never clear it. In-memory only: one monotonic clock, and it is
 # meaningless across a restart.
 _BIZ_OWNER_SEEN: Dict[str, float] = {}
+_BIZ_REPLIED: Dict[str, float] = {}
+# Both stamps are wall-clock epochs, not monotonic: they have to survive a
+# reload and line up with the store's own reply timestamps.
+_PRESENCE_TTL = 7 * 24 * 3600.0
+_PRESENCE_LOADED = False
+
+
+def _presence_load() -> None:
+    """Hydrate both stamps from state.json once per process.
+
+    Without this every deploy would forget that a thread is live, and the
+    next message in it would sit on a fresh hold for no reason."""
+    global _PRESENCE_LOADED
+    if _PRESENCE_LOADED:
+        return
+    _PRESENCE_LOADED = True
+    try:
+        _now = time.time()
+        _p = (_load_state() or {}).get("biz_presence") or {}
+        for _key, _target in (("owner", _BIZ_OWNER_SEEN), ("replied", _BIZ_REPLIED)):
+            for _cid, _ts in (_p.get(_key) or {}).items():
+                _ts = float(_ts or 0.0)
+                if 0.0 < _ts and _now - _ts < _PRESENCE_TTL:
+                    _target[str(_cid)] = _ts
+    except Exception:
+        logger.debug("[TGAhermes] presence load failed", exc_info=True)
+
+
+def _presence_write() -> None:
+    """Persist both stamps, TTL-pruned, into the plugin state file."""
+    def _w(st: Dict[str, Any]) -> None:
+        _now = time.time()
+        st["biz_presence"] = {
+            "owner": {k: v for k, v in _BIZ_OWNER_SEEN.items()
+                      if _now - v < _PRESENCE_TTL},
+            "replied": {k: v for k, v in _BIZ_REPLIED.items()
+                        if _now - v < _PRESENCE_TTL},
+        }
+    try:
+        _mutate_state(_w)
+    except Exception:
+        logger.debug("[TGAhermes] presence save failed", exc_info=True)
 
 
 def _bump_owner_seen(event: Any) -> None:
@@ -1038,6 +1080,7 @@ def _bump_owner_seen(event: Any) -> None:
     business_message, and the automation handler never sees it.
     """
     try:
+        _presence_load()
         if event is None or getattr(event, "internal", False):
             return
         _src_ev = getattr(event, "source", None)
@@ -1046,12 +1089,10 @@ def _bump_owner_seen(event: Any) -> None:
             return
         _cid = str(getattr(_src_ev, "chat_id", "") or "")
         if _cid:
-            _BIZ_OWNER_SEEN[_cid] = time.monotonic()
+            _BIZ_OWNER_SEEN[_cid] = time.time()
+            _presence_write()
     except Exception:
         logger.debug("[TGAhermes] owner presence update failed", exc_info=True)
-
-
-_BIZ_REPLIED: Dict[str, float] = {}
 
 
 def _biz_engaged(chat_id: Any) -> bool:
@@ -1063,8 +1104,24 @@ def _biz_engaged(chat_id: Any) -> bool:
     back, the conversation is live: the next message in it must not sit on a
     fresh wait. Only his posting HERE re-arms the delay, so him answering
     somewhere else can never hold up a conversation already under way."""
+    _presence_load()
     _cid = str(chat_id or "")
     _at = _BIZ_REPLIED.get(_cid)
+    if not _at:
+        # No stamp of our own: the store still knows when the last reply
+        # actually went out, so a live thread stays live across reloads.
+        store = _biz_store()
+        state = None
+        if store is not None:
+            try:
+                state = store.chat_state(_cid)
+            except Exception:
+                logger.debug("[TGAhermes] chat state lookup failed", exc_info=True)
+        state = state or {}
+        _last = float(state.get("last_at") or 0.0)
+        if _last > 0.0 and str(state.get("last_status") or "") == "ok":
+            _at = _last
+            _BIZ_REPLIED[_cid] = _at
     if not _at:
         return False
     return _at > (_BIZ_OWNER_SEEN.get(_cid) or 0.0)
@@ -1480,7 +1537,8 @@ async def _biz_try_send(adapter: Any, chat_id: Any, text: str,
                 chat_id=chat_id, text=str(text)[:4000],
                 business_connection_id=bcid)
             # A message that actually went out spends the entry grace period.
-            _BIZ_REPLIED[str(chat_id)] = time.monotonic()
+            _BIZ_REPLIED[str(chat_id)] = time.time()
+            _presence_write()
             # Remember the id that actually worked (the cached one may be stale).
             if _BIZ_CONN.get(str(chat_id)) != bcid:
                 _BIZ_CONN[str(chat_id)] = bcid
@@ -1724,7 +1782,7 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     # wait for — answer it now. Within a wait, his reply in THIS chat cancels
     # it; his traffic anywhere else never does.
     _delay = _biz_idle_delay_s(st)
-    _t0 = time.monotonic()
+    _t0 = time.time()
     if _delay > 0 and _biz_engaged(chat_id):
         logger.info("[TGAhermes] Chat Automation skip hold: engaged chat=%s",
                     chat_id)

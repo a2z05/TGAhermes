@@ -2257,9 +2257,9 @@ async def _t27():
         check(bool(getattr(_ev, "channel_prompt", "")),
               "assistant: persona + identity prompt attached")
 
-        # Plain hold: EVERY message waits the configured delay (no idle
-        # threshold, no engaged flag), and the owner replying inside that
-        # window — in THIS chat — cancels ATRA's turn.
+        # Plain hold: a message waits the configured delay unless the thread
+        # is already engaged (no idle threshold), and the owner replying
+        # inside that window — in THIS chat — cancels ATRA's turn.
         mod.save_settings({"biz_idle_delay_min": 0.005})  # 0.3s hold
         _h0 = stub.handles
         _ta = time.monotonic()
@@ -2272,7 +2272,7 @@ async def _t27():
         _t27task = asyncio.create_task(
             mod._handle_business_message(stub, _mk_update(), None))
         await asyncio.sleep(0.1)
-        mod._BIZ_OWNER_SEEN["700000"] = time.monotonic()
+        mod._BIZ_OWNER_SEEN["700000"] = time.time()
         await _t27task
         check(stub.handles == _h0 + 2,
               "owner replying in another chat does not cancel this hold")
@@ -2281,7 +2281,7 @@ async def _t27():
         _t27task = asyncio.create_task(
             mod._handle_business_message(stub, _mk_update(), None))
         await asyncio.sleep(0.1)
-        mod._BIZ_OWNER_SEEN["770011"] = time.monotonic()
+        mod._BIZ_OWNER_SEEN["770011"] = time.time()
         await _t27task
         check(stub.handles == _h0 + 2,
               "owner replying inside the window cancels ATRA's turn")
@@ -3104,7 +3104,7 @@ def _t34():
             if _owner:
                 mod._bump_owner_seen(NS(internal=False,
                                         source=NS(user_id=_owner, chat_id="910111")))
-                _age = time.monotonic() - (mod._BIZ_OWNER_SEEN.get("910111") or 0)
+                _age = time.time() - (mod._BIZ_OWNER_SEEN.get("910111") or 0)
                 check("910111" in mod._BIZ_OWNER_SEEN and 0 <= _age < 5,
                       "an owner message stamps the chat")
                 _before = dict(mod._BIZ_OWNER_SEEN)
@@ -3121,7 +3121,7 @@ def _t34():
 
             # stand-down: a stamp from inside the window cancels the hold
             mod._BIZ_OWNER_SEEN.clear()
-            mod._BIZ_OWNER_SEEN["910111"] = time.monotonic() + 60.0
+            mod._BIZ_OWNER_SEEN["910111"] = time.time() + 60.0
             ad = _Ad()
             await mod._handle_business_message(ad, _mk("hi there"), None)
             check(not ad.events and not ad._bot.sent,
@@ -3139,8 +3139,8 @@ def _t34():
             # straight away instead of sitting on a fresh hold.
             mod._BIZ_OWNER_SEEN.clear()
             mod._BIZ_REPLIED.clear()
-            mod._BIZ_REPLIED["910111"] = time.monotonic()
-            mod._BIZ_OWNER_SEEN["910111"] = time.monotonic() - 60.0
+            mod._BIZ_REPLIED["910111"] = time.time()
+            mod._BIZ_OWNER_SEEN["910111"] = time.time() - 60.0
             check(mod._biz_engaged("910111"),
                   "replied-after-owner reads as engaged")
             check(not mod._biz_engaged("910222"),
@@ -3151,9 +3151,22 @@ def _t34():
             await mod._handle_business_message(ad, _mk("hi there"), None)
             check(time.monotonic() - _t < 1.0 and bool(ad.events),
                   "engaged chat answers now — no wait")
-            mod._BIZ_OWNER_SEEN["910111"] = time.monotonic()
+            mod._BIZ_OWNER_SEEN["910111"] = time.time()
             check(not mod._biz_engaged("910111"),
                   "owner taking the thread back re-arms the wait")
+
+            # and both stamps survive a reload, so a deploy does not
+            # hand a live thread back to the hold
+            mod._presence_write()
+            _so, _sr = dict(mod._BIZ_OWNER_SEEN), dict(mod._BIZ_REPLIED)
+            mod._BIZ_OWNER_SEEN.clear()
+            mod._BIZ_REPLIED.clear()
+            mod._PRESENCE_LOADED = False
+            mod._presence_load()
+            check(mod._BIZ_OWNER_SEEN.get("910111") == _so.get("910111")
+                  and mod._BIZ_REPLIED.get("910111") == _sr.get("910111"),
+                  "presence stamps survive a reload")
+            mod._PRESENCE_LOADED = True
         finally:
             (mod._log, mod._biz_store, mod._biz_idle_delay_s) = _orig[:3]
             mod._BIZ_OWNER_SEEN.clear()
