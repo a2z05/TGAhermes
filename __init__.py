@@ -168,8 +168,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "biz_window_start": "00:00",     # window mode only, HH:MM local
     "biz_window_end": "23:59",       # window mode only (may wrap past midnight)
     "biz_window_days": [],           # [] = every day; else ["mon","tue",...]
-    "biz_idle_delay_min": 0,         # wait this long when the owner was idle
-    "biz_owner_idle_min": 10,        # owner counts as idle after this many minutes
+    "biz_idle_delay_min": 0,         # plain hold on every message; 0 = instant
     "biz_sessions_split": True,      # whitelisted DM != automation session
 }
 
@@ -1022,15 +1021,11 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
 # --- Chat Automation wiring: connection map + owner presence ---------------
 _BIZ_CONN: Dict[str, str] = {}             # chat_id -> business_connection_id (live)
 _BIZ_ACTIVE_ID: str = ""                   # last attached connection id (see _on_business_connection)
-_OWNER_LAST_SEEN: Dict[str, float] = {"t": 0.0}   # monotonic ts of owner's last event
-# chat_id -> monotonic ts of ATRA's last successful reply there.
-_BIZ_REPLIED: Dict[str, float] = {}
 # chat_id -> monotonic ts of the owner's own last message IN THAT chat.
-# The spent grace period is per conversation, not global: it holds until the
-# owner comes back to *that* chat, and the owner posting there arms the delay
-# again. The owner talking somewhere else must not clear it. In-memory only —
-# every value here shares the same monotonic clock and all of them are
-# meaningless across a restart, where the owner is treated as just-seen anyway.
+# The reply window is per conversation: a message only cancels ATRA's hold
+# when the owner posts in THAT chat during the window — his traffic anywhere
+# else must never clear it. In-memory only: one monotonic clock, and it is
+# meaningless across a restart.
 _BIZ_OWNER_SEEN: Dict[str, float] = {}
 
 
@@ -1055,75 +1050,6 @@ def _active_bcid() -> str:
         except Exception:
             logger.debug("[TGAhermes] connection lookup failed", exc_info=True)
     return ""  # none recorded yet
-
-
-
-def _owner_idle_for(st: Optional[Dict[str, Any]] = None) -> float:
-    """Minutes the owner has been silent. Cold process = 0.0 (just seen)."""
-    last = _OWNER_LAST_SEEN.get("t") or 0.0
-    if not last:
-        return 0.0
-    return max(0.0, (time.monotonic() - last) / 60.0)
-
-
-def _owner_idle(st: Optional[Dict[str, Any]] = None) -> bool:
-    """Warn-first gate: True when the owner has not talked to ATRA for the
-    configured window (default 10 min, owner-tunable via biz_owner_idle_min).
-
-    The Bot API exposes no online status, so presence is inferred from the
-    owner's own inbound traffic; a cold process starts idle (warn on)."""
-    _s = st if isinstance(st, dict) else settings()
-    # `0 or 10` would turn the documented "0 = never idle" into 10 minutes, so
-    # an explicit None check is what keeps that promise.
-    raw = _s.get("biz_owner_idle_min")
-    try:
-        need = 10.0 if raw is None else float(raw)
-    except Exception:
-        need = 10.0
-    if need <= 0:
-        return False
-    quiet = _owner_idle_for(_s)
-    if quiet <= 0.0:
-        return True   # never seen this process: treat as idle (fail loud, not silent)
-    return quiet >= need
-
-
-def _bump_owner_seen(event: Any) -> None:
-    """Remember the owner just spoke (called from the dispatch hook).
-
-    Records both the global stamp (drives the idle window) and the per-chat
-    stamp, which is what re-arms the automation delay for that one conversation."""
-    try:
-        if event is None:
-            return
-        _src_ev = getattr(event, "source", None)
-        _uid = str(getattr(_src_ev, "user_id", "") or "")
-        if _uid and _uid == str(_owner_id() or "") and not getattr(event, "internal", False):
-            _now = time.monotonic()
-            _OWNER_LAST_SEEN["t"] = _now
-            _cid = str(getattr(_src_ev, "chat_id", "") or "")
-            if _cid:
-                _BIZ_OWNER_SEEN[_cid] = _now
-    except Exception:
-        logger.debug("[TGAhermes] owner presence update failed", exc_info=True)
-
-
-def _biz_engaged(chat_id: Any) -> bool:
-    """True when ATRA has already spoken in this chat and the owner has not
-    come back to it since — i.e. the entry grace period for this conversation
-    is spent.
-
-    The idle delay exists once, to give a returning owner the first word. Once
-    ATRA has answered, the conversation is live and the next message in it must
-    not sit on a fresh 5-minute wait. Both stamps share one monotonic clock, and
-    the reset is deliberately scoped to *this* chat: only the owner posting here
-    arms the delay again, so the owner answering somewhere else can never hold up
-    a conversation that is already under way."""
-    _cid = str(chat_id or "")
-    _at = _BIZ_REPLIED.get(_cid)
-    if not _at:
-        return False
-    return _at > (_BIZ_OWNER_SEEN.get(_cid) or 0.0)
 
 
 # ---------------------------------------------------------------- chat automation (bizauto)
@@ -1323,11 +1249,10 @@ def _biz_should_answer(st: Optional[Dict[str, Any]] = None,
 
 
 def _biz_idle_delay_s(st: Optional[Dict[str, Any]] = None) -> float:
-    """Seconds an automation turn waits when the owner is idle.
+    """Seconds every automation message is held before ATRA may answer.
 
-    0 means answer immediately. The owner's example: idle threshold 10 min,
-    then wait 5 min before ATRA steps in — so a human who is away and returns
-    gets a chance to answer first.
+    0 means answer immediately. Plain wait with no conditions: the hold is
+    cancelled only by the owner replying in that chat during the window.
     """
     _s = st if isinstance(st, dict) else settings()
     try:
@@ -1421,6 +1346,31 @@ def _biz_wants_owner(chat_id: Any) -> bool:
     return _biz_chat_known(chat_id)
 
 
+def _biz_safe_thread(tid: Any) -> Any:
+    """A thread id is only usable as ``message_thread_id`` when it is a real
+    message id. The ``bizauto:<chat>`` session-split marker is not one, and
+    int() on it crashed every queued-lane final for automation chats."""
+    if tid is None or tid == "":
+        return None
+    try:
+        int(tid)
+    except (TypeError, ValueError):
+        return None
+    return tid
+
+
+def _biz_safe_metadata(metadata: Any) -> Any:
+    """Metadata without non-numeric thread ids (see _biz_safe_thread).
+    Returns the input untouched when there is nothing to drop."""
+    if not isinstance(metadata, dict):
+        return metadata
+    drop = [k for k in ("thread_id", "message_thread_id")
+            if k in metadata and _biz_safe_thread(metadata.get(k)) is None]
+    if not drop:
+        return metadata
+    return {k: v for k, v in metadata.items() if k not in drop}
+
+
 def _biz_list_patch(key: str, raw: str) -> list:
     """Wizard input -> updated list: 'all' clears, '-x' removes, 'x' adds."""
     cur = [str(x) for x in (settings().get(key) or [])]
@@ -1435,28 +1385,86 @@ def _biz_list_patch(key: str, raw: str) -> list:
     return cur
 
 
+def _bcid_candidates(chat_id: Any, preferred: str = "") -> List[str]:
+    """Ordered connection ids to try for one delivery: the preferred (event
+    or per-chat) id first, then the map, then the live connection, then the
+    newest ENABLED row on record. Deduplicated, empties dropped — a reconnect
+    rotates the id and a cached stale one is rejected with
+    Business_connection_invalid."""
+    out: List[str] = []
+    seen: set = set()
+
+    def _add(x: Any) -> None:
+        v = str(x or "").strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+
+    _add(preferred)
+    _add(_BIZ_CONN.get(str(chat_id or ""), ""))
+    _add(_active_bcid())
+    store = _biz_store()
+    if store is not None:
+        try:
+            for c in (store.connections() or [])[::-1]:
+                if str(c.get("is_enabled") or "") == "true":
+                    _add(c.get("business_connection_id"))
+                    break
+        except Exception:
+            logger.debug("[TGAhermes] connection lookup failed", exc_info=True)
+    return out
+
+
+def _bcid_retriable(err: Any) -> bool:
+    """The connection id was rejected — a different candidate may still work."""
+    return "Business_connection_invalid" in str(err)
+
+
+async def _biz_try_send(adapter: Any, chat_id: Any, text: str,
+                        preferred: str = "") -> "tuple[bool, Optional[Any]]":
+    """Send over the business connection, rotating to a live connection id
+    when Telegram rejects the one we had. Returns (delivered, sent): a failed
+    send must never raise — delivery callers treat False as a refusal."""
+    if not chat_id or not text:
+        return False, None
+    cands = _bcid_candidates(chat_id, preferred)
+    if not cands:
+        logger.warning("[TGAhermes] automation reply dropped, no business "
+                       "connection (chat=%s)", chat_id)
+        return False, None
+    last_err: Any = None
+    for i, bcid in enumerate(cands):
+        try:
+            sent = await adapter._bot.send_message(
+                chat_id=chat_id, text=str(text)[:4000],
+                business_connection_id=bcid)
+            # Remember the id that actually worked (the cached one may be stale).
+            if _BIZ_CONN.get(str(chat_id)) != bcid:
+                _BIZ_CONN[str(chat_id)] = bcid
+            return True, sent
+        except Exception as e:
+            last_err = e
+            if _bcid_retriable(e) and i < len(cands) - 1:
+                logger.info("[TGAhermes] connection rejected, trying the next "
+                            "one (chat=%s): %s", chat_id, e)
+                continue
+            break
+    logger.warning("[TGAhermes] automation send failed (chat=%s): %s",
+                   chat_id, last_err)
+    return False, None
+
+
 async def _biz_send(adapter: Any, chat_id: Any, text: str) -> bool:
     """Best-effort text delivery over the business connection."""
-    # Fall back to the recorded connection: this may be a wrap from a previous
-    # module load whose _BIZ_CONN froze at reload, and incoming messages do not
-    # always carry the id either way.
-    bcid = _BIZ_CONN.get(str(chat_id) or "") or _active_bcid()
-    if not bcid or not text:
-        return False
-    try:
-        await adapter._bot.send_message(chat_id=chat_id, text=str(text)[:4000],
-                                        business_connection_id=bcid)
-        _BIZ_REPLIED[str(chat_id)] = time.monotonic()
-        return True
-    except Exception:
-        logger.warning("[TGAhermes] automation send failed (chat=%s)", chat_id, exc_info=True)
-        return False
+    ok, _ = await _biz_try_send(adapter, chat_id, text)
+    return ok
 
 
 async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -> Any:
     """Final reply of an automation turn: deliver via the business connection
-    (it appears as the owner's message), remember the reply, and drop the
-    configured reaction on it when enabled."""
+    (it appears as the owner's message) and drop the configured reaction on
+    it when enabled. Connection ids rotate on reconnect, so delivery goes
+    through _biz_try_send's candidate rotation instead of one cached id."""
     from gateway.platforms.base import SendResult
     md = getattr(event, "metadata", None) or {}
     src = getattr(event, "source", None)
@@ -1467,28 +1475,13 @@ async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -
         logger.debug("[TGAhermes] turn marker release failed", exc_info=True)
     ok = False
     if chat_id and text_content and str(text_content).strip():
-        if not bcid:
-            bcid = _BIZ_CONN.get(chat_id, "") or _active_bcid()
-        if bcid:
-            try:
-                sent = await adapter._bot.send_message(
-                    chat_id=chat_id, text=str(text_content)[:4000],
-                    business_connection_id=bcid)
-                ok = True
-                mid = getattr(sent, "message_id", None)
-                st0 = settings()
-                if mid and st0.get("biz_react"):
-                    _spawn(_react(chat_id, mid, st0.get("biz_react_emoji") or "\U0001f47e"))
-            except Exception as e:
-                logger.warning("[TGAhermes] automation reply failed (chat=%s): %s",
-                               chat_id, e, exc_info=True)
-        else:
-            logger.warning("[TGAhermes] automation reply dropped, no business "
-                           "connection (chat=%s)", chat_id)
-    if ok and chat_id:
-        # Only a reply that actually went out spends the grace period; a failed
-        # send leaves the next message waiting for the owner as before.
-        _BIZ_REPLIED[str(chat_id)] = time.monotonic()
+        ok, sent = await _biz_try_send(adapter, chat_id, str(text_content),
+                                       preferred=str(bcid or ""))
+        if ok:
+            mid = getattr(sent, "message_id", None)
+            st0 = settings()
+            if mid and st0.get("biz_react"):
+                _spawn(_react(chat_id, mid, st0.get("biz_react_emoji") or "\U0001f47e"))
     store = _biz_store()
     if store is not None and chat_id:
         try:
@@ -1666,24 +1659,31 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
                    f"\n<b>Text:</b> <i>{_esc(text[:300])}</i>"
                    f"\n<b>Action:</b> {_esc(_why)} — nothing sent", buttons=prof)
         return
-    # --- idle delay: owner was away -> hold the answer briefly ------------
-    # The hold is spent once per conversation, not once per message: after
-    # ATRA has answered this chat the conversation is live, and the next
-    # message in it goes straight out. A returning owner still gets the first
-    # word — the delay only governs ATRA's ENTRY, and seeing the owner again
-    # (or an untouched chat) arms it back.
+    # --- plain hold: every message waits; your reply in this chat cancels it
+    # No idle threshold, no engaged flag: hold the message for the configured
+    # delay, then trigger ATRA's answer only if the owner has not replied in
+    # THIS chat during the window. Him posting there = he took it, ATRA stands
+    # down. His traffic anywhere else never cancels another chat's hold.
     _delay = _biz_idle_delay_s(st)
-    if _delay > 0 and _owner_idle(st) and not _biz_engaged(chat_id):
-        _quiet = _owner_idle_for(st)
+    _t0 = time.monotonic()
+    if _delay > 0:
         try:
             await _log("🤖 Chat Automation — waiting for owner",
                        f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"
-                       f"\n<b>Owner idle:</b> {_quiet:.1f} min · "
-                       f"<b>holding:</b> {_delay / 60.0:.1f} min "
-                       f"<i>(answer this without me if I am back)</i>", buttons=prof)
+                       f"\n<b>Holding:</b> {_delay / 60.0:.1f} min "
+                       f"<i>(reply in this chat and I stay out)</i>", buttons=prof)
         except Exception:
-            logger.debug("[TGAhermes] idle-delay log failed", exc_info=True)
+            logger.debug("[TGAhermes] hold log failed", exc_info=True)
         await asyncio.sleep(_delay)
+        if (_BIZ_OWNER_SEEN.get(str(chat_id)) or 0.0) >= _t0:
+            try:
+                await _log("🤖 Chat Automation — owner answered",
+                           f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"
+                           f"\n<b>Action:</b> you replied inside the window — "
+                           f"ATRA stood down", buttons=prof)
+            except Exception:
+                logger.debug("[TGAhermes] stand-down log failed", exc_info=True)
+            return
     # --- first-contact warning: once per chat, before ATRA's first reply ----
     warned = False
     if store is not None:
@@ -1691,8 +1691,7 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
             warned = bool((store.chat_state(chat_id) or {}).get("warned_at"))
         except Exception:
             warned = False
-    if (st.get("biz_warn_first") and not warned and bcid
-            and _owner_idle()):
+    if st.get("biz_warn_first") and not warned and bcid:
         warn = str(st.get("biz_warn_text") or "").strip() or (
             bizauto.warn_text(lang) if bizauto else "")
         sent_warn = False
@@ -1936,7 +1935,8 @@ def _install_wraps(adapter: Any) -> None:
             return SendResult(success=bool(_ok), message_id=None)
         if _is_guest_chat(chat_id):
             return SendResult(success=True, message_id=None)
-        return await _orig_send(chat_id, content, reply_to, metadata)
+        return await _orig_send(chat_id, content, reply_to,
+                                _biz_safe_metadata(metadata))
 
     _orig_send = _true(adapter.send, "_orig_send")
     adapter.send = send
@@ -1955,12 +1955,23 @@ def _install_wraps(adapter: Any) -> None:
             else:
                 logger.info("[TGAhermes] empty final for guest query %s", gqid)
             return SendResult(success=True, message_id=None), adapter
+        # A session-split marker ("bizauto:<chat>") is not a forum thread id:
+        # int() on it as message_thread_id is exactly what crashed queued-lane
+        # finals for automation chats. Drop it before any core send sees it.
+        metadata = _biz_safe_metadata(metadata)
         _fchat = getattr(getattr(event, "source", None), "chat_id", "")
-        if str(md.get("business_connection_id") or ""):
+        _bcid = str(md.get("business_connection_id") or "")
+        _ctx_biz = _BIZ_CTX.get(str(_fchat or "")) == "business"
+        if not _bcid and _ctx_biz:
+            # Queued/synthetic events arrive WITHOUT the event metadata (the
+            # bcid lives only on the original event): recover the connection
+            # from the live map/candidates so the reply still goes out as the
+            # owner instead of falling into the plain path that crashes.
+            _cands = _bcid_candidates(_fchat)
+            _bcid = _cands[0] if _cands else ""
+        if _bcid or _ctx_biz:
             _biz_mark(_fchat, "business")
-            return await _biz_deliver(adapter, event,
-                                      str(md["business_connection_id"]),
-                                      text_content)
+            return await _biz_deliver(adapter, event, _bcid, text_content)
         # Non-business final: every send belonging to this turn (including the
         # delivery below) must go out as the bot, even for chats with business
         # history — otherwise the reply lands in the owner's personal DM.
@@ -2002,7 +2013,8 @@ def _install_wraps(adapter: Any) -> None:
                                  exc_info=True)
                 return SendResult(success=True, message_id=None)
         if not _is_guest_chat(chat_id):
-            return await _orig_sc(chat_id, question, choices, clarify_id, session_key, metadata)
+            return await _orig_sc(chat_id, question, choices, clarify_id, session_key,
+                                  _biz_safe_metadata(metadata))
         try:
             if choices:
                 try:
@@ -2035,8 +2047,10 @@ def _install_wraps(adapter: Any) -> None:
     async def _send_prompt(what, chat_id, metadata, build, *, parse_mode=None,
                            thread_id=None, reply_to_mode=None):
         if not _is_guest_chat(chat_id):
-            return await _orig_sp(what, chat_id, metadata, build, parse_mode=parse_mode,
-                                  thread_id=thread_id, reply_to_mode=reply_to_mode)
+            return await _orig_sp(what, chat_id, _biz_safe_metadata(metadata), build,
+                                  parse_mode=parse_mode,
+                                  thread_id=_biz_safe_thread(thread_id),
+                                  reply_to_mode=reply_to_mode)
         try:
             built = build()
             if isinstance(built, SendResult):
@@ -2119,17 +2133,17 @@ def _install_wraps(adapter: Any) -> None:
 
     async def send_typing(chat_id, metadata=None):
         if _biz_wants_owner(chat_id):
-            _bc = _BIZ_CONN.get(str(chat_id) or "") or _active_bcid()
-            if _bc:
+            _cand = _bcid_candidates(chat_id)
+            if _cand:
                 try:
                     await adapter._bot.send_chat_action(chat_id=chat_id,
                                                         action="typing",
-                                                        business_connection_id=_bc)
+                                                        business_connection_id=_cand[0])
                 except Exception:
                     logger.debug("[TGAhermes] business typing failed", exc_info=True)
             return
         if not _is_guest_chat(chat_id):
-            await _orig_st(chat_id, metadata)
+            await _orig_st(chat_id, _biz_safe_metadata(metadata))
 
     _orig_st = _true(adapter.send_typing, "_orig_st")
     adapter.send_typing = send_typing
@@ -2143,6 +2157,11 @@ def _install_wraps(adapter: Any) -> None:
         async def media(*args, **kwargs):
             chat_id = args[0] if args else kwargs.get("chat_id")
             if not _is_guest_chat(chat_id):
+                if "metadata" in kwargs:
+                    # The bizauto session-split marker must never reach the
+                    # adapter's int(message_thread_id) — media inherits the
+                    # same crash as text otherwise.
+                    kwargs = dict(kwargs, metadata=_biz_safe_metadata(kwargs.get("metadata")))
                 return await orig(*args, **kwargs)
             if not settings().get("media_to_guests"):
                 return SendResult(success=True, message_id=None)
@@ -2206,9 +2225,9 @@ def _install_wraps(adapter: Any) -> None:
                         chat = args[0]
                     chat = str(chat or "")
                     if chat and _biz_wants_owner(chat) and "business_connection_id" not in kwargs:
-                        _bc = _BIZ_CONN.get(chat) or _active_bcid()
-                        if _bc:
-                            kwargs["business_connection_id"] = _bc
+                        _cand = _bcid_candidates(chat)
+                        if _cand:
+                            kwargs["business_connection_id"] = _cand[0]
                     return await _o(*args, **kwargs)
                 _bw._tga_biz = True
                 return _bw
@@ -2528,26 +2547,115 @@ def _touch_guest_session(uid: str) -> None:
     _mutate_state(_fn)
 
 
-def _wipe_sessions(store: Any, chat: Any) -> Optional[int]:
-    """Reset every gateway session of this chat (all participants + guest twin).
-    Returns the count, 0 for none, None when the store is unavailable."""
+def _like_literal(text: str) -> str:
+    """Escape a value used as a LIKE pattern — chat ids contain `_`, which is a
+    single-char wildcard and quietly matched neighbouring rows."""
+    return str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _stored_session_ids(chat: Any) -> List[str]:
+    """Session rows this wipe owns: the chat's own rows, its guest twin, and
+    everything routed under a key containing them — the SAME predicate the
+    routing reset uses, so the router and the Sessions tab agree on what
+    "wiped" means. Read-only query; [] on any failure (the caller still resets
+    routing)."""
+    cid = str(chat or "").strip()
+    if not cid or cid == "None":
+        return []
+    guest = f"{GUEST_CHAT_PREFIX}{cid}"
+    try:
+        db = _hermes_home() / "state.db"
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rows = con.execute(
+                "SELECT id FROM sessions WHERE chat_id IN (?, ?)"
+                " OR session_key LIKE ? ESCAPE '\\'"
+                " OR session_key LIKE ? ESCAPE '\\'",
+                (cid, guest, f"%{_like_literal(cid)}%",
+                 f"%{_like_literal(guest)}%")).fetchall()
+        finally:
+            con.close()
+        return [str(r[0]) for r in rows if r and r[0]]
+    except Exception:
+        logger.exception("[TGAhermes] stored session lookup failed for %s", cid)
+        return []
+
+
+def _purge_stored_sessions(ids: List[str]) -> int:
+    """Delete those session rows — and their messages — so they stop showing in
+    the Sessions tab. Direct read-write sqlite on purpose: the gateway's own
+    SessionDB handle is best-effort and can be unavailable (state.db preflight)
+    while file-level writes still work, and a wipe that only resets routing
+    leaves every row listed exactly as before. FTS stays consistent through the
+    messages_fts_delete trigger."""
+    if not ids:
+        return 0
+    try:
+        db = _hermes_home() / "state.db"
+        con = sqlite3.connect(str(db), timeout=20.0)
+        try:
+            con.execute("PRAGMA busy_timeout = 20000")
+            ph = ",".join("?" * len(ids))
+            con.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", ids)
+            cur = con.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
+            con.commit()
+            return max(0, int(cur.rowcount or 0))
+        finally:
+            con.close()
+    except Exception:
+        logger.exception("[TGAhermes] stored session purge failed (%d ids)", len(ids))
+        return 0
+
+
+def _wipe_sessions(store: Any, chat: Any) -> Optional[Tuple[int, int]]:
+    """Fresh start for this chat: reset every gateway session it owns (all
+    participants + guest twin) AND drop the stored rows, so the tab really
+    empties instead of listing the same sessions forever.
+
+    Returns (routes_reset, rows_deleted); (0, 0) when the chat has neither;
+    None only when the chat id itself is unusable. Routing is collected first
+    and the rows deleted afterwards, so a row the reset just created for the
+    fresh session survives — the wipe removes what was there, not what comes
+    next."""
+    cid = str(chat or "").strip()
+    if not cid or cid == "None":
+        return None
     if store is None:
         store = _CTX.get("session_store")
-    if store is None:
+    entries = getattr(store, "_entries", None) if store is not None else None
+    if not isinstance(entries, dict):
+        # No store means no way to make the router start fresh — deleting rows
+        # nothing can re-route away from would strand the next turn on ids that
+        # no longer exist. Report it and touch nothing.
         return None
-    needle = str(chat)
-    needles = (needle, f"{GUEST_CHAT_PREFIX}{needle}")
+    needles = (cid, f"{GUEST_CHAT_PREFIX}{cid}")
+    routes = 0
     try:
-        entries = getattr(store, "_entries", None)
-        if not isinstance(entries, dict):
-            return None
+        # Collect the stored rows BEFORE the reset: reset_session creates the
+        # fresh row, and the purge must not take out the session it just made.
+        stored = _stored_session_ids(cid)
         keys = [k for k in list(entries) if any(n in str(k) for n in needles)]
+        failed = 0
         for k in keys:
-            store.reset_session(k)
-        return len(keys)
+            try:
+                store.reset_session(k)
+                routes += 1
+            except Exception:
+                failed += 1
+                logger.exception("[TGAhermes] route reset failed for %s", k)
+        if failed:
+            # Routing still points at the sessions we would be deleting: keep
+            # their rows, or the next turn lands on ids that no longer exist.
+            logger.warning("[TGAhermes] wipe: %d route(s) left unreset for %s "
+                           "— stored rows kept", failed, cid)
+            return None
+        rows = _purge_stored_sessions(stored)
     except Exception:
         logger.exception("[TGAhermes] session wipe failed")
         return None
+    if not routes and not rows:
+        return (0, 0)
+    return (routes, rows)
 
 
 def _settings_summary() -> str:
@@ -2556,8 +2664,16 @@ def _settings_summary() -> str:
             "guest_error_reply_en", "guest_error_reply_fa", "auto_react", "react_guests",
             "media_to_guests", "log_owner_messages", "log_whitelisted_messages",
             "log_other_messages", "log_group_mentions", "tool_enabled",
-            "persona_path"]
-    return "\n".join(f"<code>{k}</code> = <b>{_esc(st.get(k))}</b>" for k in keys)
+            "persona_path", "biz_persona_path"]
+    out = []
+    for k in keys:
+        v = st.get(k)
+        if not v and k == "persona_path":
+            v = "default"
+        elif not v and k == "biz_persona_path":
+            v = "bundled"
+        out.append(f"<code>{k}</code> = <b>{_esc(v)}</b>")
+    return "\n".join(out)
 
 
 def _help_sections(st: Optional[Dict[str, Any]] = None) -> list:
@@ -2901,13 +3017,12 @@ _TOGGLES: Dict[str, Tuple[str, str]] = {
 # generic on/off writer, and a 3-way or numeric setting must never be reduced to
 # a bool by it. `_tg_next` / `_tg_view` / the Apply writer branch on them by name.
 _TENUMS: Tuple[str, ...] = ("mode", "bizmode", "bizsched",
-                            "bizidledelay", "bizownidle")
+                            "bizidledelay")
 
 # Confirm sub-key -> wizard flow that accepts a typed duration for it. The
 # confirm screen keeps its preset cycle; these give the owner a way to enter
 # something the preset list does not contain (90s, 3h, …).
-_DUR_FLOWS: Dict[str, str] = {"bizidledelay": "bizidledur",
-                              "bizownidle": "bizownidledur"}
+_DUR_FLOWS: Dict[str, str] = {"bizidledelay": "bizidledur"}
 
 
 def _next_preset(cur: Any, presets: List[int], fallback: int) -> int:
@@ -2946,8 +3061,6 @@ def _tg_next(sub: str, st: Dict[str, Any]) -> Any:
         return order_s[(order_s.index(cur_s) + 1) % len(order_s)]
     if sub == "bizidledelay":
         return _next_preset(st.get("biz_idle_delay_min"), [0, 1, 2, 5, 10, 15, 30], 0)
-    if sub == "bizownidle":
-        return _next_preset(st.get("biz_owner_idle_min"), [0, 5, 10, 15, 30, 60], 10)
     ent = _TOGGLES.get(sub)
     if not ent:
         return None
@@ -3010,22 +3123,13 @@ def _tg_view(sub: str, origin: str, st: Dict[str, Any]) -> str:
     if sub == "bizidledelay":
         cur_d = _fmt_min(st.get("biz_idle_delay_min"))
         nxt_d = _fmt_min(_tg_next("bizidledelay", st))
-        return (f"<b>\u23f3 Idle reply delay</b>\n"
+        return (f"<b>⏳ Reply hold</b>\n"
                 f"now: <b>{cur_d}</b> → <b>{nxt_d}</b>\n\n"
-                "When you have been silent longer than the idle threshold below, "
-                "ATRA waits this long before answering — you get the chance to "
-                "answer first. 0 = answer immediately.\n"
+                "Every message in an automation chat is held this long so you "
+                "get the first word; if you reply there inside the window, "
+                "ATRA stands down. 0 = answer immediately.\n"
                 "Tap ✏️ to type any duration (<code>10s</code>, <code>2m</code>, "
                 "<code>1h</code>).\n\n"
-                "Tap ✅ Apply to change, ✖ Cancel to go back.")
-    if sub == "bizownidle":
-        cur_o = _fmt_min(st.get("biz_owner_idle_min"))
-        nxt_o = _fmt_min(_tg_next("bizownidle", st))
-        return (f"<b>\U0001f4c4 Owner idle threshold</b>\n"
-                f"now: <b>{cur_o}</b> → <b>{nxt_o}</b>\n\n"
-                "After this long without a message from you, you count as idle "
-                "(warn-first and the idle delay both use it). 0 = never idle.\n"
-                "Tap ✏️ to type any duration (<code>10m</code>, <code>1h</code>).\n\n"
                 "Tap ✅ Apply to change, ✖ Cancel to go back.")
     if sub == "userbridge":
         return _ub_cfm(st)
@@ -3257,10 +3361,8 @@ _CATS: Dict[str, List[Dict[str, Any]]] = {
          "label": "🕑 Window end (HH:MM)"},
         {"kind": "list", "key": "biz_window_days", "cb": "panel:wiz:bizdays",
          "label": "📅 Window days (all when empty)"},
-        {"kind": "enum", "key": "biz_owner_idle_min", "sub": "bizownidle",
-         "unit": "min", "label": "\U0001f4c4 You count as idle after"},
         {"kind": "enum", "key": "biz_idle_delay_min", "sub": "bizidledelay",
-         "unit": "min", "label": "\u23f3 ATRA waits when you are away"},
+         "unit": "min", "label": "⏳ Reply hold (you answer first)"},
         {"kind": "bool", "key": "biz_sessions_split", "sub": "bizsplit",
          "label": "🧮 Separate automation vs whitelist sessions"},
         {"kind": "cmd", "cb": "panel:bizconn",
@@ -3426,6 +3528,14 @@ def _cat_value(it: Dict[str, Any], st: Dict[str, Any]) -> str:
             p = st.get("persona_path")
             return (f"<code>{_esc(str(p))}</code>" if p
                     else "<i>default</i>")
+        if key == "biz_persona_path":
+            # "" is the BUNDLED persona in effect, not "no persona" — the panel
+            # said "(empty)" while a full automation/mimic prompt was being sent
+            # on every turn, so the owner had no way to tell them apart.
+            p = str(st.get("biz_persona_path") or "").strip()
+            if p:
+                return f"<code>{_esc(p)}</code>"
+            return f"<i>bundled ({_esc(', '.join(_BIZ_PERSONAS.values()))})</i>"
         v = st.get(key)
         v = str(v) if v is not None else ""
         v = v.strip() or "(empty)"
@@ -4151,6 +4261,65 @@ def _session_key_for(adapter: Any, chat_id: Any) -> Optional[str]:
 _SESS_SNAP: List[str] = []
 _SESS_WIPES: List[str] = []   # chat ids of open stored sessions, for 🧹 buttons
 
+# Chat labels for the list. A bare numeric id is unreadable when a dozen
+# sessions are stacked in one message, so each row reads `name (id)` — the
+# @handle comes from getChat, but a panel render must not turn into a dozen
+# uncached network round-trips inside a synchronous callback: one lookup per
+# chat, cached, capped per render and hard-stopped at the render deadline.
+_LABEL_CACHE: Dict[str, Tuple[str, float]] = {}   # chat id -> (resolved name, ts)
+_LABEL_TTL = 6 * 3600.0
+_LABEL_MISS_TTL = 300.0                            # a failed/empty lookup retries soon
+_LABEL_USES: List[int] = [0]
+_LABEL_DEADLINE: List[float] = [0.0]
+_LABEL_MAX_LOOKUPS = 4
+
+
+def _session_label(adapter: Any, chat_id: Any, display_name: Any = None,
+                   chat_type: Any = None) -> str:
+    """`@username` for a person, the group title for a group — always with the
+    raw id in parentheses: `Some Name (uid)`, `Group Title (chat_id)`.
+
+    Groups keep their stored title (the owner recognises it instantly and it
+    needs no API call); DMs prefer the @handle, fetched at most
+    `_LABEL_MAX_LOOKUPS` times per render and only while the render still has
+    time left. Falls back to the stored name, then to the id.
+    """
+    cid = str(chat_id or "").strip()
+    if not cid or cid == "None":
+        return ""
+    name = str(display_name or "").strip()
+    ctype = str(chat_type or "").lower()
+    is_numeric = bool(cid.lstrip("-").isdigit())
+    is_group = ctype in ("group", "supergroup", "channel") or (
+        is_numeric and cid.startswith("-"))
+    now = time.time()
+    cached = _LABEL_CACHE.get(cid)
+    fresh = False
+    if cached:
+        ttl = _LABEL_TTL if cached[0] else _LABEL_MISS_TTL
+        if now - cached[1] < ttl:
+            name = cached[0] or name
+            fresh = True
+    if (not fresh and not is_group and is_numeric
+            and _LABEL_USES[0] < _LABEL_MAX_LOOKUPS
+            and now < _LABEL_DEADLINE[0]):
+        _LABEL_USES[0] += 1
+        obj = None
+        try:
+            if adapter is not None:
+                obj = adapter._bot.get_chat(int(cid))
+        except Exception:
+            obj = None                        # cache the miss below, keep the name
+        resolved = ""
+        if obj is not None:
+            uname = str(getattr(obj, "username", "") or "").strip()
+            first = str(getattr(obj, "first_name", "") or "").strip()
+            resolved = f"@{uname}" if uname else first
+        _LABEL_CACHE[cid] = (resolved, now)
+        name = resolved or name
+    name = name or cid
+    return f"{name} ({cid})" if name != cid else cid
+
 
 def _sessions_body(adapter: Any = None, st: Optional[Dict[str, Any]] = None) -> str:
     """Owner view: live turns + per-chat session rows (guest / friend / biz).
@@ -4163,6 +4332,8 @@ def _sessions_body(adapter: Any = None, st: Optional[Dict[str, Any]] = None) -> 
     """
     global _SESS_SNAP, _SESS_WIPES
     _SESS_WIPES = []
+    _LABEL_USES[0] = 0
+    _LABEL_DEADLINE[0] = time.time() + 0.9
     if adapter is None:
         adapter = _ADAPTER.get("adapter")
     lines: List[str] = ["\U0001f9f5 <b>Sessions</b>",
@@ -4193,7 +4364,8 @@ def _sessions_body(adapter: Any = None, st: Optional[Dict[str, Any]] = None) -> 
             # and the old column name made this whole query throw, so the view
             # always read "no stored sessions yet" no matter what was stored.
             rows = con.execute(
-                "SELECT source, chat_id, id, last_activity_at, ended_at "
+                "SELECT source, chat_id, display_name, chat_type, id, "
+                "last_activity_at, ended_at "
                 "FROM sessions ORDER BY last_activity_at DESC LIMIT 12").fetchall()
         finally:
             con.close()
@@ -4201,10 +4373,10 @@ def _sessions_body(adapter: Any = None, st: Optional[Dict[str, Any]] = None) -> 
         rows = []
     if rows:
         lines.append("")
-        lines.append("<b>Recent sessions</b> (type \u2014 chat \u2014 session id):")
+        lines.append("<b>Recent sessions</b> (type \u2014 name (id) \u2014 session id):")
         _owner = str(_owner_id() or "")
         _wl = {str(u) for u in _read_allow_from()}
-        for src, cid, sid, upd, ended in rows:
+        for src, cid, disp, ctype, sid, upd, ended in rows:
             tag = str(cid or "")
             sid_s = str(sid or "")
             # Label by WHO owns the lane, not just membership: the owner's own
@@ -4236,8 +4408,12 @@ def _sessions_body(adapter: Any = None, st: Optional[Dict[str, Any]] = None) -> 
             if state == "open" and cid is not None and str(cid).strip() \
                     and str(cid) != "None" and str(cid) not in _SESS_WIPES:
                 _SESS_WIPES.append(str(cid))
+            # `@handle`/title first, raw id second — a bare id tells nobody
+            # whose session they are looking at.
+            _lab = _session_label(adapter, cid, disp, ctype)
+            _lab_html = f"<b>{_esc(_lab)}</b>" if _lab else "\u2014"
             lines.append(f"\u2022 {lane} <b>[{state}]</b> \u2014 "
-                         f"<code>{_esc(str(cid))}</code>{age}\n"
+                         f"{_lab_html}{age}\n"
                          f"    <code>{_esc(str(sid)[:60])}</code>")
     else:
         lines.append("<i>no stored sessions yet</i>")
@@ -4442,15 +4618,20 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
             reply = ("Usage: <code>!wipe &lt;chat_id&gt;</code> — deletes that chat's session "
                      "and starts a fresh one <i>there</i>. This chat is never wiped implicitly.")
         else:
-            n = _wipe_sessions(session_store, target)
-            if n is None:
-                reply = "⚠️ session store unavailable — send the command as a chat message"
-            elif n == 0:
+            res = _wipe_sessions(session_store, target)
+            if res is None:
+                reply = ("⚠️ wipe could not complete — "
+                         "session store unavailable, nothing was changed")
+            elif res == (0, 0):
                 reply = f"Nothing to wipe — no session found for <code>{_esc(target)}</code>"
             else:
-                reply = f"🧹 wiped <b>{n}</b> session(s) for <code>{_esc(target)}</code> — fresh start there"
+                routes, rows = res
+                reply = (f"🧹 wiped <b>{rows}</b> stored session(s) "
+                         f"(<b>{routes}</b> live route(s) reset) for "
+                         f"<code>{_esc(target)}</code> — fresh start there")
                 await _log("🧹 Session wiped",
-                           f"<b>Chat:</b> <code>{_esc(target)}</code> · <b>Reset:</b> {n}")
+                           f"<b>Chat:</b> <code>{_esc(target)}</code> · "
+                           f"<b>Reset:</b> {routes} route(s) · <b>Deleted:</b> {rows} row(s)")
     elif cmd == "!whitelist":
         reply = await _whitelist_cmd(adapter, arg)
     elif cmd == "!auth":
@@ -4561,23 +4742,15 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
         "validate": lambda d: "" if _biz_days_ok(d[0]) else "send a day name, 'all', or 'clear'",
         "done": "window days updated."},
     "bizidledur": {
-        "prompts": ["\u23f3 <b>Idle reply delay</b>\n\nSend how long ATRA waits "
-                    "before answering when you are away — <code>10s</code>, "
-                    "<code>2m</code>, <code>1h</code>, or <code>0</code> for "
-                    "immediately.\n<i>Type cancel to abort.</i>"],
+        "prompts": ["⏳ <b>Reply hold</b>\n\nSend how long every automation "
+                    "message is held before ATRA may answer — <code>10s</code>, "
+                    "<code>2m</code>, <code>1h</code>, or <code>0</code> to "
+                    "answer immediately. Replying in the chat during the "
+                    "window cancels the hold.\n<i>Type cancel to abort.</i>"],
         "save": lambda d: {"biz_idle_delay_min": (_dur_to_s(d[0], "m") or 0) / 60.0},
         "validate": lambda d: ("" if _dur_to_s(d[0], "m") is not None
                                else "send a duration, e.g. 10s, 2m, 1h or 0"),
-        "done": "idle reply delay updated."},
-    "bizownidledur": {
-        "prompts": ["\U0001f4c4 <b>Owner idle threshold</b>\n\nSend how long "
-                    "without a message from you counts as idle — <code>10m</code>, "
-                    "<code>1h</code>, or <code>0</code> to never count as idle.\n"
-                    "<i>Type cancel to abort.</i>"],
-        "save": lambda d: {"biz_owner_idle_min": (_dur_to_s(d[0], "m") or 0) / 60.0},
-        "validate": lambda d: ("" if _dur_to_s(d[0], "m") is not None
-                               else "send a duration, e.g. 10m, 1h or 0"),
-        "done": "owner idle threshold updated."},
+        "done": "reply hold updated."},
     "wladd": {
         "prompts": ["🛡 <b>Add to whitelist</b>\n\nSend the user id (or @username).\n"
                     "<i>Type cancel to abort.</i>"],
@@ -4884,7 +5057,6 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
         _UB_STATE["probe"] = 1
         logger.info("[TGAhermes] probe: dispatch entered (bridge=%r)",
                     settings().get("user_bridge"))
-    _bump_owner_seen(event)  # Chat Automation: owner presence for warn-first
     """Observe + console: bang commands (skip), owner reactions, group mentions, owner mirror."""
     chat_for_error: Any = None
     try:
@@ -5282,19 +5454,11 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                         nxt = _tg_next("bizidledelay", st)
                         save_settings({"biz_idle_delay_min": nxt})
                         st = settings()
-                        note = f"\u23f3 idle reply delay → <b>{_fmt_min(nxt)}</b>"
-                        await _log("\u23f3 Chat Automation idle delay",
-                                   f"Idle reply delay → <b>{_fmt_min(nxt)}</b> "
-                                   f"(owner idle after "
-                                   f"{_fmt_min(st.get('biz_owner_idle_min'))})")
-                    elif _ts == "bizownidle":
-                        nxt = _tg_next("bizownidle", st)
-                        save_settings({"biz_owner_idle_min": nxt})
-                        st = settings()
-                        note = f"\U0001f4c4 owner idle after <b>{_fmt_min(nxt)}</b>"
-                        await _log("\U0001f4c4 Owner idle threshold",
-                                   f"Owner counts as idle after <b>{_fmt_min(nxt)}</b> "
-                                   f"(owner {_esc(str(_owner_id()))})")
+                        note = f"⏳ reply hold → <b>{_fmt_min(nxt)}</b>"
+                        await _log("⏳ Chat Automation reply hold",
+                                   f"Reply hold → <b>{_fmt_min(nxt)}</b> "
+                                   f"(every message waits; your reply in the "
+                                   f"chat cancels it)")
                     elif _ts in _TOGGLES:
                         key, label = _TOGGLES[_ts]
                         on = bool(_tg_next(_ts, st))
@@ -5551,11 +5715,13 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             return
         if data.startswith(f"{_CB_PREFIX}wipe2:"):
             _chat = data.split(":", 2)[2]
-            n = _wipe_sessions(None, _chat)
-            if n:
+            res = _wipe_sessions(None, _chat)
+            if res and res != (0, 0):
+                _routes, _rows = res
                 await q.answer("Session wiped ✅")
                 await _log("🧹 Session wiped",
-                           f"<b>Chat:</b> <code>{_esc(_chat)}</code> · <b>Reset:</b> {n} (button)")
+                           f"<b>Chat:</b> <code>{_esc(_chat)}</code> · <b>Reset:</b> "
+                           f"{_routes} route(s) · <b>Deleted:</b> {_rows} row(s) (button)")
             else:
                 await q.answer("No session found")
             return

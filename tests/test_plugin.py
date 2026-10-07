@@ -2256,6 +2256,36 @@ async def _t27():
               "assistant: automation event marked internal")
         check(bool(getattr(_ev, "channel_prompt", "")),
               "assistant: persona + identity prompt attached")
+
+        # Plain hold: EVERY message waits the configured delay (no idle
+        # threshold, no engaged flag), and the owner replying inside that
+        # window — in THIS chat — cancels ATRA's turn.
+        mod.save_settings({"biz_idle_delay_min": 0.005})  # 0.3s hold
+        _h0 = stub.handles
+        _ta = time.monotonic()
+        await mod._handle_business_message(stub, _mk_update(), None)
+        check(stub.handles == _h0 + 1,
+              "plain hold: message answered after the wait")
+        check(time.monotonic() - _ta >= 0.25,
+              "plain hold: the delay actually held the message")
+        # his reply in ANOTHER chat must never cancel this chat's hold
+        _t27task = asyncio.create_task(
+            mod._handle_business_message(stub, _mk_update(), None))
+        await asyncio.sleep(0.1)
+        mod._BIZ_OWNER_SEEN["700000"] = time.monotonic()
+        await _t27task
+        check(stub.handles == _h0 + 2,
+              "owner replying in another chat does not cancel this hold")
+        mod._BIZ_OWNER_SEEN.pop("700000", None)
+        # his reply INSIDE this chat during the window cancels ATRA's turn
+        _t27task = asyncio.create_task(
+            mod._handle_business_message(stub, _mk_update(), None))
+        await asyncio.sleep(0.1)
+        mod._BIZ_OWNER_SEEN["770011"] = time.monotonic()
+        await _t27task
+        check(stub.handles == _h0 + 2,
+              "owner replying inside the window cancels ATRA's turn")
+        mod._BIZ_OWNER_SEEN.pop("770011", None)
     finally:
         mod._log = _orig_log
         mod.save_settings(_orig)
@@ -2556,7 +2586,7 @@ print("\n[31] typed durations, time normalising, bundled personas")
 
 _prev31 = {k: mod.settings().get(k) for k in (
     "unauthorized_cooldown_s", "update_timeout_s", "biz_idle_delay_min",
-    "biz_owner_idle_min", "biz_window_start", "biz_window_end",
+    "biz_window_start", "biz_window_end",
     "biz_persona_path")}
 try:
     # _dur_to_s — the point of the feature: type what people actually say
@@ -2600,8 +2630,7 @@ try:
     # wizard flows accept durations end to end
     for flow, key, sample, want in (
             ("uptimeout", "update_timeout_s", "10m", 600.0),
-            ("bizidledur", "biz_idle_delay_min", "10s", 10 / 60),
-            ("bizownidledur", "biz_owner_idle_min", "2h", 120.0)):
+            ("bizidledur", "biz_idle_delay_min", "10s", 10 / 60)):
         mod._WIZARD.clear()
         check(bool(mod._wizard_start("-100555", flow)), f"{flow} wizard opens")
         asyncio.run(mod._wizard_feed(None, "-100555", sample))
@@ -2633,11 +2662,7 @@ try:
     d31 = [b.callback_data for row in mod._help_keyboard("tg", arg="bizidledelay:biz")
            for b in row]
     check(any(x.endswith("panel:wiz:bizidledur") for x in d31),
-          "idle-delay confirm offers a typed value")
-    d31 = [b.callback_data for row in mod._help_keyboard("tg", arg="bizownidle:biz")
-           for b in row]
-    check(any(x.endswith("panel:wiz:bizownidledur") for x in d31),
-          "owner-idle confirm offers a typed value")
+          "reply-hold confirm offers a typed value")
     check(any(b.callback_data.endswith("panel:wiz:cooldown")
               for row in mod._help_keyboard("cool") for b in row),
           "cooldown page offers typed entry")
@@ -2645,38 +2670,9 @@ try:
               for row in mod._help_keyboard("cool") for b in row),
           "cooldown presets survive next to the new button")
     check(all(f in mod._WIZ_FLOWS for f in
-              ("bizidledur", "bizownidledur", "cooldown", "uptimeout",
+              ("bizidledur", "cooldown", "uptimeout",
                "bizwinstart", "bizwinend")),
           "every duration flow is registered")
-
-    # 0 really means 0 — it used to fall through to the 10-minute default
-    check(mod._owner_idle({"biz_owner_idle_min": 0}) is False,
-          "owner idle threshold 0 means never idle")
-
-    # The idle hold is for ATRA's ENTRY into a conversation, not every message
-    # in it. Once ATRA has answered, the next message answers immediately —
-    # until the owner posts in that same chat, which arms the hold again.
-    mod._BIZ_REPLIED.clear()
-    mod._BIZ_OWNER_SEEN.clear()
-    check(mod._biz_engaged("c-delay") is False,
-          "an untouched chat still waits for the owner")
-    mod._BIZ_REPLIED["c-delay"] = time.monotonic() - 100.0
-    check(mod._biz_engaged("c-delay") is True,
-          "a chat ATRA already answered skips the wait")
-    check(mod._biz_engaged("c-other") is False,
-          "the spent grace period is per chat, not global")
-    mod._BIZ_OWNER_SEEN["c-delay"] = time.monotonic()
-    check(mod._biz_engaged("c-delay") is False,
-          "the owner posting in that chat re-arms the hold")
-    check(mod._biz_engaged("c-other") is False,
-          "the owner returning to one chat does not re-arm another")
-    mod._BIZ_REPLIED["c-other"] = time.monotonic() - 100.0
-    mod._BIZ_OWNER_SEEN["c-delay"] = time.monotonic() - 50.0
-    mod._BIZ_REPLIED["c-delay"] = time.monotonic() - 10.0
-    check(mod._biz_engaged("c-delay") is True,
-          "an answer sent after the owner's visit holds again")
-    mod._BIZ_REPLIED.clear()
-    mod._BIZ_OWNER_SEEN.clear()
 
     # bundled personas: one per mode, and the assistant one is NOT the guest
     a31 = mod._biz_persona({}, "assistant")
@@ -2796,6 +2792,118 @@ async def t_busy():
 
 
 asyncio.run(t_busy())
+
+# [32] The two live send bugs (2026-10-06, real guest chat):
+#  (a) the "bizauto:<chat>" session-split marker flowed into int() as
+#      message_thread_id and crashed every queued-lane final — the wrappers
+#      must drop it while keeping real forum thread ids;
+#  (b) a reconnect rotated the business connection id, the cached one went
+#      stale (Business_connection_invalid) — delivery must rotate to the next
+#      candidate and remember the id that worked.
+print("\n[32] split-marker safety + connection rotation")
+_g32 = "679" + "498" + "5749"  # assembled: the audit forbids storing it raw
+check(mod._biz_safe_thread(f"bizauto:{_g32}") is None,
+      "safe_thread: bizauto marker rejected")
+check(mod._biz_safe_thread("4242") == "4242",
+      "safe_thread: real message id kept")
+check(mod._biz_safe_thread(None) is None and mod._biz_safe_thread("") is None,
+      "safe_thread: empty stays None")
+_m32 = {"thread_id": "bizauto:5", "business_chat_id": "5"}
+_m32s = mod._biz_safe_metadata(_m32)
+check("thread_id" not in _m32s and _m32s.get("business_chat_id") == "5",
+      "safe_metadata: marker dropped, siblings kept")
+check(_m32.get("thread_id") == "bizauto:5",
+      "safe_metadata: input dict untouched")
+_m32b = {"thread_id": 777}
+check(mod._biz_safe_metadata(_m32b) is _m32b,
+      "safe_metadata: real thread id untouched")
+check(mod._biz_safe_metadata(None) is None,
+      "safe_metadata: non-dict passes through")
+
+_prev_act32 = mod._BIZ_ACTIVE_ID
+_prev_conn32 = dict(mod._BIZ_CONN)
+try:
+    mod._BIZ_CONN.clear()
+    mod._BIZ_CONN["555"] = "stale_id"
+    mod._BIZ_ACTIVE_ID = "live_id"
+    _c32 = mod._bcid_candidates("555", preferred="preferred_id")
+    check(_c32[:3] == ["preferred_id", "stale_id", "live_id"],
+          "candidates: preferred -> map -> active, in order")
+    check(len(set(_c32)) == len(_c32), "candidates: deduplicated")
+
+    class _RotBot:
+        def __init__(self):
+            self.calls = []
+
+        async def send_message(self, **kw):
+            self.calls.append(kw.get("business_connection_id"))
+            if kw.get("business_connection_id") == "stale_id":
+                raise RuntimeError("Business_connection_invalid")
+            return NS(message_id=42)
+
+    class _RotAdapter:
+        def __init__(self):
+            self._bot = _RotBot()
+
+    class _HardBot:
+        def __init__(self):
+            self.calls = 0
+
+        async def send_message(self, **kw):
+            self.calls += 1
+            raise RuntimeError("message is too long")
+
+    class _HardAdapter:
+        def __init__(self):
+            self._bot = _HardBot()
+
+    async def t32():
+        ad = _RotAdapter()
+        ok, sent = await mod._biz_try_send(ad, "555", "hi", preferred="stale_id")
+        check(ok and sent.message_id == 42,
+              "try_send: delivery succeeds on the rotated connection")
+        check(ad._bot.calls[:2] == ["stale_id", "live_id"],
+              "try_send: rotated past the rejected id")
+        check(mod._BIZ_CONN.get("555") == "live_id",
+              "try_send: remembers the id that worked")
+        adh = _HardAdapter()
+        okh, _ = await mod._biz_try_send(adh, "555", "text", preferred="live_id")
+        check(okh is False and adh._bot.calls == 1,
+              "try_send: unrelated errors do not rotate candidates")
+    asyncio.run(t32())
+
+    # The queued-lane crash, end to end: ctx says business, the synthetic
+    # event lost the bcid and carries the split marker as thread_id. The
+    # final must go out as the owner over the live connection and never
+    # reach the plain path whose int() blew up.
+    _old_ad32 = mod._ADAPTER.get("adapter")
+    ad4 = FakeAdapter()
+    mod._ADAPTER["adapter"] = ad4
+    try:
+        mod._install_wraps(ad4)
+        mod._BIZ_CONN["666"] = "bc_live"
+
+        async def t32b():
+            mod._biz_mark("666", "business")
+            ev = FakeEvent(text="q", source=FakeSource("666"))
+            r, who = await ad4.send_final_ledgered(
+                ev, "k", "answer", {"thread_id": "bizauto:666"}, reply_to=None)
+            check(getattr(r, "success", False) and who is ad4,
+                  "synthetic final: delivered and ledgered")
+            check(any(kw.get("business_connection_id") == "bc_live"
+                      for kw in ad4._bot.sent),
+                  "synthetic final: sent as the owner over the live connection")
+            check(not any(c[0] == "sfl" for c in ad4.calls),
+                  "synthetic final: never reached the crashing plain path")
+        asyncio.run(t32b())
+    finally:
+        mod._BIZ_CTX.pop("666", None)
+        mod._BIZ_CONN.pop("666", None)
+        mod._ADAPTER["adapter"] = _old_ad32
+finally:
+    mod._BIZ_ACTIVE_ID = _prev_act32
+    mod._BIZ_CONN.clear()
+    mod._BIZ_CONN.update(_prev_conn32)
 
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)
