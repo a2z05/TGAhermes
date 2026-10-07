@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: syntax + audits
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Syntax check every python file
+        run: python -m py_compile __init__.py bizauto.py userbridge.py selfupdate.py scripts/*.py tests/*.py
+
+      # scripts/test-audit.py synthesises .audit-identities.json when the
+      # clone has none (the real file is gitignored), so all 30 cases run
+      # here exactly as they do on the host.
+      - name: Pre-push audit behaviour (30 checks)
+        run: python scripts/test-audit.py
+
+      - name: Self-update tests (15 checks)
+        run: python scripts/test-selfupdate.py
+
+      # tests/test_plugin.py is intentionally not run here: it drives the live
+      # Hermes runtime (gateway + hermes_cli + host state.db/config.yaml) which
+      # a hosted runner does not have. sync.sh runs it on the box on every deploy.
