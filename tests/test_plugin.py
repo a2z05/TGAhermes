@@ -3088,10 +3088,12 @@ def _t34():
                           chat=NS(id=910111, type="private", first_name="Nima")))
 
         _st0 = mod.settings()
-        _orig = (mod._log, mod._biz_store, mod._biz_idle_delay_s, dict(mod._BIZ_OWNER_SEEN))
+        _orig = (mod._log, mod._biz_store, mod._biz_idle_delay_s,
+                 dict(mod._BIZ_OWNER_SEEN), dict(mod._BIZ_REPLIED))
         mod._log, mod._biz_store = _log, (lambda: _Store())
         mod._biz_idle_delay_s = lambda st: 0.01
         mod._BIZ_OWNER_SEEN.clear()
+        mod._BIZ_REPLIED.clear()
         mod.save_settings({"biz_mode": "assistant", "biz_warn_first": True,
                            "biz_warn_text": "", "biz_react": False,
                            "biz_sessions_split": True, "biz_idle_delay_min": 5})
@@ -3131,10 +3133,33 @@ def _t34():
             await mod._handle_business_message(ad, _mk("hi there"), None)
             check(bool(ad.events),
                   "no owner answer → the message is ATRA's, as before")
+
+            # "engaged and I haven't answered → don't wait": once ATRA has
+            # spoken here and he has not come back, the next message answers
+            # straight away instead of sitting on a fresh hold.
+            mod._BIZ_OWNER_SEEN.clear()
+            mod._BIZ_REPLIED.clear()
+            mod._BIZ_REPLIED["910111"] = time.monotonic()
+            mod._BIZ_OWNER_SEEN["910111"] = time.monotonic() - 60.0
+            check(mod._biz_engaged("910111"),
+                  "replied-after-owner reads as engaged")
+            check(not mod._biz_engaged("910222"),
+                  "a chat we never spoke in is not engaged")
+            mod._biz_idle_delay_s = lambda st: 1.5
+            _t = time.monotonic()
+            ad = _Ad()
+            await mod._handle_business_message(ad, _mk("hi there"), None)
+            check(time.monotonic() - _t < 1.0 and bool(ad.events),
+                  "engaged chat answers now — no wait")
+            mod._BIZ_OWNER_SEEN["910111"] = time.monotonic()
+            check(not mod._biz_engaged("910111"),
+                  "owner taking the thread back re-arms the wait")
         finally:
             (mod._log, mod._biz_store, mod._biz_idle_delay_s) = _orig[:3]
             mod._BIZ_OWNER_SEEN.clear()
             mod._BIZ_OWNER_SEEN.update(_orig[3])
+            mod._BIZ_REPLIED.clear()
+            mod._BIZ_REPLIED.update(_orig[4])
             mod.save_settings(_st0)
 
     return asyncio.run(_t())

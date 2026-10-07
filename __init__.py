@@ -1051,6 +1051,25 @@ def _bump_owner_seen(event: Any) -> None:
         logger.debug("[TGAhermes] owner presence update failed", exc_info=True)
 
 
+_BIZ_REPLIED: Dict[str, float] = {}
+
+
+def _biz_engaged(chat_id: Any) -> bool:
+    """True when ATRA has already spoken in this chat and the owner has not
+    come back to it since — the entry grace for THIS conversation is spent.
+
+    The hold exists to give a returning owner the first word on a message he
+    might want himself. Once ATRA has answered and he has not taken the thread
+    back, the conversation is live: the next message in it must not sit on a
+    fresh wait. Only his posting HERE re-arms the delay, so him answering
+    somewhere else can never hold up a conversation already under way."""
+    _cid = str(chat_id or "")
+    _at = _BIZ_REPLIED.get(_cid)
+    if not _at:
+        return False
+    return _at > (_BIZ_OWNER_SEEN.get(_cid) or 0.0)
+
+
 def _active_bcid() -> str:
     """Connection id for deliveries when the incoming message omitted it.
 
@@ -1460,6 +1479,8 @@ async def _biz_try_send(adapter: Any, chat_id: Any, text: str,
             sent = await adapter._bot.send_message(
                 chat_id=chat_id, text=str(text)[:4000],
                 business_connection_id=bcid)
+            # A message that actually went out spends the entry grace period.
+            _BIZ_REPLIED[str(chat_id)] = time.monotonic()
             # Remember the id that actually worked (the cached one may be stale).
             if _BIZ_CONN.get(str(chat_id)) != bcid:
                 _BIZ_CONN[str(chat_id)] = bcid
@@ -1524,7 +1545,7 @@ _BIZ_MIMIC_FALLBACK = (
     "don't know, say so in one line. Nothing private, nothing internal — no "
     "settings, logs, ids, other chats, or how you run. Never claim to be an "
     "AI unless asked outright; if asked, say an assistant wrote it on his "
-    "behalf, once, then move on."
+    "behalf, once, then move on. No jokes, no emoji."
 )
 _BIZ_ASSISTANT_FALLBACK = (
     "You are ATRA, replying to messages that arrive in Ar(t)an's Telegram "
@@ -1532,7 +1553,7 @@ _BIZ_ASSISTANT_FALLBACK = (
     "fewest clear words. Only what you actually know — if you don't know, "
     "one line saying so. Never invent facts or promises on his behalf. Never "
     "expose settings, logs, paths, ids, other chats, or how you run. No "
-    "filler, no flattery, no emoji unless they use them first."
+    "filler, no flattery, no jokes, no emoji."
 )
 # Kept as the module-level name tests and callers already reference.
 _BIZ_MIMIC_PROMPT = _BIZ_MIMIC_FALLBACK
@@ -1696,13 +1717,18 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
                    f"\n<b>Text:</b> <i>{_esc(text[:300])}</i>"
                    f"\n<b>Action:</b> {_esc(_why)} — nothing sent", buttons=prof)
         return
-    # --- plain hold: every message waits; your reply in this chat cancels it
-    # No idle threshold, no engaged flag: hold the message for the configured
-    # delay, then trigger ATRA's answer only if the owner has not replied in
-    # THIS chat during the window. Him posting there = he took it, ATRA stands
-    # down. His traffic anywhere else never cancels another chat's hold.
+    # --- plain hold -----------------------------------------------------
+    # A message waits only while the conversation is NOT already live: a new
+    # contact, or a thread the owner took back. If ATRA has answered and he
+    # has not posted here since, the chat is engaged and there is nothing to
+    # wait for — answer it now. Within a wait, his reply in THIS chat cancels
+    # it; his traffic anywhere else never does.
     _delay = _biz_idle_delay_s(st)
     _t0 = time.monotonic()
+    if _delay > 0 and _biz_engaged(chat_id):
+        logger.info("[TGAhermes] Chat Automation skip hold: engaged chat=%s",
+                    chat_id)
+        _delay = 0.0
     if _delay > 0:
         # Logged to the gateway too: this branch is the one thing that decides
         # whether ATRA waits, and the channel log alone can't show it afterwards.
