@@ -9,6 +9,7 @@ blobs left behind by an earlier case.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -31,10 +32,38 @@ def check(cond: bool, label: str) -> None:
         print(f"  FAIL {label}")
 
 
+# Values assembled from fragments so this test file never stores a real id.
+OWNER_ID = "583" + "817" + "5445"
+GUEST_IDS = ["679" + "498" + "5749"]
+CHANNEL_ID = "-" + "100" + "374" + "471" + "8087"
+BOT_USERNAME = "ATRA" + "vbot"
+OWNER_NAME = "a" + "2" + "z"
+PRIVATE_REPO = "her" + "mesbp"
+HOME_PATH = "/opt" + "/data"
+
+# The real identities file is gitignored on purpose, so a fresh clone (a CI
+# runner) carries none of these rules and every identity case would fail.
+# Rebuild the same shape from the fragments above: on the host the untouched
+# real file is already there and this is never written.
+SYNTHETIC_IDENTITIES = {
+    "owner_telegram_id": OWNER_ID,
+    "guest_telegram_ids": GUEST_IDS,
+    "log_channel_id": CHANNEL_ID,
+    "bot_username": BOT_USERNAME,
+    "owner_name": OWNER_NAME,
+    "extra_forbidden": [PRIVATE_REPO],
+    "forbidden_paths": [HOME_PATH],
+    "block_farsi": True,
+}
+
+
 def make_repo() -> Path:
     tmp = Path(tempfile.mkdtemp(prefix="audit-test-"))
     dest = tmp / "repo"
     shutil.copytree(SRC, dest, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+    ident = dest / ".audit-identities.json"
+    if not ident.exists():
+        ident.write_text(json.dumps(SYNTHETIC_IDENTITIES), encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=dest, check=True)
     subprocess.run(["git", "add", "-A"], cwd=dest, check=True)
     subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
@@ -66,14 +95,9 @@ def case(label: str, content: str | None, want_block: bool, rule: str = "") -> N
 
 
 def main() -> int:
-    # Values assembled from fragments so this test file never stores a real id.
-    owner = "583" + "817" + "5445"
-    guest = "679" + "498" + "5749"
-    channel = "-" + "100" + "374" + "471" + "8087"
-    bot = "ATRA" + "vbot"
-    name = "a" + "2" + "z"
-    private_repo = "her" + "mesbp"
-    home = "/opt" + "/data"
+    owner, guest = OWNER_ID, GUEST_IDS[0]
+    channel, bot, name = CHANNEL_ID, BOT_USERNAME, OWNER_NAME
+    private_repo, home = PRIVATE_REPO, HOME_PATH
 
     print("clean tree")
     case("no leaks", None, want_block=False)
