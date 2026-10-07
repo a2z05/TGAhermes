@@ -1830,16 +1830,25 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
                        f"<i>(reply in this chat and I stay out)</i>", buttons=prof)
         except Exception:
             logger.debug("[TGAhermes] hold log failed", exc_info=True)
-        await asyncio.sleep(_delay)
-        if (_BIZ_OWNER_SEEN.get(str(chat_id)) or 0.0) >= _t0:
-            try:
-                await _log("🤖 Chat Automation — owner answered",
-                           f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"
-                           f"\n<b>Action:</b> you replied inside the window — "
-                           f"ATRA stood down", buttons=prof)
-            except Exception:
-                logger.debug("[TGAhermes] stand-down log failed", exc_info=True)
-            return
+        # Poll instead of one long sleep: his reply inside the window has
+        # to cancel the wait within seconds, not at the end of it.
+        _until = _t0 + _delay
+        while True:
+            _rem = _until - time.time()
+            if _rem <= 0:
+                break
+            await asyncio.sleep(min(2.0, _rem))
+            if (_BIZ_OWNER_SEEN.get(str(chat_id)) or 0.0) >= _t0:
+                logger.info("[TGAhermes] Chat Automation stand-down chat=%s "
+                            "after %.0fs", chat_id, time.time() - _t0)
+                try:
+                    await _log("🤖 Chat Automation — owner answered",
+                               f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"
+                               f"\n<b>Action:</b> you replied inside the window — "
+                               f"ATRA stood down", buttons=prof)
+                except Exception:
+                    logger.debug("[TGAhermes] stand-down log failed", exc_info=True)
+                return
     # --- first-contact warning: once per chat, before ATRA's first reply ----
     # His own text, when he wrote one, goes out verbatim — that is his call to
     # make. When he left the field empty the old path still fired the canned

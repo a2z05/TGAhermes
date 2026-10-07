@@ -2286,6 +2286,23 @@ async def _t27():
         check(stub.handles == _h0 + 2,
               "owner replying inside the window cancels ATRA's turn")
         mod._BIZ_OWNER_SEEN.pop("770011", None)
+        # ...and the wait has to notice within seconds. A one-shot sleep
+        # only checked at the end, so a reply at second 1 of a 7-minute
+        # window sat unnoticed until minute 7.
+        mod.save_settings({"biz_idle_delay_min": 0.1})  # 6s hold
+        _h1 = stub.handles
+        _ta = time.monotonic()
+        _t27task = asyncio.create_task(
+            mod._handle_business_message(stub, _mk_update(), None))
+        await asyncio.sleep(0.3)
+        mod._BIZ_OWNER_SEEN["770011"] = time.time()
+        await _t27task
+        _el = time.monotonic() - _ta
+        check(stub.handles == _h1,
+              "mid-window reply: ATRA never answers")
+        check(_el < 3.0,
+              f"mid-window reply: the wait ended in {_el:.1f}s, not 6")
+        mod._BIZ_OWNER_SEEN.pop("770011", None)
     finally:
         mod._log = _orig_log
         mod.save_settings(_orig)
