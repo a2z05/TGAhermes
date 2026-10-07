@@ -3425,5 +3425,89 @@ def _t37():
 
 _t37()
 
+
+def _t38():
+    """A hard stop ends a task that swallowed its cancel, each failure kind
+    alerts once per window, and only real failure markers are surfaced."""
+    print("\n[38] hard session stop + session error alerts")
+
+    async def _t():
+        hits = {"n": 0}
+
+        async def stubborn(session_key: str) -> None:
+            while True:
+                try:
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    hits["n"] += 1
+                    if hits["n"] >= 2:
+                        raise
+
+        tsk = asyncio.create_task(stubborn("agent:test:sess"))
+        await asyncio.sleep(0.12)
+        ad = types.SimpleNamespace(_session_tasks={"agent:test:sess": tsk})
+        ok = await mod._hard_stop_session(ad, "agent:test:sess", budget=5.0)
+        check(ok, "a task that swallows its first cancel still dies")
+        check(tsk.done(), "the stubborn task is finished")
+        check(hits["n"] >= 2, "the repeat cancel is what ended it")
+
+        async def bystander() -> None:
+            hold = "agent:test:sess"
+            while True:
+                await asyncio.sleep(0.05)
+                if hold == "":
+                    return
+
+        bch = asyncio.create_task(bystander())
+        await asyncio.sleep(0.05)
+        ad2 = types.SimpleNamespace(_session_tasks={})
+        ok2 = await mod._hard_stop_session(ad2, "agent:test:sess", budget=1.0)
+        check(not ok2, "no bound task means the stop reports a failure")
+        check(not bch.done(),
+              "a bystander holding the key under another name is left alone")
+        bch.cancel()
+        try:
+            await asyncio.wait_for(bch, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+    asyncio.run(_t())
+
+    _orig_log = mod._log
+    _seen: list = []
+
+    async def _fake_log(title, body, buttons=None):
+        _seen.append(title)
+        return True
+
+    mod._log = _fake_log
+    try:
+        mod._ALERT_TS.clear()
+        first = asyncio.run(mod._session_alert("kind-a", "boom"))
+        again = asyncio.run(mod._session_alert("kind-a", "boom"))
+        other = asyncio.run(mod._session_alert("kind-b", "boom"))
+        check(first and not again,
+              "a repeating failure reports once per window")
+        check(other and len(_seen) == 2,
+              "a different failure kind still reports")
+    finally:
+        mod._log = _orig_log
+        mod._ALERT_TS.clear()
+
+    stalled = ("2026-10-07 12:00:00,001 ERROR gateway.session: Session DB "
+               "transcript append failed for 20261007_165423_8158e8c1 "
+               "(failure_count=3, pending=0); session is stalled and needs "
+               "operator attention")
+    noisy = ("2026-10-07 12:00:01,002 ERROR gateway.run: kanban dispatcher: "
+             "tick failed on board default")
+    check(mod._err_marker_for(stalled) == "session is stalled",
+          "a stalled session is surfaced")
+    check(mod._err_marker_for(noisy) == "",
+          "the repeating kanban noise never reaches the alert channel")
+    check(mod._err_marker_for("INFO no error here") == "",
+          "non error lines are ignored")
+
+
+_t38()
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

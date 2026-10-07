@@ -742,6 +742,177 @@ async def _log(title: str, body: str, buttons: Optional[list] = None) -> bool:
         return False
 
 
+# ----------------------------------------------- session failure surfacing
+_ALERT_TS: Dict[str, float] = {}
+_ERR_MARKERS = (
+    "session is stalled",
+    "Session DB transcript append failed",
+    "Failed to deliver response",
+    "Failed to send Telegram message",
+    "automation turn failed",
+    "outbound wrap install failed",
+)
+_WATCH_TICK_S = 45.0
+
+
+def _err_marker_for(line: str) -> str:
+    """Marker a gateway log line earns, or empty when it is not a session
+    failure worth waking the owner for. The denylist is implicit: only
+    ERROR lines carrying one of these markers are ever surfaced."""
+    if " ERROR " not in line:
+        return ""
+    for _m in _ERR_MARKERS:
+        if _m in line:
+            return _m
+    return ""
+
+
+async def _session_alert(kind: str, body: str) -> bool:
+    """Post a session-level failure to the owner log channel (this chat).
+
+    The cooldown is per kind: a failure that repeats every tick reports once
+    per window instead of flooding the very channel meant to make it
+    readable."""
+    try:
+        _now = time.time()
+        if _now - float(_ALERT_TS.get(kind, 0.0)) < 90.0:
+            return False
+        _ALERT_TS[kind] = _now
+        return await _log("🛑 Session error",
+                          f"<code>{_esc(str(kind))}</code>\n"
+                          f"{_html_plain(str(body))[:700]}")
+    except Exception:
+        logger.debug("[TGAhermes] session alert failed", exc_info=True)
+        return False
+
+
+def _session_task_bound(task: Any, session_key: str) -> bool:
+    """True when a live task carries this session key in its coroutine chain.
+
+    Frames are walked through ``cr_await`` so a turn nested inside helpers is
+    found as well. Only an exact ``session_key`` value counts, so tasks that
+    merely hold the key inside a list of names (the panel snapshot) are never
+    touched."""
+    try:
+        if task.done():
+            return False
+        _co = task.get_coro()
+        _hops = 0
+        while _co is not None and _hops < 60:
+            _hops += 1
+            _fr = getattr(_co, "cr_frame", None)
+            if _fr is not None:
+                try:
+                    _local = _fr.f_locals
+                except Exception:
+                    _local = None
+                if _local and _local.get("session_key") == session_key:
+                    return True
+            _co = getattr(_co, "cr_await", None)
+    except Exception:
+        return False
+    return False
+
+
+async def _hard_stop_session(adapter: Any, session_key: str,
+                             budget: float = 12.0,
+                             held: Any = None) -> bool:
+    """Keep cancelling until the session's task is really gone.
+
+    ``cancel_session_processing`` allows 5 seconds and then lets a wedged
+    task unwind in the background, which is how one automation turn kept
+    firing heartbeats for an hour after its Stop. References are taken first
+    and every live task bound to the key keeps receiving CancelledError
+    until it exits, because a handler that swallows the first cancel still
+    sees the next one."""
+    try:
+        _pool = []
+        if held is not None:
+            _pool.append(held)
+        _st = getattr(adapter, "_session_tasks", None)
+        if isinstance(_st, dict):
+            _h = _st.get(session_key)
+            if _h is not None and _h not in _pool:
+                _pool.append(_h)
+        try:
+            _me = asyncio.current_task()
+        except Exception:
+            _me = None
+        try:
+            for _t in asyncio.all_tasks():
+                if _t is None or _t is _me or _t in _pool:
+                    continue
+                if _session_task_bound(_t, session_key):
+                    _pool.append(_t)
+        except Exception:
+            logger.debug("[TGAhermes] task scan for stop failed", exc_info=True)
+        if not _pool:
+            return False
+        _deadline = time.time() + float(budget)
+        while time.time() < _deadline:
+            _alive = [_t for _t in _pool if not _t.done()]
+            if not _alive:
+                return True
+            for _t in _alive:
+                try:
+                    _t.cancel()
+                except Exception:
+                    pass
+            await asyncio.sleep(0.35)
+        return all(_t.done() for _t in _pool)
+    except Exception:
+        logger.warning("[TGAhermes] hard stop failed for %s", session_key,
+                       exc_info=True)
+        return False
+
+
+async def _error_watch(adapter: Any) -> None:
+    """Bring session-level gateway failures into the owner log channel.
+
+    Reads only new bytes from the end of the gateway log, follows a rotation
+    back to the start, and reports through the per-kind cooldown of
+    _session_alert. A newer watch (started by a later load) supersedes this
+    one so reloads never stack watchers."""
+    _token = f"{time.time():.3f}-{id(asyncio.current_task())}"
+    try:
+        adapter._tga_errwatch = _token
+    except Exception:
+        return
+    _path = str(_hermes_home() / "logs" / "gateway.log")
+    _offset = 0
+    try:
+        _offset = int(os.path.getsize(_path))
+    except Exception:
+        _offset = 0
+    while True:
+        try:
+            await asyncio.sleep(_WATCH_TICK_S)
+            if getattr(adapter, "_tga_errwatch", None) != _token:
+                logger.info("[TGAhermes] error watch superseded by a newer "
+                            "load, exiting")
+                return
+            try:
+                _size = int(os.path.getsize(_path))
+            except Exception:
+                _size = 0
+            if _size < _offset:
+                _offset = 0
+            if _size <= _offset:
+                continue
+            with open(_path, "r", encoding="utf-8", errors="replace") as _fh:
+                _fh.seek(_offset)
+                _chunk = _fh.read(262144)
+                _offset = _fh.tell()
+            for _line in _chunk.splitlines():
+                _kind = _err_marker_for(_line)
+                if _kind:
+                    await _session_alert(_kind, _line.strip())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("[TGAhermes] error watch tick failed", exc_info=True)
+
+
 # ---------------------------------------------------------------- user registry
 
 def _record_user(user: Any, *, started: bool = False, sample: str = "",
@@ -1637,6 +1808,10 @@ async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -
             if mid and st0.get("biz_react"):
                 _spawn(_react(chat_id, mid, st0.get("biz_react_emoji") or "\U0001f47e"))
     logger.info("[TGAhermes] reply delivered=%s chat=%s", bool(ok), chat_id)
+    if not ok:
+        _spawn(_session_alert("deliver",
+                              f"reply not delivered to chat "
+                              f"<code>{_esc(str(chat_id))}</code>"))
     store = _biz_store()
     if store is not None and chat_id:
         try:
@@ -2311,6 +2486,7 @@ def _install_wraps(adapter: Any) -> None:
             # never receive an error/notification/cron-style message through the
             # automation path. Attempt counter + log entry, no outbound send.
             logger.error("[TGAhermes] automation turn failed: %s", e)
+            _spawn(_session_alert("automation-turn", str(e)[:400]))
             try:
                 _biz_err_total = int(globals().get("_BIZ_ERR_TOTAL", 0) or 0) + 1
                 globals()["_BIZ_ERR_TOTAL"] = _biz_err_total
@@ -5948,14 +6124,36 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             if _cancel is None:
                 await q.answer("session control unavailable", show_alert=True)
                 return
+            # Grab the live task BEFORE the cancel pops it out of the
+            # adapter, so the hard stop has a reference even when the
+            # ordinary cancel decides to give up on a wedged task.
+            _held = None
+            try:
+                _st_h = getattr(ad, "_session_tasks", None)
+                if isinstance(_st_h, dict):
+                    _held = _st_h.get(_key)
+            except Exception:
+                _held = None
             try:
                 await _cancel(_key)
-                await q.answer("stopped ✅", show_alert=False)
-                await _log("🛑 Session stopped",
-                           f"<code>{_esc(_key)}</code> (panel button)")
+                if await _hard_stop_session(ad, _key, held=_held):
+                    await q.answer("stopped ✅", show_alert=False)
+                    await _log("🛑 Session stopped",
+                               f"<code>{_esc(_key)}</code> (panel button)")
+                else:
+                    # cancel_session_processing gave up after 5s and something
+                    # bound to this key is still alive: report that instead
+                    # of claiming a stop that did not happen.
+                    await q.answer("⚠️ still running", show_alert=True)
+                    await _session_alert(
+                        "sessstop",
+                        f"session refused to stop: <code>{_esc(_key)}</code>")
             except Exception as _e:
                 logger.warning("[TGAhermes] sessstop failed: %s", _e)
                 await q.answer(f"stop failed: {str(_e)[:70]}", show_alert=True)
+                await _session_alert(
+                    "sessstop-exception",
+                    f"<code>{_esc(_key)}</code>: {_esc(str(_e)[:200])}")
             # Re-render so the button disappears with its turn.
             _s2 = settings()
             await _panel_edit(q, _sessions_body(st=_s2), "sessions", _s2)
@@ -6906,6 +7104,12 @@ def _make_factory():
             _install_wraps(adapter)
         except Exception:
             logger.exception("[TGAhermes] outbound wrap install failed")
+        # Session failures in the gateway log land in the owner log channel
+        # as well; a later load supersedes this watcher instead of stacking.
+        try:
+            _spawn(_error_watch(adapter))
+        except Exception:
+            logger.debug("[TGAhermes] error watch start failed", exc_info=True)
         if native is None:
             return
         # Previous load's handlers must go before ours, or PTB keeps matching
