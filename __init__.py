@@ -1029,6 +1029,28 @@ _BIZ_ACTIVE_ID: str = ""                   # last attached connection id (see _o
 _BIZ_OWNER_SEEN: Dict[str, float] = {}
 
 
+def _bump_owner_seen(event: Any) -> None:
+    """Remember the owner just spoke in this chat (dispatch hook).
+
+    The hold reads this one stamp: his message inside the window is what
+    stands ATRA down, so it has to be recorded for ANY event he sends —
+    his reply in a customer chat is an ordinary message, never a
+    business_message, and the automation handler never sees it.
+    """
+    try:
+        if event is None or getattr(event, "internal", False):
+            return
+        _src_ev = getattr(event, "source", None)
+        _uid = str(getattr(_src_ev, "user_id", "") or "")
+        if not _uid or _uid != str(_owner_id() or ""):
+            return
+        _cid = str(getattr(_src_ev, "chat_id", "") or "")
+        if _cid:
+            _BIZ_OWNER_SEEN[_cid] = time.monotonic()
+    except Exception:
+        logger.debug("[TGAhermes] owner presence update failed", exc_info=True)
+
+
 def _active_bcid() -> str:
     """Connection id for deliveries when the incoming message omitted it.
 
@@ -1682,6 +1704,9 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     _delay = _biz_idle_delay_s(st)
     _t0 = time.monotonic()
     if _delay > 0:
+        # Logged to the gateway too: this branch is the one thing that decides
+        # whether ATRA waits, and the channel log alone can't show it afterwards.
+        logger.info("[TGAhermes] Chat Automation hold %.0fs chat=%s", _delay, chat_id)
         try:
             await _log("🤖 Chat Automation — waiting for owner",
                        f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"
@@ -5102,6 +5127,11 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
         _plat = getattr(getattr(event, "source", None), "platform", None)
         if getattr(_plat, "value", _plat) != "telegram":
             return None
+        # Chat Automation: his reply in a customer chat is an ordinary
+        # message, so this hook is the ONLY place the hold can learn he took
+        # the conversation. Without it the delay always runs to the end and
+        # ATRA answers even though he already did.
+        _bump_owner_seen(event)
         _md0 = getattr(event, "metadata", None) or {}
         _biz_mark(getattr(getattr(event, "source", None), "chat_id", ""),
                   "business" if (_md0.get("business_connection_id")

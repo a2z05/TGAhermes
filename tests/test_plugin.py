@@ -3032,5 +3032,115 @@ async def t33():
 
 asyncio.run(t33())
 
+# [34] "I replied, but automation answered anyway" (2026-10-07): the hold
+# cancels on _BIZ_OWNER_SEEN, and the only writer of that stamp used to be a
+# dispatch hook removed with the idle system — so the owner's own message in a
+# customer chat (an ordinary message, not a business_message) never reached it.
+def _t34():
+    async def _t():
+        async def _log(*a, **k):
+            pass
+
+        class _Bot:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, **kw):
+                self.sent.append(kw)
+                return NS(message_id=7)
+
+        class _Ad:
+            def __init__(self):
+                self._bot = _Bot()
+                self._message_handler = object()
+                self.events = []
+
+            def _clean_bot_trigger_text(self, t, *a, **k):
+                return t or ""
+
+            def _build_message_event(self, msg, mtype, update_id=None):
+                ev = NS(text=msg.text, metadata={}, internal=False, channel_prompt="",
+                        source=NS(chat_id=msg.chat.id, message_id=msg.message_id,
+                                  user_id=msg.from_user.id))
+                self.events.append(ev)
+                return ev
+
+            async def handle_message(self, event):
+                return None
+
+        class _Store:
+            def chat_state(self, chat_id):
+                return None
+
+            def remember_chat(self, chat_id, lang):
+                pass
+
+            def mark_warned(self, chat_id, lang):
+                pass
+
+        def _mk(text):
+            return NS(update_id=8, edited_business_message=None, message=None,
+                      business_message=NS(
+                          message_id=601, business_connection_id="bc_t34",
+                          text=text, caption=None, date=None,
+                          from_user=NS(id=910111, is_bot=False, first_name="Nima",
+                                       last="", username="nimax"),
+                          chat=NS(id=910111, type="private", first_name="Nima")))
+
+        _st0 = mod.settings()
+        _orig = (mod._log, mod._biz_store, mod._biz_idle_delay_s, dict(mod._BIZ_OWNER_SEEN))
+        mod._log, mod._biz_store = _log, (lambda: _Store())
+        mod._biz_idle_delay_s = lambda st: 0.01
+        mod._BIZ_OWNER_SEEN.clear()
+        mod.save_settings({"biz_mode": "assistant", "biz_warn_first": True,
+                           "biz_warn_text": "", "biz_react": False,
+                           "biz_sessions_split": True, "biz_idle_delay_min": 5})
+        try:
+            # the stamp itself: owner only, and never a non-owner sender
+            _owner = mod._owner_id()
+            mod._BIZ_OWNER_SEEN.clear()
+            if _owner:
+                mod._bump_owner_seen(NS(internal=False,
+                                        source=NS(user_id=_owner, chat_id="910111")))
+                _age = time.monotonic() - (mod._BIZ_OWNER_SEEN.get("910111") or 0)
+                check("910111" in mod._BIZ_OWNER_SEEN and 0 <= _age < 5,
+                      "an owner message stamps the chat")
+                _before = dict(mod._BIZ_OWNER_SEEN)
+                mod._bump_owner_seen(NS(internal=False,
+                                        source=NS(user_id=910111, chat_id="910111")))
+                check(dict(mod._BIZ_OWNER_SEEN) == _before,
+                      "a customer message never stamps it")
+                mod._bump_owner_seen(NS(internal=True,
+                                        source=NS(user_id=_owner, chat_id="910111")))
+                check(dict(mod._BIZ_OWNER_SEEN) == _before,
+                      "ATRA's own turn never stamps it")
+            else:
+                check(True, "no owner configured — stamp sender checks skipped")
+
+            # stand-down: a stamp from inside the window cancels the hold
+            mod._BIZ_OWNER_SEEN.clear()
+            mod._BIZ_OWNER_SEEN["910111"] = time.monotonic() + 60.0
+            ad = _Ad()
+            await mod._handle_business_message(ad, _mk("hi there"), None)
+            check(not ad.events and not ad._bot.sent,
+                  "owner answered in the window → ATRA never wakes up")
+
+            # and without it the message still goes through
+            mod._BIZ_OWNER_SEEN.clear()
+            ad = _Ad()
+            await mod._handle_business_message(ad, _mk("hi there"), None)
+            check(bool(ad.events),
+                  "no owner answer → the message is ATRA's, as before")
+        finally:
+            (mod._log, mod._biz_store, mod._biz_idle_delay_s) = _orig[:3]
+            mod._BIZ_OWNER_SEEN.clear()
+            mod._BIZ_OWNER_SEEN.update(_orig[3])
+            mod.save_settings(_st0)
+
+    return asyncio.run(_t())
+
+
+_t34()
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)
