@@ -2905,5 +2905,132 @@ finally:
     mod._BIZ_CONN.clear()
     mod._BIZ_CONN.update(_prev_conn32)
 
+# [33] First-contact warning + a message with no language in it
+# (2026-10-07, real automation chat): the customer sent an order number,
+# detect_language() answered "en" for the digits, so the canned catalog
+# warning went out in English AND the identity line told ATRA to mirror an
+# English sender — to a customer whose first words were Persian. The owner
+# had also left biz_warn_text empty, yet a fixed sentence was still sent;
+# he wants ATRA to write that line itself, shaped around the situation.
+print("\n[33] first-contact warning + digit-only language")
+
+
+class _N33:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+async def t33():
+    class _Bot33:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, **kw):
+            self.sent.append(kw)
+            return _N33(message_id=900009)
+
+    class _Ad33:
+        def __init__(self):
+            self._bot = _Bot33()
+            self._message_handler = object()
+            self.events = []
+
+        def _clean_bot_trigger_text(self, t, *a, **k):
+            return t or ""
+
+        def _build_message_event(self, msg, mtype, update_id=None):
+            ev = _N33(text=msg.text, metadata={}, internal=False, channel_prompt="",
+                      source=_N33(chat_id=msg.chat.id, message_id=msg.message_id,
+                                  user_id=msg.from_user.id))
+            self.events.append(ev)
+            return ev
+
+        async def handle_message(self, event):
+            pass
+
+    class _Store33:
+        def __init__(self):
+            self.rows = {}
+            self.warned = {}
+
+        def chat_state(self, chat_id):
+            return self.rows.get(str(chat_id))
+
+        def remember_chat(self, chat_id, lang):
+            self.rows.setdefault(str(chat_id), {"first_lang": lang})
+
+        def mark_warned(self, chat_id, lang):
+            self.warned[str(chat_id)] = lang
+            self.rows.setdefault(str(chat_id), {"first_lang": lang})
+
+    def _mk33(text):
+        return _N33(update_id=7, edited_business_message=None, message=None,
+                    business_message=_N33(
+                        message_id=501, business_connection_id="bc_t33",
+                        text=text, caption=None, date=None,
+                        from_user=_N33(id=998877, is_bot=False, first_name="Nika",
+                                       last_name="", username="nikax"),
+                        chat=_N33(id=998877, type="private", first_name="Nika")))
+
+    async def _log33(*a, **k):
+        pass
+
+    _st0 = mod.settings()
+    _log0, _store0 = mod._log, mod._biz_store
+    mod._log = _log33
+    try:
+        # digits only, in a chat that has already spoken Persian
+        _s1 = _Store33()
+        _s1.rows["998877"] = {"first_lang": "fa"}
+        mod._biz_store = (lambda: _s1)
+        mod.save_settings({"biz_mode": "assistant", "biz_warn_first": True,
+                           "biz_warn_text": "", "biz_lang": "auto",
+                           "biz_react": False, "biz_idle_delay_min": 0})
+        ad1 = _Ad33()
+        await mod._handle_business_message(ad1, _mk33("1234567890123456"), None)
+        check(len(ad1.events) == 1, "digits: the message still reaches the brain")
+        _ev33 = ad1.events[0]
+        check(_ev33.metadata.get("biz_lang") == "fa",
+              "digits: this chat's own language beats the English guess")
+        check(not ad1._bot.sent,
+              "empty warning field: nothing canned goes out")
+        check(_s1.warned.get("998877") == "fa",
+              "empty warning field: still recorded as told, once per chat")
+        _cp33 = str(getattr(_ev33, "channel_prompt", "") or "")
+        check("First reply to this chat" in _cp33,
+              "ATRA is told to write the line itself")
+        check("Whose question is that" in _cp33,
+              "persona carries the question-routing section")
+        check("Chat Automation turn" in _cp33, "identity block attached")
+
+        # his own text wins, verbatim, and replaces ATRA's draft line
+        _s2 = _Store33()
+        mod._biz_store = (lambda: _s2)
+        mod.save_settings({"biz_warn_text": "OWNLINE"})
+        ad2 = _Ad33()
+        await mod._handle_business_message(ad2, _mk33("hello there"), None)
+        check(any(kw.get("text") == "OWNLINE"
+                  and kw.get("business_connection_id") == "bc_t33"
+                  for kw in ad2._bot.sent),
+              "owner's warning text sent verbatim over the connection")
+        check("First reply to this chat" not in
+              str(getattr(ad2.events[0], "channel_prompt", "") or ""),
+              "his own text replaces ATRA's draft line")
+
+        # plain letters still detect on their own
+        _s3 = _Store33()
+        mod._biz_store = (lambda: _s3)
+        mod.save_settings({"biz_warn_text": ""})
+        ad3 = _Ad33()
+        await mod._handle_business_message(ad3, _mk33("hello there"), None)
+        check(ad3.events[0].metadata.get("biz_lang") == "en",
+              "letters: an unknown chat still detects English")
+    finally:
+        mod._log, mod._biz_store = _log0, _store0
+        mod.save_settings(_st0)
+
+
+asyncio.run(t33())
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

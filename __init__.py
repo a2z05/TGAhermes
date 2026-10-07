@@ -153,7 +153,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "biz_mode": "assistant",         # assistant | mimic | off - who answers customer chats
     "biz_warn_first": True,          # first-contact warning before the first auto-reply
     "biz_lang": "auto",              # auto = detect per message; else a pinned lang code
-    "biz_warn_text": "",             # "" = per-language default (bizauto catalog)
+    "biz_warn_text": "",             # "" = ATRA writes the line itself (in their language)
     "biz_react": True,               # drop the emoji on the automation reply
     "biz_react_emoji": "\U0001f47e",
     "biz_media": True,               # photo/video/gif/sticker/doc/voice → agent + panel
@@ -1633,9 +1633,24 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
         _BIZ_CONN[chat_id] = bcid
     cfg_lang = str(st.get("biz_lang") or "auto")
     detect = bizauto.detect_language(text) if (bizauto and text) else "en"
+    store = _biz_store()
+    if cfg_lang in ("", "auto") and not any(ch.isalpha() for ch in text):
+        # A bare number or an emoji carries no language of its own and
+        # detect_language() returns "en" for it — so an order number from a
+        # Persian customer used to declare "English" twice over: the canned
+        # first-contact warning went out in English, and the identity line
+        # told ATRA to mirror an English sender. Fall back to what this chat
+        # has actually spoken before; only a brand-new chat guesses.
+        known = ""
+        if store is not None:
+            try:
+                known = str((store.chat_state(chat_id) or {}).get("first_lang") or "")
+            except Exception:
+                known = ""
+        if known:
+            detect = known
     lang = detect if cfg_lang in ("", "auto") else cfg_lang
     lang_label = bizauto.language_label(lang) if bizauto else lang
-    store = _biz_store()
     if store is not None:
         try:
             store.remember_chat(chat_id, detect)
@@ -1685,28 +1700,41 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
                 logger.debug("[TGAhermes] stand-down log failed", exc_info=True)
             return
     # --- first-contact warning: once per chat, before ATRA's first reply ----
+    # His own text, when he wrote one, goes out verbatim — that is his call to
+    # make. When he left the field empty the old path still fired the canned
+    # catalog in a guessed language. Now the empty field means ATRA writes the
+    # line itself, inside its first reply: right language, right register, and
+    # shaped around what the customer actually sent.
     warned = False
     if store is not None:
         try:
             warned = bool((store.chat_state(chat_id) or {}).get("warned_at"))
         except Exception:
             warned = False
-    if st.get("biz_warn_first") and not warned and bcid:
-        warn = str(st.get("biz_warn_text") or "").strip() or (
-            bizauto.warn_text(lang) if bizauto else "")
-        sent_warn = False
-        if warn:
-            try:
-                await adapter._bot.send_message(chat_id=chat_id, text=warn[:4000],
-                                                business_connection_id=bcid)
-                sent_warn = True
-            except Exception:
-                logger.warning("[TGAhermes] first-contact warning failed", exc_info=True)
-        if sent_warn and store is not None:
-            try:
-                store.mark_warned(chat_id, lang)
-            except Exception:
-                logger.debug("[TGAhermes] mark_warned failed", exc_info=True)
+    warn_draft = False
+    if st.get("biz_warn_first") and not warned:
+        owner_warn = str(st.get("biz_warn_text") or "").strip()
+        if owner_warn:
+            sent_warn = False
+            if bcid:
+                try:
+                    await adapter._bot.send_message(chat_id=chat_id, text=owner_warn[:4000],
+                                                    business_connection_id=bcid)
+                    sent_warn = True
+                except Exception:
+                    logger.warning("[TGAhermes] first-contact warning failed", exc_info=True)
+            if sent_warn and store is not None:
+                try:
+                    store.mark_warned(chat_id, lang)
+                except Exception:
+                    logger.debug("[TGAhermes] mark_warned failed", exc_info=True)
+        else:
+            warn_draft = True
+            if store is not None:
+                try:
+                    store.mark_warned(chat_id, lang)
+                except Exception:
+                    logger.debug("[TGAhermes] mark_warned failed", exc_info=True)
     # --- build the event the same way the guest path does -------------------
     try:
         from gateway.platforms.event import MessageType
@@ -1756,6 +1784,14 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
         f"{mode_line}\n"
         "Reply directly to their message; no commands, no panel talk."
     )
+    if warn_draft:
+        identity += (
+            "\nFirst reply to this chat: fold in ONE short line telling them "
+            "you wrote this on Ar(t)an's behalf and he'll come back to it "
+            "himself. Write it yourself, in their language and shaped around "
+            "what they actually said — never a stock sentence. One line, then "
+            "the answer; if they didn't need telling, keep it to a clause."
+        )
     if st.get("biz_larp"):
         identity += ("\nStyle: read the owner's own messages in the history above "
                      "and match how he writes — vocabulary, sentence length, "
@@ -1851,7 +1887,7 @@ def _bizlang_view(st: Dict[str, Any], note: str = "") -> str:
     lines += ["",
               "auto = every message's language is detected (Persian included); "
               "a fixed language pins the warning and the replies.",
-              f"warning text: <i>{_esc(warn[:120]) if warn else 'per-language default'}</i>",
+              f"warning text: <i>{_esc(warn[:120]) if warn else 'ATRA writes it, in their language'}</i>",
               "",
               "Tap a language to confirm it."]
     return "\n".join(lines)
@@ -3160,7 +3196,7 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
                 f"now: <b>{_esc(cur_l)}</b> → <b>{_esc(nxt_l)}</b>\n\n"
                 "The first-contact warning and every automation reply go out in "
                 "this language. <b>auto</b> detects per message (Persian included)."
-                f"\n\nwarning: <i>{_esc(warn[:80]) if warn else 'per-language default'}</i>"
+                f"\n\nwarning: <i>{_esc(warn[:80]) if warn else 'ATRA writes it'}</i>"
                 "\n\nTap ✅ Apply to change, ✖ Cancel to go back.")
     if kind == "tg":                      # a settings flag / guest mode cycle
         sub, _, _origin = (arg or "").partition(":")
@@ -4675,8 +4711,8 @@ _WIZARD: Dict[str, Dict[str, Any]] = {}
 _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
     "bizwarntext": {
         "prompts": ["\u2709\ufe0f <b>Automation - warning text</b>\n\nSend the exact "
-                    "first-contact message, or <code>default</code> to fall back to the "
-                    "per-language one.\n<i>Type cancel to abort.</i>"],
+                    "first-contact message, or <code>default</code> to let ATRA write it "
+                    "itself, in their language.\n<i>Type cancel to abort.</i>"],
         "save": lambda d: {"biz_warn_text": (
             "" if d[0].strip().lower() in ("default", "reset", "auto")
             else d[0].strip()[:600])},
