@@ -1,13 +1,13 @@
-"""Secretary Mode / Chat Automation — ATRA answering on the owner's behalf.
+"""Secretary Mode / Chat Automation ATRA answering on the owner's behalf.
 
 Telegram's May 2026 "Secretary Mode" (Settings > Chat Automation) lets a user
 attach a bot to their account. Once connected, the bot receives:
 
-  * ``update.business_connection``      — established / edited / ended
-  * ``update.business_message``          — a new DM reaching the account
-  * ``update.edited_business_message``   — that message edited
-  * ``update.deleted_business_messages``— messages deleted in a managed chat
-  * ``update.message_reaction``          — a reaction landing on a chat message
+  * ``update.business_connection`` established / edited / ended
+  * ``update.business_message`` a new DM reaching the account
+  * ``update.edited_business_message`` that message edited
+  * ``update.deleted_business_messages`` messages deleted in a managed chat
+  * ``update.message_reaction`` a reaction landing on a chat message
 
 This module owns everything that is specific to that surface: which chats are
 in scope, whether a first-contact warning is sent, which persona answers, what
@@ -40,7 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Script detectors — escapes only, no literal non-Latin text in this file
+# Script detectors escapes only, no literal non-Latin text in this file
 # (repo audit rejects Arabic script outright; Farsi lives in the local JSON).
 _RE_ARABIC_SCRIPT = re.compile("[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\ufb50-\ufdff\ufe70-\ufeff]")
 _FA_MARKERS = set(
@@ -64,7 +64,7 @@ _RE_LATIN_ACCENTED = re.compile("[\u00c0-\u00ff\u0100-\u017f]")
 # incoming message, so a Persian DM gets Persian and an English DM gets English
 # without the owner touching anything.
 LANGUAGES: Dict[str, str] = {
-    "auto": "Auto — mirror the incoming message",
+    "auto": "Auto mirror the incoming message",
     "en": "English",
     "ru": "Русский",
     "tr": "Türkçe",
@@ -82,36 +82,36 @@ LANGUAGES: Dict[str, str] = {
 # text outright. They are loaded from LANG_EXTRA_PATH below, which is local to
 # the install and never tracked.
 WARN_TEXT: Dict[str, str] = {
-    "en": ("Hi — this reply was written by an AI (ATRA); I'm not at my phone right now. "
+    "en": ("Hi this reply was written by an AI (ATRA); I'm not at my phone right now. "
            "If this doesn't cover it, give me a moment and I'll answer myself."),
-    "ru": ("Привет — этот ответ "
+    "ru": ("Привет этот ответ "
            "написал ИИ (ATRA), я сейчас "
            "не у телефона. Если ответа "
-           "не хватит, подожди — "
+           "не хватит, подожди "
            "я отвечу сам."),
-    "tr": ("Merhaba — bu yanıtı bir yapay zeka (ATRA) yazdı, şu an "
+    "tr": ("Merhaba bu yanıtı bir yapay zeka (ATRA) yazdı, şu an "
            "telefonumda değilim. Cevap işine yaramazsa biraz bekle, "
            "kendim cevaplarım."),
-    "de": ("Hallo — diese Antwort wurde von einer KI (ATRA) geschrieben; ich bin "
+    "de": ("Hallo diese Antwort wurde von einer KI (ATRA) geschrieben; ich bin "
            "gerade nicht am Handy. Falls es nicht reicht, warte kurz, ich antworte selbst."),
-    "fr": ("Bonjour — cette réponse a écrit par une IA (ATRA) ; je n'ai pas "
+    "fr": ("Bonjour cette réponse a écrit par une IA (ATRA) ; je n'ai pas "
            "mon téléphone. Si ce n'est pas suffisant, patiente, je répondrai moi-même."),
-    "es": ("Hola — esta respuesta la escribió una IA (ATRA); no tengo el móvil ahora. "
+    "es": ("Hola esta respuesta la escribió una IA (ATRA); no tengo el móvil ahora. "
            "Si no es suficiente, espera un momento y responderé yo."),
-    "pt": ("Olá — esta resposta foi escrita por uma IA (ATRA); não estou com o "
+    "pt": ("Olá esta resposta foi escrita por uma IA (ATRA); não estou com o "
            "telefone. Se não bastar, aguarde um pouco e eu mesmo respondo."),
-    "zh": ("你好 — 这条回复由 AI（ATRA）撰写，"
+    "zh": ("你好 这条回复由 AI（ATRA）撰写，"
            "我现在不在手机旁。"
            "如果回复不够，请稍等，"
            "我会亲自答复。"),
-    "hi": ("नमस्ते — यह उत्तर "
+    "hi": ("नमस्ते यह उत्तर "
            "AI (ATRA) ने लिखा है; मैं "
            "अभी फ़ोन पर नहीं "
            "हूँ। अगर पर्याप्त "
            "न हो, थोड़ा प्रतीक्षा "
            "करें, मैं खुद जवाब "
            "दूंगा।"),
-    "ko": ("안녕하세요 — 이 답장은 AI(ATRA)ac"
+    "ko": ("안녕하세요 이 답장은 AI(ATRA)ac"
            "가 작성했습니다; 지금 "
            "휴대전팅 없습니다. 부족하면 "
            "잠짜 기다려 주세요, 같이 "
@@ -203,9 +203,9 @@ def language_label(lang: str) -> str:
 # Modes
 # --------------------------------------------------------------------------- #
 
-# `assistant` — ATRA answers as itself (default).
-# `mimic`    — answers on the owner's behalf via business_connection_id.
-# `off`      — observed but silent.
+# `assistant` ATRA answers as itself (default).
+# `mimic` answers on the owner's behalf via business_connection_id.
+# `off` observed but silent.
 MODES: Tuple[str, ...] = ("assistant", "mimic", "off")
 
 _MODE_LABEL = {
@@ -237,7 +237,7 @@ def warn_text(lang: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Persistence — connection registry + per-chat warning memory
+# Persistence connection registry + per-chat warning memory
 # --------------------------------------------------------------------------- #
 
 class BizStore:

@@ -12,7 +12,7 @@ deploy dir.
 Usage:
   python3 scripts/setup_userbridge.py [--plugin-dir DIR] [--force] [--skip-verify]
 
-Rerun only while Full unlock is OFF — a running bridge holds its copy open.
+Rerun only while Full unlock is OFF a running bridge holds its copy open.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve()
 PROJECTS = HERE.parents[2]                      # .../projects
 SELFBOT = PROJECTS / "selfbot_pro" / "selfbot_pro"
-# sync.sh deploys to REPO/../../plugins/<name> — same derivation here.
+# sync.sh deploys to REPO/../../plugins/<name> same derivation here.
 DEFAULT_PLUGIN_DIR = HERE.parents[3] / "plugins" / HERE.parents[1].name
 
 
@@ -54,7 +54,7 @@ def main() -> int:
     session_name = env.get("SESSION_NAME")
     api_id, api_hash, owner = env.get("API_ID"), env.get("API_HASH"), env.get("OWNER_ID")
     if not (session_name and api_id and api_hash and owner):
-        print(f"setup_userbridge: incomplete env at {env_file.name} — need "
+        print(f"setup_userbridge: incomplete env at {env_file.name} need "
               "SESSION_NAME, API_ID, API_HASH, OWNER_ID", file=sys.stderr)
         return 1
 
@@ -99,7 +99,7 @@ def main() -> int:
     try:
         from telethon import TelegramClient
     except Exception as exc:
-        print(f"setup_userbridge: telethon unavailable ({exc}) — run "
+        print(f"setup_userbridge: telethon unavailable ({exc}) run "
               "sync.sh deploy first (installs deps/), then rerun",
               file=sys.stderr)
         return 2
@@ -120,9 +120,9 @@ def main() -> int:
         return 3
     if str(found) != str(owner):
         print(f"setup_userbridge: copy identifies {found}, expected the owner "
-              f"({owner}) — refusing to keep it", file=sys.stderr)
+              f"({owner}) refusing to keep it", file=sys.stderr)
         return 4
-    print("setup_userbridge: verified — the copy identifies the owner")
+    print("setup_userbridge: verified the copy identifies the owner")
     return 0
 
 

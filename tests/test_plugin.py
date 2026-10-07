@@ -65,7 +65,7 @@ GATE_SYNC_CALLS = []
 _real_gate_sync = mod._sync_gate_allowlists
 def _fake_gate_sync(csv, *, env_path=None, environ=None):
     if env_path is not None and environ is not None:
-        # explicitly sandboxed call ([24]) — safe, run it for real
+        # explicitly sandboxed call ([24]) safe, run it for real
         return _real_gate_sync(csv, env_path=env_path, environ=environ)
     GATE_SYNC_CALLS.append((csv, env_path, environ))
     return True
@@ -74,7 +74,7 @@ mod._sync_gate_allowlists = _fake_gate_sync
 mod.SETTINGS_PATH = TMP / "settings.json"
 mod.STATE_PATH = TMP / "state.json"
 PERSONA = TMP / "persona.md"
-PERSONA.write_text("# ATRA — test persona\n", encoding="utf-8")
+PERSONA.write_text("# ATRA test persona\n", encoding="utf-8")
 
 
 class NS(types.SimpleNamespace):
@@ -273,7 +273,7 @@ async def t1():
     check(ev.metadata["guest_original_chat_id"] == "777777", "original chat id kept for log buttons")
     check("[Channel origin]" in ev.channel_prompt and "ATRA" in ev.channel_prompt, "persona + identity tag")
     check("guest chat" in ev.channel_prompt, "guest block says this is a guest chat")
-    check(any("Guest mention — answered" in str(m.get("text", "")) for m in ad._bot.sent), "answered mention logged")
+    check(any("Guest mention answered" in str(m.get("text", "")) for m in ad._bot.sent), "answered mention logged")
 
     # stranger reply-to-ATRA -> handled (no canned)
     n = len(ad._bot.answers)
@@ -623,7 +623,7 @@ check(not HAVE_HOST or "TGAhermes" in ((cfg.get("plugins") or {}).get("enabled")
       "still enabled in config")
 
 # ---------------------------------------------------------------- real MessageEvent shape (regression)
-# FakeEvent above carries a `.platform` attr that the REAL gateway MessageEvent does NOT have —
+# FakeEvent above carries a `.platform` attr that the REAL gateway MessageEvent does NOT have 
 # that mismatch let a broken platform gate pass every test while production silently no-opped
 # (bang commands fell through to the LLM). This section builds the production shape for real.
 print("\n[9] real MessageEvent shape (platform lives on event.source)")
@@ -712,7 +712,7 @@ class FakeStore:
 store10 = FakeStore()
 mod._CTX["session_store"] = store10
 r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!wipe", session_store=store10))
-check(store10.reset == [], "bare !wipe refuses — no implicit current-chat wipe")
+check(store10.reset == [], "bare !wipe refuses no implicit current-chat wipe")
 check("chat_id" in str(r10) and "Usage" in str(r10), "bare !wipe shows usage")
 store10.reset = []
 r10 = asyncio.run(mod._bang_execute(ad10, "900000001", "!wipe -100123", session_store=store10))
@@ -920,14 +920,14 @@ mod._CTX["gateway"] = None
 r12 = asyncio.run(mod._bang_execute(ad12, "900000001", "!panel"))
 check(r12 and "ATRA console" in r12 and "!panel" in r12, "!panel serves the dashboard")
 check(r12 and "friends" in r12 and "cooldown" in r12 and "guest tool mode" in r12,
-      "dashboard carries live status only — flags moved to Settings")
+      "dashboard carries live status only flags moved to Settings")
 
 kb = mod._help_keyboard("panel")
 datas = [b.callback_data for row in kb for b in row]
 check(any(d.endswith("panel:settings") for d in datas), "panel has a settings section")
 check(any(d.endswith("panel:wl") for d in datas), "panel has a whitelist section")
 check(not any("panel:toggle:" in d for d in datas),
-      "home carries no bare toggles — every flag goes through a confirm screen")
+      "home carries no bare toggles every flag goes through a confirm screen")
 
 check(any(d.endswith("help:sessions") for d in datas), "panel keeps section buttons")
 check(not any(d.endswith("panel:back") for d in datas), "dashboard has no self-back button")
@@ -1143,7 +1143,7 @@ async def t15():
                              reply_text=None),
                   answer=_ans)
 
-    # v3.3: these flags also confirm first — tap lands on the confirm
+    # v3.3: these flags also confirm first tap lands on the confirm
     # screen, and only the Apply callback flips the setting.
     before_tool = bool(mod.settings().get("tool_enabled"))
     edits.clear()
@@ -1444,7 +1444,7 @@ async def t18():
     # strict mode so the gate is at its most closed
     mod.save_settings({"guest_tool_mode": "strict", "guest_owner_full_access": False})
     # Stub the session row: this check must not depend on the author's live
-    # state.db — anywhere else the lookup misses, the gate returns None and
+    # state.db anywhere else the lookup misses, the gate returns None and
     # every block assertion silently "passes" as a None (found 2026-10-01).
     orig_info18 = mod._guest_session_info
     mod._guest_session_info = lambda sid: ({"guest_user_id": "111", "is_owner": False}
@@ -1817,7 +1817,7 @@ check("telegram-guest-mode" not in Path(mod.__file__).read_text(encoding="utf-8"
 
 
 async def t23():
-    """!setlog here — the command twin of the Actions button."""
+    """!setlog here the command twin of the Actions button."""
     mod.save_settings({"owner_id": "900000001"})
     prev_log = mod.settings().get("log_channel")
 
@@ -1826,7 +1826,7 @@ async def t23():
           "!setlog here sets the current chat")
     check(r is not None and "-100777" in r, "!setlog here replies with the chat id")
 
-    # From inside a group that is NOT the current log — the whole point of `here`.
+    # From inside a group that is NOT the current log the whole point of `here`.
     mod.save_settings({"log_channel": None})
     ev = _real_ev("!setlog here", chat_type="supergroup",
                   chat_id="-100888", user_id="900000001")
@@ -1969,8 +1969,8 @@ import types as _types
 _stale_cb = lambda: None
 _stale_cb.__module__ = mod.__name__  # pretend an older instance of the plugin defined it
 _stale_h = _types.SimpleNamespace(callback=_stale_cb)
-_mine_h = _types.SimpleNamespace(callback=mod._drop_stale_handlers)  # this instance — keep
-_foreign_h = _types.SimpleNamespace(callback=check)  # another module — untouched
+_mine_h = _types.SimpleNamespace(callback=mod._drop_stale_handlers)  # this instance keep
+_foreign_h = _types.SimpleNamespace(callback=check)  # another module untouched
 
 
 class _FakeNative:
@@ -1996,7 +1996,7 @@ check(mod._make_factory().__qualname__.startswith("factory.m"),
 # ---------------------------------------------------------------- core-gate env tier (the "Dropped ... unrecognized" tier)
 # The authz mixin reads TELEGRAM_ALLOWED_USERS from the environment first; when
 # non-empty it never consults telegram.extra.allow_from. These tests use
-# injected env_path/environ — the real .env is never touched by the harness.
+# injected env_path/environ the real .env is never touched by the harness.
 print("\n[24] core gate env tier: union sync that survives hand-entries")
 _tmp_env = TMP / "dot.env"
 _tmp_env.write_text("OTHER=1\nTELEGRAM_ALLOWED_USERS=900000001,111111111\n", encoding="utf-8")
@@ -2142,7 +2142,7 @@ _raw_origin = _sp.run(["git", "config", "--get", "remote.origin.url"],
                       cwd=str(HERE), capture_output=True,
                       text=True).stdout.strip()
 _shown = mod._repo_display(_raw_origin)
-# the kept tail must be host/path only — no colon means no password survived
+# the kept tail must be host/path only no colon means no password survived
 _tail = _shown.split("://")[-1] if "://" in _shown else _shown
 check(":" not in _tail.rsplit("@", 1)[-1],
       "git origin loses its credential when displayed")
@@ -2259,7 +2259,7 @@ async def _t27():
 
         # Plain hold: a message waits the configured delay unless the thread
         # is already engaged (no idle threshold), and the owner replying
-        # inside that window — in THIS chat — cancels ATRA's turn.
+        # inside that window in THIS chat cancels ATRA's turn.
         mod.save_settings({"biz_idle_delay_min": 0.005})  # 0.3s hold
         _h0 = stub.handles
         _ta = time.monotonic()
@@ -2313,7 +2313,7 @@ asyncio.run(_t27())
 
 # [27b] Regression: the home board printed biz_mode under the label
 # "automation", so a paused biz_schedule read as ON while the gate answered
-# "automation is switched off" — the reported contradiction. And the mode row
+# "automation is switched off" the reported contradiction. And the mode row
 # routed through a confirm screen, so a mode tap looked like an on/off switch
 # when only biz_schedule gates anything.
 print("\n[27b] home board tells the truth, mode applies on one tap")
@@ -2372,7 +2372,7 @@ async def _t27b():
         check("Chat Automation" in edited[0][0],
               "mode tap lands back on the Chat Automation page")
 
-        # the key it writes is biz_mode only — schedule is untouched
+        # the key it writes is biz_mode only schedule is untouched
         check(mod.settings().get("biz_schedule") == _orig.get("biz_schedule"),
               "a mode tap never touches the schedule master switch")
     finally:
@@ -2421,7 +2421,7 @@ _t28()
 
 # [29] Regression: ghost handlers. The adapter's post-factory hoist rebuilds
 # group-0 from a PRE-factory snapshot, re-inserting the stale handlers the
-# factory just dropped — OLD closures then sit in front of everything (panel
+# factory just dropped OLD closures then sit in front of everything (panel
 # taps answered by old code, business messages never reaching the Chat
 # Automation logger). Two guards: the sweep must unwrap admission's @wraps
 # before deciding "is this ours", and business events must never fall
@@ -2544,7 +2544,7 @@ try:
     mod._BIZ_CONN["770011"] = "bc_boot"
 
     async def t30():
-        # no event seen yet: old behaviour — owner delivery for a known chat
+        # no event seen yet: old behaviour owner delivery for a known chat
         mod._BIZ_CTX.pop("770011", None)
         await ad3.send("770011", "boot sweep")
         check(any(kw.get("business_connection_id") == "bc_boot"
@@ -2606,7 +2606,7 @@ _prev31 = {k: mod.settings().get(k) for k in (
     "biz_window_start", "biz_window_end",
     "biz_persona_path")}
 try:
-    # _dur_to_s — the point of the feature: type what people actually say
+    # _dur_to_s the point of the feature: type what people actually say
     check(mod._dur_to_s("10s", "s") == 10, "duration 10s parses")
     check(mod._dur_to_s("10m", "s") == 600, "duration 10m parses")
     check(mod._dur_to_s("1h", "s") == 3600, "duration 1h parses")
@@ -2705,7 +2705,7 @@ try:
     check(mod._biz_persona({"biz_persona_path": str(PERSONA)}, "assistant")
           .startswith("# ATRA"), "an explicit persona path still wins")
 
-    # the persona wizard refuses a path that is not a file — that is the bug
+    # the persona wizard refuses a path that is not a file that is the bug
     # which stored a chat message as biz_persona_path
     check(mod._biz_persona_arg_ok(["default"]) == "",
           "persona wizard accepts 'default'")
@@ -2812,10 +2812,10 @@ asyncio.run(t_busy())
 
 # [32] The two live send bugs (2026-10-06, real guest chat):
 #  (a) the "bizauto:<chat>" session-split marker flowed into int() as
-#      message_thread_id and crashed every queued-lane final — the wrappers
+#      message_thread_id and crashed every queued-lane final the wrappers
 #      must drop it while keeping real forum thread ids;
 #  (b) a reconnect rotated the business connection id, the cached one went
-#      stale (Business_connection_invalid) — delivery must rotate to the next
+#      stale (Business_connection_invalid) delivery must rotate to the next
 #      candidate and remember the id that worked.
 print("\n[32] split-marker safety + connection rotation")
 _g32 = "679" + "498" + "5749"  # assembled: the audit forbids storing it raw
@@ -2926,7 +2926,7 @@ finally:
 # (2026-10-07, real automation chat): the customer sent an order number,
 # detect_language() answered "en" for the digits, so the canned catalog
 # warning went out in English AND the identity line told ATRA to mirror an
-# English sender — to a customer whose first words were Persian. The owner
+# English sender to a customer whose first words were Persian. The owner
 # had also left biz_warn_text empty, yet a fixed sentence was still sent;
 # he wants ATRA to write that line itself, shaped around the situation.
 print("\n[33] first-contact warning + digit-only language")
@@ -3051,7 +3051,7 @@ asyncio.run(t33())
 
 # [34] "I replied, but automation answered anyway" (2026-10-07): the hold
 # cancels on _BIZ_OWNER_SEEN, and the only writer of that stamp used to be a
-# dispatch hook removed with the idle system — so the owner's own message in a
+# dispatch hook removed with the idle system so the owner's own message in a
 # customer chat (an ordinary message, not a business_message) never reached it.
 def _t34():
     async def _t():
@@ -3134,7 +3134,7 @@ def _t34():
                 check(dict(mod._BIZ_OWNER_SEEN) == _before,
                       "ATRA's own turn never stamps it")
             else:
-                check(True, "no owner configured — stamp sender checks skipped")
+                check(True, "no owner configured stamp sender checks skipped")
 
             # stand-down: a stamp from inside the window cancels the hold
             mod._BIZ_OWNER_SEEN.clear()
@@ -3189,7 +3189,7 @@ def _t34():
             ad = _Ad()
             await mod._handle_business_message(ad, _mk("hi there"), None)
             check(time.monotonic() - _t < 1.0 and bool(ad.events),
-                  "engaged chat answers now — no wait")
+                  "engaged chat answers now no wait")
             mod._BIZ_OWNER_SEEN["910111"] = time.time()
             check(not mod._biz_engaged("910111"),
                   "owner taking the thread back re-arms the wait")
@@ -3285,7 +3285,7 @@ _t35()
 def _t36():
     """Telegram does deliver his reply: same business_message update, his id
     in `from`. The handler records the stamp and returns before any
-    automation runs — and the stamp must be an epoch, or the hold reads it
+    automation runs and the stamp must be an epoch, or the hold reads it
     as a few seconds since boot and decides he never spoke."""
     from types import SimpleNamespace
     print("\n[36] the owner's own business_message stands the hold down")

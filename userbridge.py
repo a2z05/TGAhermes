@@ -1,4 +1,4 @@
-"""Owner-session bridge — the panel's "Full unlock (act as you)".
+"""Owner-session bridge the panel's "Full unlock (act as you)".
 
 WHAT IT IS
     The Bot API gives a bot connected to the owner's business account no way
@@ -17,13 +17,13 @@ WHAT IT IS
 
 SESSION SAFETY
     scripts/setup_userbridge.py reads the live session file ONCE through
-    SQLite's backup API — the original is never opened for write — and stores
+    SQLite's backup API the original is never opened for write and stores
     the copy plus api_id/api_hash in userbridge.json (mode 600, beside the
     copy, never committed). The running selfbot keeps its own file untouched.
 
 STATE
     client / listener task / current callback live on the adapter object the
-    plugin hands in ("anchor"), which survives plugin reloads — so a reload
+    plugin hands in ("anchor"), which survives plugin reloads so a reload
     refreshes the callback instead of stacking a second connection.
 """
 from __future__ import annotations

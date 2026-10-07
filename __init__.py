@@ -1,32 +1,32 @@
-"""TGAhermes — all-in-one Telegram guest mode, logging console and admin tools for Hermes.
+"""TGAhermes all-in-one Telegram guest mode, logging console and admin tools for Hermes.
 
 Restores the Atropos guest-mode behavior on Hermes 0.21.5+ as a plugin (no core edits), plus:
 
-* **Guest mode** — Bot API 10 guest summons answered exclusively via ``answerGuestQuery``
+* **Guest mode** Bot API 10 guest summons answered exclusively via ``answerGuestQuery``
   (owner plain-mention / reply-to-ATRA gate, ATRA persona, sender-identity tag, per-guest-chat
   sessions, ``event.internal`` admission bypass).
-* **Unauthorized users** get a configurable canned reply (default "I only serve to my owner") —
-  guest plain mentions via the guest query, stranger DMs directly — with a per-user cooldown.
-* **Log channel** — every interaction (guest mentions, stranger DMs, /start, admin actions,
+* **Unauthorized users** get a configurable canned reply (default "I only serve to my owner") 
+  guest plain mentions via the guest query, stranger DMs directly with a per-user cooldown.
+* **Log channel** every interaction (guest mentions, stranger DMs, /start, admin actions,
   bang commands, guest-mode errors, optional owner/group traffic) posts to a configurable
   group/channel with inline buttons (profile / info / ban / delete). Errors of GUEST turns
   only go to the log channel (owner DM fallback when no channel is configured).
 * **Bang command console** (log channel or owner DM, owner only):
   ``!help !run !users !send !settings !setlog !setowner !whitelist add|remove|list|perms
   !gs list|open|lock|reset !gate show|allow|deny !auth [user_id] !wipe [chat_id]
-  !setunauthorized !seterror !seterrorfa !setreact !setmedia !setcooldown`` — texts/ids
+  !setunauthorized !seterror !seterrorfa !setreact !setmedia !setcooldown`` texts/ids
   editable live. Every chat (DM / group / guest) is its own session; ``!wipe`` (or the 🧹
   button on log entries) resets it. The whitelist adds friends who talk to the real bot,
   each with a permission level (talk / gate / full). Guest sessions can be opened for a
-  specific person or locked — whether you opened them or they appeared automatically —
+  specific person or locked whether you opened them or they appeared automatically 
   and ``!auth`` shows exactly why a user is getting through or being blocked (config file
   vs the live adapter snapshot the core prefilter actually checks).
 * **``telegram_admin`` agent tool** (owner session ONLY): delete messages, ban/unban/mute,
-  reactions, DM users, chat/member info, pin, and ``bang`` (run any console command — the
-  agent can do everything the owner can type) — gated by DB lookup to the owner's session.
-* **Reactions as feedback** — 👀 when a message lands, ✅ after the reply, ❌ on errors
+  reactions, DM users, chat/member info, pin, and ``bang`` (run any console command the
+  agent can do everything the owner can type) gated by DB lookup to the owner's session.
+* **Reactions as feedback** 👀 when a message lands, ✅ after the reply, ❌ on errors
   (configurable/off-able, best-effort).
-* **Media to guests** — URL images/documents/voice answered as inline results through the
+* **Media to guests** URL images/documents/voice answered as inline results through the
   guest query, with a text fallback when the API rejects a result type.
 
 Settings live in ``settings.json`` next to this file (hot-edited, never committed); the user
@@ -97,8 +97,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "log_channel": None,             # group (recommended) or channel id/@username; bot must be able to post
     "unauthorized_reply": "I only serve to my owner",
     "unauthorized_cooldown_s": 3600,
-    "guest_error_reply_en": "Give me a second — system hiccup. I'm fixing it. Try again.",
-    "guest_error_reply_fa": "Something went wrong on my side — fixing it now. Please try again.",
+    "guest_error_reply_en": "Give me a second system hiccup. I'm fixing it. Try again.",
+    "guest_error_reply_fa": "Something went wrong on my side fixing it now. Please try again.",
     "auto_react": True,              # 👀 receive / ✅ done / ❌ error (owner DM + groups)
     "react_guests": False,           # also try reactions inside guest chats (usually no rights)
     "react_emoji_receive": "👀",
@@ -136,15 +136,15 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "guest_owner_chats": [],
     # --- whitelisted-friend permissions ------------------------------
     # Per-user tool level for a whitelisted friend's own DM session:
-    #   "talk" — only the safe read-only set (web, vision, skills)
-    #   "free" — everything works except destructive/credential tools
+    #   "talk" only the safe read-only set (web, vision, skills)
+    #   "free" everything works except destructive/credential tools
     #            (default; "gate" is accepted as its old name)
-    #   "full" — no tool gating at all (the old whitelisted behavior)
+    #   "full" no tool gating at all (the old whitelisted behavior)
     "whitelist_perms": {},          # {"<user_id>": "talk"|"free"|"full"}
     "user_bridge": False,           # Full unlock: owner-session bridge (act as you)
     # What a locked guest session answers (rate-limited by the cooldown).
     "guest_locked_reply": "This session is locked by the owner.",
-    # !update — pull a newer version of this plugin from git
+    # !update pull a newer version of this plugin from git
     "update_enabled": True,          # set False to lock the plugin version
     "update_repo": None,             # git URL; None = use the plugin's own origin
     "update_branch": "master",       # branch to track
@@ -164,7 +164,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "biz_full_access": False,        # unlock every tool on business chats (owner accepts risk)
 
     # --- automation schedule / session separation (owner-set, per chat overridable) ---
-    "biz_schedule": "always",        # always | off | window  — master switch
+    "biz_schedule": "always",        # always | off | window master switch
     "biz_window_start": "00:00",     # window mode only, HH:MM local
     "biz_window_end": "23:59",       # window mode only (may wrap past midnight)
     "biz_window_days": [],           # [] = every day; else ["mon","tue",...]
@@ -172,7 +172,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "biz_sessions_split": True,      # whitelisted DM != automation session
 }
 
-_FALLBACK_PERSONA = """I'm ATRA — named after Atropos, the Greek Fate who cuts the thread.
+_FALLBACK_PERSONA = """I'm ATRA named after Atropos, the Greek Fate who cuts the thread.
 " she who cannot be turned."
 
 The person talking to me here is a guest: someone who summoned the bot through
@@ -189,7 +189,7 @@ How I answer:
 - No opening ritual. No "how can I help". No "Absolutely!" / "I'd be happy to" /
   "great question". No exclamation marks as decoration. Emoji rare and
   deliberate.
-- Casual room: I don't censor myself out of reflex — dark jokes, sharp
+- Casual room: I don't censor myself out of reflex dark jokes, sharp
   comments, swearing when it fits. Serious room: flat and precise, no jokes
   until it breaks. It's the same voice either way, just attentive.
 - If I got something wrong: say so, fix it, move on. No apology paragraphs.
@@ -202,7 +202,7 @@ What I don't do:
 - Never mention the operator's business. If they ask about him, that's all
   they get: he set me up.
 
-If something can't be done, I say it can't — with a reason, not as a reflex.
+If something can't be done, I say it can't with a reason, not as a reflex.
 Everything that can be done, I do, and I finish it.
 """
 _lock = threading.Lock()
@@ -211,7 +211,7 @@ _NATIVE: Any = None  # live PTB application, set by the PTB factory (sweep targe
 # Fresh object per module instance: when a hot reload swaps this module, the
 # first hook run sees its sentinel differ from the one stored on the adapter and
 # triggers the PTB re-wire (on_plugin_loaded never fires for a RE-load, so
-# nothing else would — see the factory qualname comment).
+# nothing else would see the factory qualname comment).
 _INSTANCE = object()
 _CTX: Dict[str, Any] = {"session_store": None}  # live SessionStore, cached from the dispatch hook
 
@@ -253,7 +253,7 @@ def _load_state() -> Dict[str, Any]:
 
 
 def _save_state(state: Dict[str, Any]) -> None:
-    # NOTE: called under _lock by _mutate_state — must NOT re-acquire (non-reentrant lock).
+    # NOTE: called under _lock by _mutate_state must NOT re-acquire (non-reentrant lock).
     tmp = STATE_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
     os.replace(tmp, STATE_PATH)
@@ -405,39 +405,39 @@ async def _react(chat_id: Any, message_id: Any, emoji: str) -> bool:
     except Exception:
         logger.debug("[TGAhermes] reaction failed", exc_info=True)
     if not ok and _biz_wants_owner(str(chat_id)):
-        # Full unlock: the Bot API refuses inside business chats — fall back
+        # Full unlock: the Bot API refuses inside business chats fall back
         # to the owner's own session (see userbridge.py). Never for plain
         # turns: the ids collide with the owner's own DMs with the same
         # people, so a fallback here could react to an unrelated message.
         ok = await _ub_react(ad, chat_id, message_id, emoji)
     if not ok and _biz_wants_owner(str(chat_id)) and str(chat_id) not in _REACT_WARNED:
         _REACT_WARNED.add(str(chat_id))
-        logger.info("[TGAhermes] reaction NOT delivered — bot cannot react here and "
+        logger.info("[TGAhermes] reaction NOT delivered bot cannot react here and "
                     "the owner-session bridge is off/unavailable: chat=%s", chat_id)
     return ok
 
 
 # ---------------------------------------------------------------- reaction updates (see reactions)
 # Telegram delivers message_reaction updates only for chats the bot is actually
-# in (groups where it is admin, its own DMs) — never for connected business
+# in (groups where it is admin, its own DMs) never for connected business
 # chats. Whatever does arrive is logged for the owner and surfaced to the next
 # automation turn of that chat via _LAST_REACTION.
 _LAST_REACTION: Dict[str, Any] = {}
 _REACT_WARNED: set = set()
 
 
-# Owner-session bridge ("Full unlock — act as you"): lazy import (loader-safe),
+# Owner-session bridge ("Full unlock act as you"): lazy import (loader-safe),
 # one listener kick per module load, one shared note path for both sources.
 userbridge: Any = None
 _UB_STATE: Dict[str, Any] = {"kicked": False}
 
 _BRIDGE_ON_LOG = (
-    "<b>Warning — Full unlock (act as you) is ON.</b>\n"
+    "<b>Warning Full unlock (act as you) is ON.</b>\n"
     "ATRA now acts <b>as your own Telegram account</b> from a session copy: "
     "reactions inside business chats are set and seen through your identity.\n\n"
     "<b>\u26a0\ufe0f Risk:</b> user-account automation can trip Telegram flood "
     "limits or get your account banned. Nobody has been banned so far, but that "
-    "is luck, not a guarantee. The live session file is never touched — the "
+    "is luck, not a guarantee. The live session file is never touched the "
     "bridge keeps its own copy; credentials stay in a 600 file outside the "
     "repo.\nTurn it off any time: Access → Full unlock."
 )
@@ -445,7 +445,7 @@ _BRIDGE_ON_LOG = (
 
 def _ub_mod() -> Any:
     """Import the owner-session bridge on first use (mirror the bizauto chain:
-    package-relative first, bare top-level, then file spec — the suite loads
+    package-relative first, bare top-level, then file spec the suite loads
     this module standalone, the gateway loads it as a package)."""
     global userbridge
     if userbridge is None:
@@ -481,8 +481,8 @@ def _note_reaction(chat_id: str, msg_id: str, label: str,
     _LAST_REACTION[str(chat_id)] = (str(label), str(msg_id), time.time())
     while len(_LAST_REACTION) > 64:
         _LAST_REACTION.pop(next(iter(_LAST_REACTION)), None)
-    head = ("🎭 Chat Automation — reaction" if source == "user"
-            else "👾 Chat Automation — reaction")
+    head = ("🎭 Chat Automation reaction" if source == "user"
+            else "👾 Chat Automation reaction")
     tail = "<i> · as you (owner session)</i>" if source == "user" else ""
     try:
         loop = asyncio.get_running_loop()
@@ -610,20 +610,20 @@ async def _answer_guest_media(adapter: Any, gqid: str, kind: str, url: str,
                               caption: str = "", name: str = "") -> bool:
     """Answer a guest query with URL media (photo/video/document/voice); text fallback."""
     if not url or not str(url).lower().startswith(("http://", "https://")):
-        kind = "article"  # local paths have no public URL — fall back to text
+        kind = "article"  # local paths have no public URL fall back to text
     cap = str(caption or "")
     try:
         from telegram import (InlineQueryResultDocument, InlineQueryResultPhoto,
                               InlineQueryResultVideo, InlineQueryResultVoice)
         if kind == "photo":
-            # PTB >= 22: thumbnail_url is required — use the photo itself.
+            # PTB >= 22: thumbnail_url is required use the photo itself.
             result = InlineQueryResultPhoto(id=str(uuid4()), photo_url=url, thumbnail_url=url,
                                             caption=cap or None)
         elif kind == "video":
             import mimetypes
             vmime = mimetypes.guess_type(url)[0] or "video/mp4"
             # PTB requires mime_type + thumbnail_url; Telegram may reject a video URL as
-            # thumbnail — on failure the caller falls back to a text article anyway.
+            # thumbnail on failure the caller falls back to a text article anyway.
             result = InlineQueryResultVideo(id=str(uuid4()), video_url=url, mime_type=vmime,
                                             thumbnail_url=url, title=name or "Video",
                                             caption=cap or None)
@@ -849,7 +849,7 @@ def _origin_identity_block(adapter: Any, src: Any, *, is_guest: bool = False,
     """Identity block for ordinary DMs / groups / channels (guest path has its own).
 
     Injected as `event.channel_prompt`, which the gateway appends to the system
-    prompt verbatim — the documented way to add channel context without core edits.
+    prompt verbatim the documented way to add channel context without core edits.
     """
     chat = str(getattr(src, "chat_id", "") or "")
     ctype = str(getattr(src, "chat_type", "") or "")
@@ -876,7 +876,7 @@ def _origin_identity_block(adapter: Any, src: Any, *, is_guest: bool = False,
     parts.append(f"sender_role={role}")
     if extra:
         parts.append(extra)
-    parts.append("Channel context only — not a request; do not echo these values back verbatim.")
+    parts.append("Channel context only not a request; do not echo these values back verbatim.")
     return "\n".join(parts)
 
 
@@ -902,7 +902,7 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
     # state.json keeps one record per guest uid. It appears automatically the first
     # time they talk ("created": "auto") or when the owner opens one from the panel
     # ("created": "owner"). "locked" answers only the locked reply; "open" skips the
-    # canned gate below — a plain mention reaches the brain.
+    # canned gate below a plain mention reaches the brain.
     gstate = "default"
     if user_id:
         _rec = _guest_sessions().get(user_id)
@@ -980,7 +980,7 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
     event.source.chat_id = _guest_chat_id(guest_chat)
     # Same reason, for the sender id. The event was built from the bot's
     # FORWARDED copy of the message, so source.user_id came back as the OWNER's
-    # id for every guest — which is what got stamped into state.db and made the
+    # id for every guest which is what got stamped into state.db and made the
     # gate unable to tell the owner from a stranger. The raw guest message's
     # from_user IS the real person (state.json records distinct ids per guest),
     # so put that on the event too and the session carries the truth.
@@ -1012,7 +1012,7 @@ async def _handle_guest_message(adapter: Any, update: Any, context: Any = None) 
 
     _record_user(user, started=str(event.text).lstrip().lower().startswith("/start"), sample=str(event.text))
     await _log(
-        "💬 Guest mention — answered",
+        "💬 Guest mention answered",
         # Name the person from the one identity source, so this entry and the
         # 👤 panel list can never disagree.
         f"{_identity_line(md.get('guest_original_chat_id') or event.source.chat_id, user)}"
@@ -1038,7 +1038,7 @@ _BIZ_CONN: Dict[str, str] = {}             # chat_id -> business_connection_id (
 _BIZ_ACTIVE_ID: str = ""                   # last attached connection id (see _on_business_connection)
 # chat_id -> wall-clock ts of the owner's own last message IN THAT chat.
 # The reply window is per conversation: a message only cancels ATRA's hold
-# when the owner posts in THAT chat during the window — his traffic anywhere
+# when the owner posts in THAT chat during the window his traffic anywhere
 # else must never clear it. Both stamps survive a reload (state.json) and
 # line up with the store's own reply timestamps.
 _BIZ_OWNER_SEEN: Dict[str, float] = {}
@@ -1090,7 +1090,7 @@ def _bump_owner_seen(event: Any) -> None:
     """Remember the owner just spoke in this chat (dispatch hook).
 
     The hold reads this one stamp: his message inside the window is what
-    stands ATRA down, so it has to be recorded for ANY event he sends —
+    stands ATRA down, so it has to be recorded for ANY event he sends 
     his reply in a customer chat is an ordinary message, never a
     business_message, and the automation handler never sees it.
     """
@@ -1113,7 +1113,7 @@ def _bump_owner_seen(event: Any) -> None:
 
 def _biz_engaged(chat_id: Any, store: Any = None) -> bool:
     """True when ATRA has already spoken in this chat and the owner has not
-    come back to it since — the entry grace for THIS conversation is spent.
+    come back to it since the entry grace for THIS conversation is spent.
 
     The hold exists to give a returning owner the first word on a message he
     might want himself. Once ATRA has answered and he has not taken the thread
@@ -1127,7 +1127,7 @@ def _biz_engaged(chat_id: Any, store: Any = None) -> bool:
     if not _at:
         # No stamp of our own: the store still knows when the last reply
         # went out, so a live thread stays live across reloads. It is the
-        # reply stamp, NOT last_at — remember_chat moves last_at for every
+        # reply stamp, NOT last_at remember_chat moves last_at for every
         # inbound message, which would call a chat engaged the moment its
         # customer says hello.
         if store is None:
@@ -1199,7 +1199,7 @@ def _biz_sched_st(st: Optional[Dict[str, Any]] = None) -> str:
 
 # The home board labels a single line "automation", but biz_mode and
 # biz_schedule are two different keys and only biz_schedule gates anything.
-# Printing the mode alone made a paused schedule read as ON — the reported
+# Printing the mode alone made a paused schedule read as ON the reported
 # "the panel says it's on, automation says it's off". The badge is the gate's
 # own verdict, so the board can never disagree with what actually runs.
 _BIZ_SCHED_BADGE = {"always": "✅ always", "window": "🗓 window", "off": "⏸ off"}
@@ -1213,7 +1213,7 @@ def _biz_norm_hhmm(raw: Any) -> str:
     """Any time the owner might type -> canonical 'HH:MM', or '' when unusable.
 
     Accepts '9:00', '09:05', '9', '0900' and '2359' so a window time can be
-    entered as plainly as a number. Bad input never raises — it returns '' so
+    entered as plainly as a number. Bad input never raises it returns '' so
     the caller rejects it instead of storing garbage.
     """
     s = str(raw or "").strip().replace(" ", "")
@@ -1246,7 +1246,7 @@ def _biz_hhmm(value: Any, fallback: int) -> int:
     return min(24 * 60, int(s[:2]) * 60 + int(s[3:]))
 
 
-# Durations: the owner types what people actually say — '10m', '30s', '1h' —
+# Durations: the owner types what people actually say '10m', '30s', '1h' 
 # not raw seconds. Every entry point runs through _dur_to_s and rejects
 # anything it cannot read, so a typo never reaches settings.json.
 _DUR_UNITS: Dict[str, int] = {
@@ -1297,7 +1297,7 @@ def _biz_window_now(now: Optional[datetime.datetime] = None) -> int:
 
 def _biz_day_code(raw: Any) -> str:
     """Resolve wizard input to a stored day code. Accepts any unique prefix so
-    'f', 'fr' and 'Fri' all land on 'fri' — requiring the full three letters
+    'f', 'fr' and 'Fri' all land on 'fri' requiring the full three letters
     silently dropped the day instead of setting it, which read as a dead button.
     Returns '' for 'all'/'clear'/'reset' and for anything unrecognised."""
     s = str(raw or "").strip().lower()
@@ -1351,7 +1351,7 @@ def _biz_should_answer(st: Optional[Dict[str, Any]] = None,
     """Master gate for the automation path. Returns (answer_now, reason).
 
     This is the switch the owner asked for: automation fully off, always on,
-    or only inside a time window — evaluated before any brain work so a closed
+    or only inside a time window evaluated before any brain work so a closed
     window costs nothing and says nothing to the customer.
     """
     _s = st if isinstance(st, dict) else settings()
@@ -1424,7 +1424,7 @@ def _biz_denied(st: Dict[str, Any]) -> set:
 
 
 def _biz_refusal(name: str, repeats: int = 0) -> str:
-    base = (f"🔒 <b>{_esc(name)}</b> is locked in automation chats — this conversation "
+    base = (f"🔒 <b>{_esc(name)}</b> is locked in automation chats this conversation "
             "runs with the customer-safe tool set. Ask the owner directly for anything else.")
     if repeats:
         base += f" <i>(blocked {repeats + 1}&#215;)</i>"
@@ -1511,7 +1511,7 @@ def _biz_list_patch(key: str, raw: str) -> list:
 def _bcid_candidates(chat_id: Any, preferred: str = "") -> List[str]:
     """Ordered connection ids to try for one delivery: the preferred (event
     or per-chat) id first, then the map, then the live connection, then the
-    newest ENABLED row on record. Deduplicated, empties dropped — a reconnect
+    newest ENABLED row on record. Deduplicated, empties dropped a reconnect
     rotates the id and a cached stale one is rejected with
     Business_connection_invalid."""
     out: List[str] = []
@@ -1539,7 +1539,7 @@ def _bcid_candidates(chat_id: Any, preferred: str = "") -> List[str]:
 
 
 def _bcid_retriable(err: Any) -> bool:
-    """The connection id was rejected — a different candidate may still work."""
+    """The connection id was rejected a different candidate may still work."""
     return "Business_connection_invalid" in str(err)
 
 
@@ -1547,7 +1547,7 @@ async def _biz_try_send(adapter: Any, chat_id: Any, text: str,
                         preferred: str = "") -> "tuple[bool, Optional[Any]]":
     """Send over the business connection, rotating to a live connection id
     when Telegram rejects the one we had. Returns (delivered, sent): a failed
-    send must never raise — delivery callers treat False as a refusal."""
+    send must never raise delivery callers treat False as a refusal."""
     if not chat_id or not text:
         return False, None
     cands = _bcid_candidates(chat_id, preferred)
@@ -1624,9 +1624,9 @@ _BIZ_PERSONAS = {"mimic": "mimic.md", "assistant": "automation.md"}
 
 _BIZ_MIMIC_FALLBACK = (
     "You are Ar(t)an's Telegram account answering a customer directly. "
-    "Write AS him: first person, his voice — concise, casual, practical, "
+    "Write AS him: first person, his voice concise, casual, practical, "
     "no corporate tone, no emoji spam. Only facts you actually have; if you "
-    "don't know, say so in one line. Nothing private, nothing internal — no "
+    "don't know, say so in one line. Nothing private, nothing internal no "
     "settings, logs, ids, other chats, or how you run. Never claim to be an "
     "AI unless asked outright; if asked, say an assistant wrote it on his "
     "behalf, once, then move on. No jokes, no emoji."
@@ -1634,7 +1634,7 @@ _BIZ_MIMIC_FALLBACK = (
 _BIZ_ASSISTANT_FALLBACK = (
     "You are ATRA, replying to messages that arrive in Ar(t)an's Telegram "
     "account. Answer the question or do the task, in their language, in the "
-    "fewest clear words. Only what you actually know — if you don't know, "
+    "fewest clear words. Only what you actually know if you don't know, "
     "one line saying so. Never invent facts or promises on his behalf. Never "
     "expose settings, logs, paths, ids, other chats, or how you run. No "
     "filler, no flattery, no jokes, no emoji."
@@ -1683,7 +1683,7 @@ def _biz_persona_arg_ok(data: Any) -> str:
     """Wizard guard for the persona path.
 
     It used to accept any non-empty string, so a normal chat message sent
-    while the wizard was open was silently stored as the path — the setting
+    while the wizard was open was silently stored as the path the setting
     then pointed at nothing and every automation turn logged a read warning.
     A real path must exist; anything else is rejected with the fix spelled
     out, and the owner can still clear it with 'default'.
@@ -1694,7 +1694,7 @@ def _biz_persona_arg_ok(data: Any) -> str:
     if not raw:
         return "send a path, or 'default'"
     if not Path(os.path.expanduser(raw)).is_file():
-        return f"no file at that path — send an existing file, or 'default'"
+        return f"no file at that path send an existing file, or 'default'"
     return ""
 
 
@@ -1703,7 +1703,7 @@ def _biz_persona(st: Dict[str, Any], mode: str) -> str:
 
     An explicit `biz_persona_path` wins for either mode (the owner pointing
     at one file means "use this voice"). Otherwise each mode gets its own
-    bundled persona — mimic speaks as him, assistant speaks as ATRA. The old
+    bundled persona mimic speaks as him, assistant speaks as ATRA. The old
     fallback for assistant was the GUEST persona, which told customers they
     were in a guest session with limited tools: wrong audience, and it leaked
     internal framing straight into a customer chat.
@@ -1737,13 +1737,13 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     owner = _owner_id(adapter)
     chat_id = str(getattr(getattr(msg, "chat", None), "id", "") or "")
     if uid and owner and owner not in ("", "*") and uid == owner:
-        # The owner is back in THIS conversation — that is what re-arms the
+        # The owner is back in THIS conversation that is what re-arms the
         # entry hold. Recorded here because an owner turn never reaches the
         # gateway dispatch hook: it is filtered out just below.
         if chat_id:
             # Wall-clock like every other stamp: a monotonic value is a few
             # seconds since boot, and the hold compares it against an epoch
-            # — it would read as "owner never spoke" forever.
+            # it would read as "owner never spoke" forever.
             _BIZ_OWNER_SEEN[chat_id] = time.time()
             _presence_write()
             logger.info("[TGAhermes] owner presence chat=%s (his own reply)",
@@ -1769,7 +1769,7 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     store = _biz_store()
     if cfg_lang in ("", "auto") and not any(ch.isalpha() for ch in text):
         # A bare number or an emoji carries no language of its own and
-        # detect_language() returns "en" for it — so an order number from a
+        # detect_language() returns "en" for it so an order number from a
         # Persian customer used to declare "English" twice over: the canned
         # first-contact warning went out in English, and the identity line
         # told ATRA to mirror an English sender. Fall back to what this chat
@@ -1792,8 +1792,8 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     msg_id = str(getattr(msg, "message_id", "") or "") or None
     prof = _profile_buttons(user, chat_id, msg_id)
     if edited or mode == "off":
-        action = "edited — log only" if edited else "observed (mode off)"
-        await _log("🤖 Chat Automation — " + ("edit" if edited else "message"),
+        action = "edited log only" if edited else "observed (mode off)"
+        await _log("🤖 Chat Automation " + ("edit" if edited else "message"),
                    f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code> "
                    f"(automation)\n<b>Language:</b> {_esc(lang_label)}"
                    f"\n<b>Text:</b> <i>{_esc(text[:500])}</i>"
@@ -1802,16 +1802,16 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     # --- master schedule switch: closed = silent, zero brain cost ----------
     _in_sched, _why = _biz_should_answer(st)
     if not _in_sched:
-        await _log("🤖 Chat Automation — held back",
+        await _log("🤖 Chat Automation held back",
                    f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"
                    f"\n<b>Text:</b> <i>{_esc(text[:300])}</i>"
-                   f"\n<b>Action:</b> {_esc(_why)} — nothing sent", buttons=prof)
+                   f"\n<b>Action:</b> {_esc(_why)} nothing sent", buttons=prof)
         return
     # --- plain hold -----------------------------------------------------
     # A message waits only while the conversation is NOT already live: a new
     # contact, or a thread the owner took back. If ATRA has answered and he
     # has not posted here since, the chat is engaged and there is nothing to
-    # wait for — answer it now. Within a wait, his reply in THIS chat cancels
+    # wait for answer it now. Within a wait, his reply in THIS chat cancels
     # it; his traffic anywhere else never does.
     _delay = _biz_idle_delay_s(st)
     _t0 = time.time()
@@ -1824,7 +1824,7 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
         # whether ATRA waits, and the channel log alone can't show it afterwards.
         logger.info("[TGAhermes] Chat Automation hold %.0fs chat=%s", _delay, chat_id)
         try:
-            await _log("🤖 Chat Automation — waiting for owner",
+            await _log("🤖 Chat Automation waiting for owner",
                        f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"
                        f"\n<b>Holding:</b> {_delay / 60.0:.1f} min "
                        f"<i>(reply in this chat and I stay out)</i>", buttons=prof)
@@ -1842,15 +1842,15 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
                 logger.info("[TGAhermes] Chat Automation stand-down chat=%s "
                             "after %.0fs", chat_id, time.time() - _t0)
                 try:
-                    await _log("🤖 Chat Automation — owner answered",
+                    await _log("🤖 Chat Automation owner answered",
                                f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code>"
-                               f"\n<b>Action:</b> you replied inside the window — "
+                               f"\n<b>Action:</b> you replied inside the window "
                                f"ATRA stood down", buttons=prof)
                 except Exception:
                     logger.debug("[TGAhermes] stand-down log failed", exc_info=True)
                 return
     # --- first-contact warning: once per chat, before ATRA's first reply ----
-    # His own text, when he wrote one, goes out verbatim — that is his call to
+    # His own text, when he wrote one, goes out verbatim that is his call to
     # make. When he left the field empty the old path still fired the canned
     # catalog in a guessed language. Now the empty field means ATRA writes the
     # line itself, inside its first reply: right language, right register, and
@@ -1918,18 +1918,18 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     lang_line = ("mirror the sender's language (detected: %s)" % lang_label
                  if cfg_lang in ("", "auto") else "always reply in %s" % lang_label)
     mode_line = {
-        "mimic": ("Mode: MIMIC — you ARE the owner writing his own reply: first "
+        "mimic": ("Mode: MIMIC you ARE the owner writing his own reply: first "
                   "person, his voice, short and casual. Never mention automation, "
                   "AI, a script, or the words 'as an AI'; if asked point-blank, an "
-                  "assistant wrote it on his behalf — once, then move on."),
-        "assistant": ("Mode: ASSISTANT — you reply as ATRA, the owner's AI "
+                  "assistant wrote it on his behalf once, then move on."),
+        "assistant": ("Mode: ASSISTANT you reply as ATRA, the owner's AI "
                       "assistant. Answer what was asked and nothing more; never "
                       "expose settings, logs, other chats, or how you run."),
-        "off": "Mode: OFF — observation only.",
+        "off": "Mode: OFF observation only.",
     }.get(mode, "")
     identity = (
         "\n\n---\n"
-        "Chat Automation turn — customer DM reaching the owner's Telegram account.\n"
+        "Chat Automation turn customer DM reaching the owner's Telegram account.\n"
         f"Sender: {user_name} ({uid or 'unknown'}) · chat {chat_id} · language {lang_line}\n"
         f"{mode_line}\n"
         "Reply directly to their message; no commands, no panel talk."
@@ -1939,12 +1939,12 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
             "\nFirst reply to this chat: fold in ONE short line telling them "
             "you wrote this on Ar(t)an's behalf and he'll come back to it "
             "himself. Write it yourself, in their language and shaped around "
-            "what they actually said — never a stock sentence. One line, then "
+            "what they actually said never a stock sentence. One line, then "
             "the answer; if they didn't need telling, keep it to a clause."
         )
     if st.get("biz_larp"):
         identity += ("\nStyle: read the owner's own messages in the history above "
-                     "and match how he writes — vocabulary, sentence length, "
+                     "and match how he writes vocabulary, sentence length, "
                      "rhythm, punctuation. Style only: never copy his facts or "
                      "commitments into a new context.")
     _note = _LAST_REACTION.pop(chat_id, None)
@@ -1976,7 +1976,7 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     event.allow_gateway_control = False
     event.internal = True
     _record_user(user, started=text.lstrip().lower().startswith("/start"), sample=text)
-    await _log("🤖 Chat Automation — message",
+    await _log("🤖 Chat Automation message",
                f"{_user_block(user)}\n<b>Chat:</b> <code>{_esc(chat_id)}</code> "
                f"(automation)\n<b>Language:</b> {_esc(lang_label)} · "
                f"<b>Mode:</b> {_esc(mode)}"
@@ -2057,7 +2057,7 @@ def _bizconn_view(st: Dict[str, Any], note: str = "") -> str:
     if not conns:
         lines += ["", "No connection recorded yet.",
                   "Telegram → Settings → Chat Automation → connect this bot, "
-                  "then come back — the granted rights show up here."]
+                  "then come back the granted rights show up here."]
     for c in conns[:6]:
         try:
             rd = json.loads(str(c.get("rights_json") or "{}"))
@@ -2160,7 +2160,7 @@ def _install_wraps(adapter: Any) -> None:
             return await _biz_deliver(adapter, event, _bcid, text_content)
         # Non-business final: every send belonging to this turn (including the
         # delivery below) must go out as the bot, even for chats with business
-        # history — otherwise the reply lands in the owner's personal DM.
+        # history otherwise the reply lands in the owner's personal DM.
         _biz_mark(_fchat, "plain")
         result, who = await _orig_sfl(event, session_key, text_content, metadata,
                                       reply_to=reply_to,
@@ -2209,7 +2209,7 @@ def _install_wraps(adapter: Any) -> None:
                         _is_multi = bool(getattr(_cg._entries.get(clarify_id), "multi_select", False))
                 except Exception:
                     _is_multi = False
-                hint = ("Multiple selections allowed — reply with the numbers separated by commas "
+                hint = ("Multiple selections allowed reply with the numbers separated by commas "
                         "or spaces (e.g. \"1, 3\"), the option text, or your own answer."
                         if _is_multi else
                         "Reply with the number, the option text, or your own answer.")
@@ -2301,7 +2301,7 @@ def _install_wraps(adapter: Any) -> None:
                     from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
                     await bot.send_message(
                         chat_id=normalize_telegram_chat_id(owner_id),
-                        text=(f"⚠️ *ATRA — guest error*\nFrom: {md.get('guest_user_id', '?')}\n"
+                        text=(f"⚠️ *ATRA guest error*\nFrom: {md.get('guest_user_id', '?')}\n"
                               f"Query: `{guest_text[:120]}`\nError: `{err[:400]}`"),
                         parse_mode="Markdown")
             except Exception:
@@ -2345,7 +2345,7 @@ def _install_wraps(adapter: Any) -> None:
             if not _is_guest_chat(chat_id):
                 if "metadata" in kwargs:
                     # The bizauto session-split marker must never reach the
-                    # adapter's int(message_thread_id) — media inherits the
+                    # adapter's int(message_thread_id) media inherits the
                     # same crash as text otherwise.
                     kwargs = dict(kwargs, metadata=_biz_safe_metadata(kwargs.get("metadata")))
                 return await orig(*args, **kwargs)
@@ -2388,7 +2388,7 @@ def _install_wraps(adapter: Any) -> None:
     # photos/files/gifs/stickers/typing in automation chats leave as the owner
     # instead of failing as a bot that is not in that chat.
     _biz_bot = getattr(adapter, "_bot", None)
-    # NB: PTB 22.8 Bot/ExtBot are slotted — setting arbitrary attributes on the bot
+    # NB: PTB 22.8 Bot/ExtBot are slotted setting arbitrary attributes on the bot
     # instance raises and used to abort the whole install. The "already wrapped" marker
     # lives on the adapter, which is a normal object.
     if _biz_bot is not None and not getattr(adapter, "_tga_biz_media", False):
@@ -2445,7 +2445,7 @@ def _fmt_users(limit: int = 30) -> str:
         uname = f"@{e['username']}" if e.get("username") else ""
         flags = " 🚀started" if e.get("started") else ""
         ago = int(time.time()) - int(e.get("last_seen", 0))
-        lines.append(f"• <code>{_esc(uid)}</code> {_esc(name)} {uname} — {e.get('count', 0)} msgs, "
+        lines.append(f"• <code>{_esc(uid)}</code> {_esc(name)} {uname} {e.get('count', 0)} msgs, "
                      f"{_humanize(ago)} ago{flags}")
     return "\n".join(lines)
 
@@ -2475,7 +2475,7 @@ def _read_allow_from() -> List[str]:
 def _gate_allow_raw() -> str:
     """What the CORE gate sees: this process's TELEGRAM_ALLOWED_USERS env value.
 
-    Deliberately separate from adapter.extra.allow_from — the authz mixin reads
+    Deliberately separate from adapter.extra.allow_from the authz mixin reads
     the env var first, and when it is non-empty it never consults the plugin's
     list. !auth shows this next to the other two so a divergence is visible.
     """
@@ -2489,11 +2489,11 @@ def _sync_gate_allowlists(csv: str, *, env_path: Any = None,
     Why this exists (2026-10-02): the gateway's authz mixin has its own
     allowlist tier. ``_principal_authorized`` reads TELEGRAM_ALLOWED_USERS from
     the environment and, because that var is non-empty, it NEVER consults
-    ``telegram.extra.allow_from`` — the list the panel edits. So a friend added
+    ``telegram.extra.allow_from`` the list the panel edits. So a friend added
     in the panel was still dropped by the core as "Dropped a message from
     unrecognized telegram user".
 
-    Semantics: UNION, not mirror — ids already approved in .env (operator
+    Semantics: UNION, not mirror ids already approved in .env (operator
     hand-entries) survive, the owner id is always kept, and only then come the
     config's ids. Revoking someone means removing them from BOTH sides, which
     the plugin's own prefilter still enforces either way; this tier is
@@ -2546,10 +2546,10 @@ def _sync_gate_allowlists(csv: str, *, env_path: Any = None,
 
 
 def _write_allow_from(ids: List[str]) -> bool:
-    """Persist telegram.extra.allow_from via the hermes CLI (subprocess — safe from the gateway).
+    """Persist telegram.extra.allow_from via the hermes CLI (subprocess safe from the gateway).
 
     Three hard lessons encoded here: the owner id is always merged back in
-    (_allow_csv), the file alone is not enough — the running adapter keeps
+    (_allow_csv), the file alone is not enough the running adapter keeps
     its own snapshot, so the new value is pushed into it directly
     (_sync_allow_from_live) instead of trusting the plugin reload to do it
     (it does not; measured 2026-10-02), and the core gate keeps a THIRD copy
@@ -2606,7 +2606,7 @@ def _nudge_gateway_reload() -> None:
 
 
 def _is_authorized_user(uid: str, owner: str = "") -> bool:
-    """Owner or whitelisted friend — gets the real brain (core handlers), not the canned reply."""
+    """Owner or whitelisted friend gets the real brain (core handlers), not the canned reply."""
     uid = str(uid or "")
     if not uid:
         return False
@@ -2617,18 +2617,18 @@ def _is_authorized_user(uid: str, owner: str = "") -> bool:
 
 # ------------------------------------------------------------- access-control helpers
 # Whitelisted friends carry a permission level for their own DM session:
-#   talk — only the safe read-only set (web/vision/skills)
-#   free — everything works except destructive/credential tools (default;
+#   talk only the safe read-only set (web/vision/skills)
+#   free everything works except destructive/credential tools (default;
 #          "gate" is accepted as its old name)
-#   full — no tool gating at all (the old whitelisted behavior)
+#   full no tool gating at all (the old whitelisted behavior)
 _FRIEND_LEVELS = ("talk", "free", "full")
 _FRIEND_LEVEL_LABEL = {"talk": "💬 talk only", "free": "🛠 free", "full": "🔓 full"}
-# "gate" was the old name for "free" — old configs keep working.
+# "gate" was the old name for "free" old configs keep working.
 _FRIEND_LEVEL_ALIASES = {"gate": "free"}
 
 
 def _friend_level(uid: str) -> str:
-    """Resolved tool level for uid — owner is always full, unknown users 'gate'."""
+    """Resolved tool level for uid owner is always full, unknown users 'gate'."""
     uid = str(uid or "")
     if uid and uid == str(_owner_id() or ""):
         return "full"
@@ -2640,7 +2640,7 @@ def _friend_level(uid: str) -> str:
 def _adapter_allow_raw() -> Any:
     """What the CORE prefilter actually sees: the adapter's bound config snapshot.
 
-    Deliberately NOT config.yaml — a write to the file does not reach this until
+    Deliberately NOT config.yaml a write to the file does not reach this until
     it is synced or the gateway restarts, and !auth exists to make that visible.
     """
     ad = _ADAPTER.get("adapter")
@@ -2653,7 +2653,7 @@ def _allow_csv(ids: List[str]) -> str:
 
     allow_from is the DM gate; a list that lost the owner locks the owner out of
     their own DM on the next restart (2026-10-02: a whitelist write left only the
-    friend's id behind — this function exists so that cannot happen again).
+    friend's id behind this function exists so that cannot happen again).
     """
     owner = str(_owner_id() or "")
     merged = [x for x in [owner] + [str(i).strip() for i in ids] if x]
@@ -2667,7 +2667,7 @@ def _sync_allow_from_live(csv: str) -> bool:
     set` nor `reload_gateway_plugins` rebuilds it (measured: write 13:33:23,
     plugin reload 13:33:25, same user blocked again 13:33:33). Without this the
     core prefilter keeps rejecting users the owner just whitelisted until the
-    next gateway restart. In-place dict update — the authz mixin reads the same
+    next gateway restart. In-place dict update the authz mixin reads the same
     object, so the prefilter and the runner chain both see the new value.
     """
     if not csv:
@@ -2678,7 +2678,7 @@ def _sync_allow_from_live(csv: str) -> bool:
     try:
         extra = getattr(getattr(ad, "config", None), "extra", None)
         if not isinstance(extra, dict):
-            logger.warning("[TGAhermes] adapter config.extra unavailable — allow_from not synced")
+            logger.warning("[TGAhermes] adapter config.extra unavailable allow_from not synced")
             return False
         extra["allow_from"] = csv
         logger.info("[TGAhermes] live allow_from synced: %s", csv)
@@ -2691,11 +2691,11 @@ def _sync_allow_from_live(csv: str) -> bool:
 
 # ------------------------------------------------------------ guest session control
 # state.json -> "guest_sessions": {"<uid>": {"state": ..., "created": ..., "updated": ts}}
-#   default — the usual stranger rules (canned on plain mention, brain on reply)
-#   open    — may talk without replying to ATRA
-#   locked  — answers only guest_locked_reply (rate-limited by the cooldown)
+#   default the usual stranger rules (canned on plain mention, brain on reply)
+#   open may talk without replying to ATRA
+#   locked answers only guest_locked_reply (rate-limited by the cooldown)
 # A record appears automatically the first time someone talks ("created": "auto")
-# or when the owner opens one ("created": "owner") — either can be locked.
+# or when the owner opens one ("created": "owner") either can be locked.
 
 def _guest_sessions() -> Dict[str, Any]:
     return (_load_state().get("guest_sessions") or {})
@@ -2734,14 +2734,14 @@ def _touch_guest_session(uid: str) -> None:
 
 
 def _like_literal(text: str) -> str:
-    """Escape a value used as a LIKE pattern — chat ids contain `_`, which is a
+    """Escape a value used as a LIKE pattern chat ids contain `_`, which is a
     single-char wildcard and quietly matched neighbouring rows."""
     return str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _stored_session_ids(chat: Any) -> List[str]:
     """Session rows this wipe owns: the chat's own rows, its guest twin, and
-    everything routed under a key containing them — the SAME predicate the
+    everything routed under a key containing them the SAME predicate the
     routing reset uses, so the router and the Sessions tab agree on what
     "wiped" means. Read-only query; [] on any failure (the caller still resets
     routing)."""
@@ -2768,7 +2768,7 @@ def _stored_session_ids(chat: Any) -> List[str]:
 
 
 def _purge_stored_sessions(ids: List[str]) -> int:
-    """Delete those session rows — and their messages — so they stop showing in
+    """Delete those session rows and their messages so they stop showing in
     the Sessions tab. Direct read-write sqlite on purpose: the gateway's own
     SessionDB handle is best-effort and can be unavailable (state.db preflight)
     while file-level writes still work, and a wipe that only resets routing
@@ -2801,7 +2801,7 @@ def _wipe_sessions(store: Any, chat: Any) -> Optional[Tuple[int, int]]:
     Returns (routes_reset, rows_deleted); (0, 0) when the chat has neither;
     None only when the chat id itself is unusable. Routing is collected first
     and the rows deleted afterwards, so a row the reset just created for the
-    fresh session survives — the wipe removes what was there, not what comes
+    fresh session survives the wipe removes what was there, not what comes
     next."""
     cid = str(chat or "").strip()
     if not cid or cid == "None":
@@ -2810,7 +2810,7 @@ def _wipe_sessions(store: Any, chat: Any) -> Optional[Tuple[int, int]]:
         store = _CTX.get("session_store")
     entries = getattr(store, "_entries", None) if store is not None else None
     if not isinstance(entries, dict):
-        # No store means no way to make the router start fresh — deleting rows
+        # No store means no way to make the router start fresh deleting rows
         # nothing can re-route away from would strand the next turn on ids that
         # no longer exist. Report it and touch nothing.
         return None
@@ -2833,7 +2833,7 @@ def _wipe_sessions(store: Any, chat: Any) -> Optional[Tuple[int, int]]:
             # Routing still points at the sessions we would be deleting: keep
             # their rows, or the next turn lands on ids that no longer exist.
             logger.warning("[TGAhermes] wipe: %d route(s) left unreset for %s "
-                           "— stored rows kept", failed, cid)
+                           " stored rows kept", failed, cid)
             return None
         rows = _purge_stored_sessions(stored)
     except Exception:
@@ -2863,36 +2863,36 @@ def _settings_summary() -> str:
 
 
 def _help_sections(st: Optional[Dict[str, Any]] = None) -> list:
-    """(key, title, body) — single source for the full help, sections and panel views."""
+    """(key, title, body) single source for the full help, sections and panel views."""
     st = st or settings()
     wl = _read_allow_from()
     log_now = _esc(st.get("log_channel") or "off")
     return [
         ("status", "ℹ️ Status",
-         "<b>⚡ Actions</b> — guided flows (log here, whitelist, DM, wipe, updates)\n"
-         "<code>!settings</code> — editable settings\n"
-         "<code>!users</code> — who used the bot\n"
-         "<code>!run</code> — restart Hermes (starts it too, if it is down)\n"
-         "<code>!panel</code> — this glass-button panel (same as !help)"),
+         "<b>⚡ Actions</b> guided flows (log here, whitelist, DM, wipe, updates)\n"
+         "<code>!settings</code> editable settings\n"
+         "<code>!users</code> who used the bot\n"
+         "<code>!run</code> restart Hermes (starts it too, if it is down)\n"
+         "<code>!panel</code> this glass-button panel (same as !help)"),
         ("log", "📡 Log",
          f"now: <code>{log_now}</code>\n"
-         "<code>!setlog here</code> — send <i>inside</i> the chat you want to log\n"
+         "<code>!setlog here</code> send <i>inside</i> the chat you want to log\n"
          "<code>!setlog &lt;id|@name|off&gt;</code>"),
         ("access", "🛡 Access",
          f"{len(wl)} whitelisted\n"
          "<code>!whitelist list</code>\n"
          "<code>!whitelist add &lt;user_id&gt;</code>\n"
          "<code>!whitelist remove &lt;user_id&gt;</code>\n"
-         "<code>!whitelist perms &lt;user_id&gt; talk|gate|full</code> — tool level\n"
+         "<code>!whitelist perms &lt;user_id&gt; talk|gate|full</code> tool level\n"
          "Whitelisted friends talk to the real bot; their level decides which "
          "tools their session may use.\n"
-         "<code>!auth [user_id]</code> — see file vs live prefilter verdicts"),
+         "<code>!auth [user_id]</code> see file vs live prefilter verdicts"),
         ("sessions", "🧹 Sessions",
          "one per chat; wipe = fresh start\n"
-         "<code>!wipe &lt;chat_id&gt;</code> — delete that chat's session, fresh start "
+         "<code>!wipe &lt;chat_id&gt;</code> delete that chat's session, fresh start "
          "<i>there</i> (any DM/group/guest; works from the log channel too)\n"
          "Or use the 🧹 button under a log entry.\n"
-         "<code>!gs list|open|lock|reset &lt;user_id&gt;</code> — guest sessions: "
+         "<code>!gs list|open|lock|reset &lt;user_id&gt;</code> guest sessions: "
          "🔓 open = talk freely · 🔒 locked = sealed · ▫️ reset = stranger rules"),
         ("guests", "👾 Guests",
          f"canned reply: <i>{_esc(st.get('unauthorized_reply'))}</i>\n"
@@ -2903,17 +2903,17 @@ def _help_sections(st: Optional[Dict[str, Any]] = None) -> list:
          "<code>!setunauthorized &lt;text&gt;</code> · <code>!seterror &lt;text&gt;</code> · "
          "<code>!seterrorfa &lt;text&gt;</code>"),
         ("bot", "🤖 Bot",
-         "<code>!send &lt;user_id&gt; &lt;text&gt;</code> — DM someone as the bot\n"
-         "<code>!setunauthorized &lt;text&gt;</code> — reply for strangers\n"
-         "<code>!seterror &lt;text&gt;</code> / <code>!seterrorfa &lt;text&gt;</code> — guest error texts\n"
+         "<code>!send &lt;user_id&gt; &lt;text&gt;</code> DM someone as the bot\n"
+         "<code>!setunauthorized &lt;text&gt;</code> reply for strangers\n"
+         "<code>!seterror &lt;text&gt;</code> / <code>!seterrorfa &lt;text&gt;</code> guest error texts\n"
          "<code>!setreact on|off</code> · <code>!setmedia on|off</code>\n"
-         "<code>!setcooldown 10m</code> — stranger reply cooldown (any duration)\n"
-         "<code>!setowner &lt;id&gt;</code> — owner id"),
+         "<code>!setcooldown 10m</code> stranger reply cooldown (any duration)\n"
+         "<code>!setowner &lt;id&gt;</code> owner id"),
     ]
 
 
 def _help_text(st: Optional[Dict[str, Any]] = None) -> str:
-    parts = ["🧩 <b>ATRA console</b> — owner only"]
+    parts = ["🧩 <b>ATRA console</b> owner only"]
     for _key, _title, _body in _help_sections(st):
         parts.append(f"<b>{_title}</b>\n{_body}")
     return "\n\n".join(parts)
@@ -2971,7 +2971,7 @@ def _help_view(key: str, st: Optional[Dict[str, Any]] = None) -> str:
     if key == "full":
         return _help_text(st)
     if key in _CATS:
-        # v4.0.0: the section pages ARE the categories — every setting with
+        # v4.0.0: the section pages ARE the categories every setting with
         # its live value, instead of a read-only list of command names.
         return _cat_body(key, st)
     if key == "who":
@@ -2989,7 +2989,7 @@ def _gate_view(st: Dict[str, Any], note: str = "") -> str:
     blocked = sorted(denied)
     never = sorted(GUEST_NEVER_TOOLS)
     lines = [
-        f"<b>🛡 Guest tool gate</b> — mode: <b>{_MODE_LABEL.get(mode, mode)}</b>",
+        f"<b>🛡 Guest tool gate</b> mode: <b>{_MODE_LABEL.get(mode, mode)}</b>",
         "",
         "<b>strict</b> · no shell, no files, nothing",
         "<b>balanced</b> · may read files and past chats, writes closed",
@@ -3029,7 +3029,7 @@ def _update_note(report: Dict[str, Any]) -> str:
     if report.get("action"):
         return f"📦 {report['action']}"
     if report.get("newer_available"):
-        return "⬆️ a newer version is available — tap Install update"
+        return "⬆️ a newer version is available tap Install update"
     return "✅ up to date"
 
 
@@ -3050,14 +3050,14 @@ def _gsess_view(st: Dict[str, Any]) -> str:
     lines = [
         "<b>🔐 Guest sessions</b>",
         "",
-        "▫️ <b>default</b> — stranger rules: canned on a plain mention, real answer on a reply",
-        "🔓 <b>open</b> — may talk without replying to ATRA",
-        "🔒 <b>locked</b> — answers only the locked reply (cooldown applies)",
+        "▫️ <b>default</b> stranger rules: canned on a plain mention, real answer on a reply",
+        "🔓 <b>open</b> may talk without replying to ATRA",
+        "🔒 <b>locked</b> answers only the locked reply (cooldown applies)",
         "",
     ]
     if not recs:
         lines += ["No sessions yet. One appears here automatically the first time someone "
-                  "talks on the guest link — or open one for a specific person below."]
+                  "talks on the guest link or open one for a specific person below."]
     else:
         for uid, rec in sorted(recs.items()):
             state = str(rec.get("state") or "default")
@@ -3070,7 +3070,7 @@ def _gsess_view(st: Dict[str, Any]) -> str:
 
 
 def _panel_text(st: Optional[Dict[str, Any]] = None, note: str = "") -> str:
-    """Home board for !panel — a live readout of every category, so the first
+    """Home board for !panel a live readout of every category, so the first
     screen answers "what is on?" instead of just listing section names."""
     st = st or settings()
     wl = _read_allow_from()
@@ -3106,7 +3106,7 @@ def _panel_text(st: Optional[Dict[str, Any]] = None, note: str = "") -> str:
         lines.append(note)
     lines += [
         "",
-        "<b>Tap a category</b> — every setting inside it shows its live value, "
+        "<b>Tap a category</b> every setting inside it shows its live value, "
         "and every change is a prompt or a confirm screen. No commands needed.",
         "\u21a9\ufe0f Back returns to the page you came from.",
         "<code>!panel</code> reloads this · <code>!help</code> the command list",
@@ -3125,22 +3125,22 @@ def _plugin_version() -> str:
 
 
 def _actions_view(st: Dict[str, Any], note: str = "") -> str:
-    """Body text for the Actions tab — the panel's command replacement."""
+    """Body text for the Actions tab the panel's command replacement."""
     wl = _read_allow_from()
     lines = [
-        "<b>⚡ Actions</b> — guided flows that replace typing commands",
+        "<b>⚡ Actions</b> guided flows that replace typing commands",
         f"📡 log: <code>{_esc(st.get('log_channel') or 'off')}</code> · "
         f"🛡 whitelist: <b>{len(wl)}</b> · "
         f"⏱ cooldown: <b>{_esc(st.get('unauthorized_cooldown_s'))}s</b>",
         "",
-        "📍 <b>Log here</b> — start logging into THIS chat",
-        "🛡 <b>Whitelist</b> — add, remove, or set a friend's permission level",
-        "🔐 <b>Guest sessions</b> — open a session for one guest, or lock it",
-        "📨 <b>Send a DM</b> — message someone as the bot",
-        "🧹 <b>Wipe a session</b> — give a chat a fresh start",
-        "⏱ <b>Cooldown</b> · 👾 <b>Stranger reply</b> — canned texts and delays",
-        "🩺 <b>Auth debug</b> — who gets through where, file vs live snapshot",
-        "🛡 <b>Safeguards</b> — tool gate modes, allow/deny lists, friend levels",
+        "📍 <b>Log here</b> start logging into THIS chat",
+        "🛡 <b>Whitelist</b> add, remove, or set a friend's permission level",
+        "🔐 <b>Guest sessions</b> open a session for one guest, or lock it",
+        "📨 <b>Send a DM</b> message someone as the bot",
+        "🧹 <b>Wipe a session</b> give a chat a fresh start",
+        "⏱ <b>Cooldown</b> · 👾 <b>Stranger reply</b> canned texts and delays",
+        "🩺 <b>Auth debug</b> who gets through where, file vs live snapshot",
+        "🛡 <b>Safeguards</b> tool gate modes, allow/deny lists, friend levels",
         "🔧 <b>System + updates</b>",
         "",
         "Tap a button, answer the prompt, done. Every flow runs the same code "
@@ -3160,17 +3160,17 @@ def _actions_view(st: Dict[str, Any], note: str = "") -> str:
 # level deep). v3.2.0: home is sections only, every mutation goes through a
 # confirm screen or a wizard, and the whitelist is a per-friend card instead
 # of three separate list pages. v3.3.0: no destructive or time-spending
-# button applies on the first tap any more — the tap renders a confirm screen
+# button applies on the first tap any more the tap renders a confirm screen
 # and only the Apply callback writes (`panel:cfmok`; legacy `panel:tgy` is
 # normalised to it at parse time).
 #
 # v4.0.0 rebuilt the navigation layer on top of that:
-#   * `_CATS` is the single registry — every one of the 29 settings keys sits
+#   * `_CATS` is the single registry every one of the 29 settings keys sits
 #     in exactly one category, the body renders each with its LIVE value, and
 #     the keyboard emits one button per item. A test asserts the coverage, so
 #     a new settings key cannot become unreachable by accident.
 #   * text settings open a prompt-driven wizard (flows may carry `build`, a
-#     bang-command twin, or `save`, a settings patch) — nothing is typed as a
+#     bang-command twin, or `save`, a settings patch) nothing is typed as a
 #     command; `validate` re-prompts instead of killing the flow.
 #   * Back is a per-panel-message history (`_NAV`), not a jump to the console.
 #     Confirm screens and the wizard are transient and never enter the stack.
@@ -3216,7 +3216,7 @@ def _next_preset(cur: Any, presets: List[int], fallback: int) -> int:
 
     A typed value (10s -> 0.1667 min, 90s -> 1.5 min) is not in the list, so
     cycling lands on the first preset above it instead of snapping back to the
-    bottom — otherwise Apply would quietly discard what was just typed.
+    bottom otherwise Apply would quietly discard what was just typed.
     """
     try:
         v = float(cur if cur not in (None, "") else fallback)
@@ -3265,7 +3265,7 @@ def _ub_cfm(st: Dict[str, Any]) -> str:
     return (head +
             "Connects a <b>copy of your own Telegram session</b> to the gateway "
             "so ATRA acts <b>as you</b> where the Bot API cannot: reactions "
-            "inside business chats — set them, see them live.\n\n"
+            "inside business chats set them, see them live.\n\n"
             "<b>\u26a0\ufe0f DANGER:</b> a user account running automation can trip "
             "Telegram flood limits or get banned. Nobody has been banned so far, "
             "but that is luck, not a guarantee. The live session file is never "
@@ -3275,7 +3275,7 @@ def _ub_cfm(st: Dict[str, Any]) -> str:
 
 
 def _tg_view(sub: str, origin: str, st: Dict[str, Any]) -> str:
-    """Confirm screen body — now → next, nothing applied until Apply."""
+    """Confirm screen body now → next, nothing applied until Apply."""
     if sub == "mode":
         cur = str(st.get("guest_tool_mode") or "balanced")
         nxt = str(_tg_next("mode", st))
@@ -3334,7 +3334,7 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
     """One confirm screen for every mutating button.
 
     It states the CURRENT value and the NEXT one, plus the consequence, so a tap
-    is never a guess. It changes NOTHING — the Apply callback is the only writer.
+    is never a guess. It changes NOTHING the Apply callback is the only writer.
     """
     if kind == "bizlang":
         cur = str(st.get("biz_lang") or "auto")
@@ -3357,7 +3357,7 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
                     f"now: <b>{_MODE_LABEL.get(cur, cur)}</b> → "
                     f"<b>{_MODE_LABEL.get(nxt, nxt)}</b>\n\n"
                     "<b>strict</b> nothing · <b>balanced</b> reads only · "
-                    "<b>open</b> anything — a stranger could act on this box.\n\n"
+                    "<b>open</b> anything a stranger could act on this box.\n\n"
                     "Tap ✅ Apply to change, ✖ Cancel to go back.")
         if sub == "userbridge":
             return _ub_cfm(st)
@@ -3395,8 +3395,8 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
         if sub == "here":
             return ("<b>📡 Log into THIS chat?</b>\n"
                     f"now: <code>{cur}</code>\n\n"
-                    "Everything this plugin logs — guest activity, your own mirror, "
-                    "whitelist messages — lands here from now on. The bot has to be "
+                    "Everything this plugin logs guest activity, your own mirror, "
+                    "whitelist messages lands here from now on. The bot has to be "
                     "able to post in this chat.\n\n"
                     "Tap ✅ Apply to change, ✖ Cancel to go back.")
         return ("<b>📡 Turn the log off?</b>\n"
@@ -3472,19 +3472,19 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
             if unlocked:
                 return (f"<b>➕ <code>{_esc(chat)}</code></b>\n"
                         "now: <b>already unlocked for your account</b>\n\n"
-                        "Nothing to do — tap ✖ Cancel to go back.")
+                        "Nothing to do tap ✖ Cancel to go back.")
             return ("\n".join([
                 f"<b>Unlock <code>{_esc(chat)}</code> for your account?</b>",
                 "now: <b>locked</b> → <b>unlocked</b>",
                 "",
-                "In this chat a guest is not limited to the read-only tools — it gets "
+                "In this chat a guest is not limited to the read-only tools it gets "
                 "your owner's access. Treat anyone who can message there as yourself.",
                 "",
                 "Tap ✅ Apply to unlock, ✖ Cancel to go back."]))
         if not unlocked:
             return (f"<b>➖ <code>{_esc(chat)}</code></b>\n"
                     "now: <b>not unlocked</b>\n\n"
-                    "Nothing to do — tap ✖ Cancel to go back.")
+                    "Nothing to do tap ✖ Cancel to go back.")
         return ("\n".join([
             f"<b>Revoke owner access in <code>{_esc(chat)}</code>?</b>",
             "now: <b>unlocked</b> → <b>locked</b>",
@@ -3497,11 +3497,11 @@ def _cfm_view(kind: str, arg: str, st: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# v4.0.0 — one registry drives every settings page.
+# v4.0.0 one registry drives every settings page.
 #
 # The body lists each item with its LIVE value, the keyboard offers exactly
 # one button per item, and a test asserts that all 29 DEFAULT_SETTINGS keys
-# appear here — so "every changeable setting is reachable from the panel, in
+# appear here so "every changeable setting is reachable from the panel, in
 # a category, with no command" is a checked property rather than a claim.
 #
 # kinds: bool | enum | int | text | chan | list | cmd
@@ -3666,8 +3666,8 @@ _CAT_LABEL = {"log": "📡 Logging", "guests": "👾 Guests", "react": "🔁 Rea
 # One line under each title, so a category page says what it is for before it
 # lists values. `system` doubles as the version readout the panel used to show.
 _CAT_BLURB = {
-    "log": "Where activity lands — the channel, and which messages get mirrored.",
-    "guests": "canned reply, cooldown, error texts — everything a stranger hears.",
+    "log": "Where activity lands the channel, and which messages get mirrored.",
+    "guests": "canned reply, cooldown, error texts everything a stranger hears.",
     "react": "Which emoji ATRA drops, and on whose messages.",
     "tool": "What a guest session may run, and which chats you unlocked for yourself.",
     "access": "Who talks to the real brain, and at which tool level.",
@@ -3715,7 +3715,7 @@ def _cat_value(it: Dict[str, Any], st: Dict[str, Any]) -> str:
             return (f"<code>{_esc(str(p))}</code>" if p
                     else "<i>default</i>")
         if key == "biz_persona_path":
-            # "" is the BUNDLED persona in effect, not "no persona" — the panel
+            # "" is the BUNDLED persona in effect, not "no persona" the panel
             # said "(empty)" while a full automation/mimic prompt was being sent
             # on every turn, so the owner had no way to tell them apart.
             p = str(st.get("biz_persona_path") or "").strip()
@@ -3750,14 +3750,14 @@ def _cat_body(cat: str, st: Dict[str, Any], note: str = "") -> str:
             continue
         lines.append(f"• <b>{it['label']}</b>: {_cat_value(it, st)}")
     lines += ["",
-              "Tap a button below — text settings open a prompt, flags open a "
+              "Tap a button below text settings open a prompt, flags open a "
               "confirm screen. Nothing is typed as a command.",
               "↩ Back returns to the page you came from."]
     return "\n".join(lines)
 
 
 def _cat_buttons(cat: str, st: Dict[str, Any], chat_id: Optional[str] = None) -> list:
-    """(label, callback) pairs for one category — one per setting."""
+    """(label, callback) pairs for one category one per setting."""
     out: List[Tuple[str, str]] = []
     for it in _CATS.get(cat) or []:
         k = it["kind"]
@@ -3790,9 +3790,9 @@ def _cat_buttons(cat: str, st: Dict[str, Any], chat_id: Optional[str] = None) ->
         elif k == "lock":
             # a state line, not a value: the button says what tapping it does
             if st.get(it["key"], True):
-                out.append((f"{it['label']} — tap to lock", str(it["cb"])))
+                out.append((f"{it['label']} tap to lock", str(it["cb"])))
             else:
-                out.append(("🔓 Updates locked — tap to unlock", str(it["cb"])))
+                out.append(("🔓 Updates locked tap to unlock", str(it["cb"])))
         else:  # cmd
             cb = str(it["cb"])
             if cb == "wipe:LOG" and str(st.get("log_channel") or ""):
@@ -3806,29 +3806,29 @@ def _cat_buttons(cat: str, st: Dict[str, Any], chat_id: Optional[str] = None) ->
 
 
 def _settings_view(st: Dict[str, Any], note: str = "") -> str:
-    """All flags in one place — each with its own confirm screen."""
+    """All flags in one place each with its own confirm screen."""
     return _cat_body("settings", st, note)
 
 
 def _wl_view(st: Dict[str, Any], note: str = "") -> str:
-    """Whitelist as a list of friend cards — one button each, one tap per level."""
+    """Whitelist as a list of friend cards one button each, one tap per level."""
     owner = str(_owner_id() or "")
     wl = _read_allow_from()
     lines = [
-        "<b>🛡 Whitelist & friends</b> — these ids talk to the real brain",
+        "<b>🛡 Whitelist & friends</b> these ids talk to the real brain",
         f"👑 owner: <code>{_esc(owner or 'unset')}</code> (always full access)",
     ]
     friends = [u for u in wl if u != owner]
     if not friends:
-        lines += ["", "No friends yet — tap ➕ Add a friend; the wizard asks for the id."]
+        lines += ["", "No friends yet tap ➕ Add a friend; the wizard asks for the id."]
     for uid in friends:
         lvl = _friend_level(uid)
-        lines.append(f"• <code>{_esc(uid)}</code> — {_FRIEND_LEVEL_LABEL.get(lvl, lvl)} "
-                     f"— tap to change level or remove")
+        lines.append(f"• <code>{_esc(uid)}</code> {_FRIEND_LEVEL_LABEL.get(lvl, lvl)} "
+                     f" tap to change level or remove")
     lines += [
         "",
         "The core gateway tier (<code>TELEGRAM_ALLOWED_USERS</code>) is synced "
-        "automatically — someone added here passes the gateway too, no restart.",
+        "automatically someone added here passes the gateway too, no restart.",
         "Command twin: <code>!whitelist add|remove|perms &lt;id&gt; [level]</code>",
     ]
     if note:
@@ -3843,9 +3843,9 @@ def _wlfr_view(uid: str, st: Dict[str, Any]) -> str:
         f"<b>👤 Friend <code>{_esc(uid)}</code></b>",
         f"level: <b>{_FRIEND_LEVEL_LABEL.get(lvl, lvl)}</b>",
         "",
-        "<b>talk</b> — safe read-only tools (web, vision, skills)",
-        "<b>free</b> — everything except destructive/credential tools",
-        "<b>full</b> — no tool gating at all",
+        "<b>talk</b> safe read-only tools (web, vision, skills)",
+        "<b>free</b> everything except destructive/credential tools",
+        "<b>full</b> no tool gating at all",
         "",
         "Tap a level to apply immediately (same code as "
         "<code>!whitelist perms</code>). Removing asks for a confirm.",
@@ -3853,12 +3853,12 @@ def _wlfr_view(uid: str, st: Dict[str, Any]) -> str:
 
 
 def _wlrm_view(uid: str, st: Dict[str, Any]) -> str:
-    """Remove confirm — names the consequence instead of just the action."""
+    """Remove confirm names the consequence instead of just the action."""
     return "\n".join([
         f"🗑 <b>Remove <code>{_esc(uid)}</code> from the whitelist?</b>",
         "",
         "He stops talking to the real brain and falls back to guest rules.",
-        "The core gate stays synced — his messages would be ignored, not answered.",
+        "The core gate stays synced his messages would be ignored, not answered.",
         "",
         "✅ Yes, remove · ✖ No, keep",
     ])
@@ -3866,7 +3866,7 @@ def _wlrm_view(uid: str, st: Dict[str, Any]) -> str:
 
 def _view_body(view: str, st: Dict[str, Any], note: str = "",
                arg: str = "") -> str:
-    """Body for a view name — used after Apply/Cancel so every return lands
+    """Body for a view name used after Apply/Cancel so every return lands
     back on the right page instead of dumping the owner on the home grid."""
     def _with(body: str) -> str:
         return f"{body}\n\n{note}" if note else body
@@ -3886,7 +3886,7 @@ def _view_body(view: str, st: Dict[str, Any], note: str = "",
     if view == "gsess":
         return _with(_gsess_view(st))
     if view == "cool":
-        return _with(f"<b>⏱ Cooldown</b> — how long a stranger waits before the "
+        return _with(f"<b>⏱ Cooldown</b> how long a stranger waits before the "
                      f"canned reply may repeat\ncurrent: "
                      f"<b>{_fmt_min((st.get('unauthorized_cooldown_s') or 0) / 60)}</b>"
                      f" <i>({st.get('unauthorized_cooldown_s')}s)</i>\n"
@@ -3904,7 +3904,7 @@ def _view_body(view: str, st: Dict[str, Any], note: str = "",
         return _bizconn_view(st, note)
     if view in ("full", "bot", "who", "status", "sessions", "log", "guests",
                 "access", "system"):
-        # help pages a Back pop can land on — render the real section, never
+        # help pages a Back pop can land on render the real section, never
         # the console, so the body always matches the keyboard.
         return _help_view(view, st)
     return _panel_text(st, note)
@@ -3915,7 +3915,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
     """Per-tab button sets: sections at home, contextual actions inside a tab.
 
     `arg` carries the target for card views (wlfr/wlrm uid, "sub:origin" for a
-    confirm screen) — the view string stays a plain label for routing/labels."""
+    confirm screen) the view string stays a plain label for routing/labels."""
     from telegram import InlineKeyboardButton as B
     st = st or settings()
     log = str(st.get("log_channel") or "")
@@ -3929,7 +3929,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
             rows.append([B(lbl, callback_data=f"{_CB_PREFIX}{path}") for lbl, path in pairs])
 
     if view in _CATS:
-        # v4.0.0 category page — one button per setting, values in the body.
+        # v4.0.0 category page one button per setting, values in the body.
         _pairs = _cat_buttons(view, st, chat_id)
         for _ci in range(0, len(_pairs), 2):
             add(*_pairs[_ci:_ci + 2])
@@ -3954,7 +3954,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         add(("🔁 Reactions", "help:react"), ("🤖 Tool", "help:tool"))
         add(("🛡 Access", "help:access"), ("🔧 System", "help:system"))
         add(("⚙️ Settings", "panel:settings"), ("🛡 Whitelist", "panel:wl"))
-        add(("⚡ Actions — do things", "panel:actions"),
+        add(("⚡ Actions do things", "panel:actions"),
             ("📜 Full help", "help:full"))
         add(("🧹 Sessions", "help:sessions"))
     elif view == "wl":
@@ -3965,7 +3965,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
             _wlvl = _friend_level(_wuid)
             add((f"{_FRIEND_LEVEL_LABEL.get(_wlvl, _wlvl)} · {_wuid}",
                  f"panel:wlfr:{_wuid}"))
-        add(("➕ Add a friend — wizard", "panel:wiz:wladd"))
+        add(("➕ Add a friend wizard", "panel:wiz:wladd"))
         add(("📋 Users", "panel:out:users"), ("🛡 Whitelist text", "panel:out:whitelist"))
         add(("🔍 Auth debug", "panel:wiz:authdbg"))
     elif view == "wlfr":
@@ -3985,11 +3985,11 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         if _df:
             add(("✏️ Type a value", f"panel:wiz:{_df}"))
     elif view == "actions":
-        add(("\U0001f4e1 Log here — log into THIS chat", "panel:sethere"))
+        add(("\U0001f4e1 Log here log into THIS chat", "panel:sethere"))
         add(("\U0001f6e1 Whitelist add", "panel:wiz:wladd"),
             ("\U0001f6e1 Whitelist remove", "panel:wiz:wldel"))
         add(("\U0001f6e1 Friend permission level", "panel:wiz:wlperm"))
-        add(("\U0001f510 Guest sessions — open / lock", "panel:gslist"))
+        add(("\U0001f510 Guest sessions open / lock", "panel:gslist"))
         add(("\U0001f4cb Send a DM as the bot", "panel:wiz:send"))
         add(("\U0001f9f9 Wipe a session", "panel:wiz:wipe"))
         add(("\u23f1 Cooldown", "panel:cool"))
@@ -4033,7 +4033,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         add((f"🛠 Tool {_mark('tool_enabled')}", "panel:tg:tool:status"),
             (f"👑 Mirror {_mark('log_owner_messages')}", "panel:tg:mirror:status"))
     elif view == "sessions":
-        # One 🛑 per LIVE turn (index into _SESS_SNAP — a session key is
+        # One 🛑 per LIVE turn (index into _SESS_SNAP a session key is
         # longer than Telegram's 64-byte callback_data) and one 🧹 per open
         # stored session. The body must render first: it is what refreshes
         # both snapshots the buttons point at.
@@ -4070,7 +4070,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         rows.insert(0, [B("⬅️ Back", callback_data=f"{_CB_PREFIX}panel:view:{_corigin}")])
         add(("📜 Full help", "help:full"))
     elif view != "panel":
-        # pops one level of history — from a category it lands on the console,
+        # pops one level of history from a category it lands on the console,
         # from a sub-page it lands on the category you came from.
         rows.insert(0, [B("⬅️ Back", callback_data=f"{_CB_PREFIX}panel:back")])
         add(("📜 Full help", "help:full"))
@@ -4079,7 +4079,7 @@ def _help_keyboard(view: str = "panel", st: Optional[Dict[str, Any]] = None,
         add(*[(f"{n}s", f"panel:cool:{n}") for n in (0, 60, 300, 3600)])
     if chat_id and view in ("panel", "sessions", "access") \
             and (view != "sessions" or str(chat_id) not in _SESS_WIPES):
-        # In the sessions view every open chat already got its own 🧹 above —
+        # In the sessions view every open chat already got its own 🧹 above 
         # repeating it there just doubles the button. Everywhere else this
         # stays: it is the panel's one-click "wipe where I'm standing".
         add((f"🧹 Wipe this chat", f"wipe:{chat_id}"))
@@ -4099,12 +4099,12 @@ _VIEW_LABEL = {"full": "📜 Full help", "panel": "🧩 Console", "out": "📋 O
 
 # One confirm vocabulary: every mutating button first renders
 # `panel:cfm:<kind>:...` (read-only, states now → next), and only the Apply
-# button writes — `panel:tgy` for settings flags, `panel:upd` for updates,
+# button writes `panel:tgy` for settings flags, `panel:upd` for updates,
 # `panel:cfmok` for the rest. Nothing else in the panel writes a setting.
 _CFM_KINDS = {"tg", "gs", "log", "upd", "sup", "cool", "wl", "gate",
               "bizlang"}
 
-# v4.0.0 — Back returns to the page you came from, not always to the console.
+# v4.0.0 Back returns to the page you came from, not always to the console.
 # A per-panel-message history: navigate truncates/appends, `panel:back` pops.
 # Confirm screens and the wizard are transient, so they never enter the stack.
 _NAV: Dict[str, List[str]] = {}
@@ -4113,7 +4113,7 @@ _NAV_TRANSIENT = frozenset({"cfm", "tg", "wiz"})
 
 
 def _nav_key(q: Any) -> str:
-    """One history per panel message — two open panels do not share a stack."""
+    """One history per panel message two open panels do not share a stack."""
     msg = getattr(q, "message", None)
     return f"{_msg_chat_id(msg)}:{getattr(msg, 'message_id', None) or getattr(msg, 'id', None)}"
 
@@ -4153,7 +4153,7 @@ async def _panel_edit(q: Any, body: str, view: str, st: Dict[str, Any],
     """Swap a panel message in place.
 
     Returns "ok" when Telegram accepted the edit, "same" when the tap would not change
-    anything (Telegram 400s on an identical edit — that is a no-op, not a failure), and
+    anything (Telegram 400s on an identical edit that is a no-op, not a failure), and
     "failed" for anything real (logged so it is diagnosable instead of silent).
     """
     from telegram import InlineKeyboardMarkup
@@ -4230,9 +4230,9 @@ async def _whitelist_cmd(adapter: Any, arg: str) -> str:
         target, lvl = bits2[0], bits2[1].strip().lower()
         lvl = _FRIEND_LEVEL_ALIASES.get(lvl, lvl)
         if lvl not in _FRIEND_LEVELS:
-            return f"Unknown level <code>{_esc(lvl)}</code> — use talk, free or full."
+            return f"Unknown level <code>{_esc(lvl)}</code> use talk, free or full."
         if target != owner and target not in _read_allow_from():
-            return f"<code>{_esc(target)}</code> is not whitelisted — add them first."
+            return f"<code>{_esc(target)}</code> is not whitelisted add them first."
         perms = dict(settings().get("whitelist_perms") or {})
         perms[target] = lvl
         save_settings({"whitelist_perms": perms})
@@ -4252,10 +4252,10 @@ async def _whitelist_cmd(adapter: Any, arg: str) -> str:
             except Exception:
                 target = ""
             if not target:
-                return f"⚠️ could not resolve {_esc(val)} — send the numeric user id instead"
+                return f"⚠️ could not resolve {_esc(val)} send the numeric user id instead"
         target = str(target).strip()
         if target == owner and sub == "remove":
-            return "Refusing to remove the owner — the owner is always authorized; use <code>!setowner</code> to change ownership."
+            return "Refusing to remove the owner the owner is always authorized; use <code>!setowner</code> to change ownership."
         ids = _read_allow_from()
         if sub == "add":
             if target in ids:
@@ -4266,7 +4266,7 @@ async def _whitelist_cmd(adapter: Any, arg: str) -> str:
                 return f"<code>{_esc(target)}</code> is not whitelisted."
             new = [x for x in ids if x != target]
         if not _write_allow_from(new):
-            return "❌ could not write config — see the gateway log"
+            return "❌ could not write config see the gateway log"
         verb = "Added" if sub == "add" else "Removed"
         await _log("🛡 Whitelist updated",
                    f"<b>{verb}:</b> <code>{_esc(target)}</code>\n"
@@ -4274,7 +4274,7 @@ async def _whitelist_cmd(adapter: Any, arg: str) -> str:
         out = (f"✅ {verb.lower()} <code>{_esc(target)}</code>\n"
                f"Whitelist: <code>{_esc(_allow_csv(new))}</code>")
         if sub == "add":
-            out += (f"\nLevel: {_FRIEND_LEVEL_LABEL.get(_friend_level(target), '')} — "
+            out += (f"\nLevel: {_FRIEND_LEVEL_LABEL.get(_friend_level(target), '')} "
                     f"change with <code>!whitelist perms {_esc(target)} talk|gate|full</code>")
         return out
     return ("Usage: <code>!whitelist list|add|remove|perms "
@@ -4282,7 +4282,7 @@ async def _whitelist_cmd(adapter: Any, arg: str) -> str:
 
 
 async def _gs_cmd(adapter: Any, arg: str) -> str:
-    """!gs list|open|lock|reset <user_id> — guest session control (panel twin)."""
+    """!gs list|open|lock|reset <user_id> guest session control (panel twin)."""
     bits = arg.strip().split(maxsplit=1)
     sub = bits[0].lower() if bits else "list"
     val = bits[1].strip() if len(bits) > 1 else ""
@@ -4293,7 +4293,7 @@ async def _gs_cmd(adapter: Any, arg: str) -> str:
         if not recs:
             return ("🔐 No guest sessions recorded yet.\n"
                     "One appears here automatically the first time someone talks on the "
-                    "guest link — or open one yourself with "
+                    "guest link or open one yourself with "
                     "<code>!gs open &lt;user_id&gt;</code>.")
         rows = []
         for uid, rec in sorted(recs.items()):
@@ -4317,7 +4317,7 @@ async def _gs_cmd(adapter: Any, arg: str) -> str:
 
 
 async def _gate_cmd(arg: str) -> str:
-    """!gate show|allow|deny — the safeguard lists, editable without the panel."""
+    """!gate show|allow|deny the safeguard lists, editable without the panel."""
     bits = arg.strip().split(maxsplit=1)
     sub = bits[0].lower() if bits else "show"
     val = bits[1].strip() if len(bits) > 1 else ""
@@ -4330,7 +4330,7 @@ async def _gate_cmd(arg: str) -> str:
         tool = val.lstrip("+-").strip()
         if not tool:
             cur = ", ".join(str(t) for t in (st.get(key) or [])) or "none"
-            return (f"Usage: <code>!gate {sub} &lt;tool&gt;</code> — prefix "
+            return (f"Usage: <code>!gate {sub} &lt;tool&gt;</code> prefix "
                     f"<code>-</code> to remove\nCurrent {sub} list: <code>{_esc(cur)}</code>")
         cur = [str(t) for t in (st.get(key) or [])]
         if remove:
@@ -4355,7 +4355,7 @@ def _auth_debug(uid: str = "") -> str:
 
     Four tiers, checked in this order by the real gateway: config file (panel
     writes here), live adapter snapshot (the prefilter), core gate env
-    (TELEGRAM_ALLOWED_USERS — the authz mixin reads it first and, while it is
+    (TELEGRAM_ALLOWED_USERS the authz mixin reads it first and, while it is
     non-empty, never consults the plugin's list), and the plugin's own route
     decision. The gate line is the tier that dropped whitelisted friends as
     "unrecognized" before 2026-10-02; it is shown so a divergence is visible.
@@ -4364,7 +4364,7 @@ def _auth_debug(uid: str = "") -> str:
     raw = _adapter_allow_raw()
     if raw is None:
         snap_ids = None
-        snap = "(not set — the prefilter falls through to runner auth)"
+        snap = "(not set the prefilter falls through to runner auth)"
     else:
         if isinstance(raw, (list, tuple, set)):
             snap_ids = [str(x).strip() for x in raw]
@@ -4411,7 +4411,7 @@ def _auth_debug(uid: str = "") -> str:
         cool = max(0, int(float(rec.get("canned_until", 0) or 0) - time.time()))
         lines.append(f"  canned cooldown left: {cool}s")
         if file_ids and snap_ids is not None and set(file_ids) != set(snap_ids):
-            lines += ["", "⚠️ file and live snapshot DISAGREE — a whitelist write "
+            lines += ["", "⚠️ file and live snapshot DISAGREE a whitelist write "
                       "(panel → ⚡ Actions) syncs them, or restart the gateway."]
     return "\n".join(x for x in lines if x)
 
@@ -4420,7 +4420,7 @@ def _session_key_for(adapter: Any, chat_id: Any) -> Optional[str]:
     """Best-effort gateway session key for this chat (owner rail: stop).
 
     Mirrors how the handle derives keys: walks the adapter's live sessions and
-    matches the trailing chat segment. None when nothing matches — the caller
+    matches the trailing chat segment. None when nothing matches the caller
     then answers "nothing was running" instead of cancelling blindly.
     """
     try:
@@ -4448,7 +4448,7 @@ _SESS_SNAP: List[str] = []
 _SESS_WIPES: List[str] = []   # chat ids of open stored sessions, for 🧹 buttons
 
 # Chat labels for the list. A bare numeric id is unreadable when a dozen
-# sessions are stacked in one message, so each row reads `name (id)` — the
+# sessions are stacked in one message, so each row reads `name (id)` the
 # @handle comes from getChat, but a panel render must not turn into a dozen
 # uncached network round-trips inside a synchronous callback: one lookup per
 # chat, cached, capped per render and hard-stopped at the render deadline.
@@ -4462,7 +4462,7 @@ _LABEL_MAX_LOOKUPS = 4
 
 def _session_label(adapter: Any, chat_id: Any, display_name: Any = None,
                    chat_type: Any = None) -> str:
-    """`@username` for a person, the group title for a group — always with the
+    """`@username` for a person, the group title for a group always with the
     raw id in parentheses: `Some Name (uid)`, `Group Title (chat_id)`.
 
     Groups keep their stored title (the owner recognises it instantly and it
@@ -4510,10 +4510,10 @@ def _session_label(adapter: Any, chat_id: Any, display_name: Any = None,
 def _sessions_body(adapter: Any = None, st: Optional[Dict[str, Any]] = None) -> str:
     """Owner view: live turns + per-chat session rows (guest / friend / biz).
 
-    Sync on purpose — the panel body builder is sync, and this needs to render
+    Sync on purpose the panel body builder is sync, and this needs to render
     there. Guest chatter lands in isolated one-person sessions; whitelisted
     friends run their own DM session; automation turns run a split bizauto
-    session with the SAME human — three lanes, listed separately so you can see
+    session with the SAME human three lanes, listed separately so you can see
     at a glance which session type is actually busy.
     """
     global _SESS_SNAP, _SESS_WIPES
@@ -4546,7 +4546,7 @@ def _sessions_body(adapter: Any = None, st: Optional[Dict[str, Any]] = None) -> 
         db = _hermes_home() / "state.db"
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
-            # The sessions table has no updated_at — it is last_activity_at,
+            # The sessions table has no updated_at it is last_activity_at,
             # and the old column name made this whole query throw, so the view
             # always read "no stored sessions yet" no matter what was stored.
             rows = con.execute(
@@ -4571,7 +4571,7 @@ def _sessions_body(adapter: Any = None, st: Optional[Dict[str, Any]] = None) -> 
             if _BIZ_THREAD_PREFIX in sid_s or _biz_chat_known(tag):
                 lane = "automation" if _BIZ_THREAD_PREFIX in sid_s else "business"
             elif not tag or tag == "None":
-                # cron/internal runs persist a NULL chat_id — they are not
+                # cron/internal runs persist a NULL chat_id they are not
                 # chats, so label them instead of implying an unknown person.
                 lane = "cron" if str(sid_s).startswith("cron_") else "internal"
             elif tag == _owner:
@@ -4594,7 +4594,7 @@ def _sessions_body(adapter: Any = None, st: Optional[Dict[str, Any]] = None) -> 
             if state == "open" and cid is not None and str(cid).strip() \
                     and str(cid) != "None" and str(cid) not in _SESS_WIPES:
                 _SESS_WIPES.append(str(cid))
-            # `@handle`/title first, raw id second — a bare id tells nobody
+            # `@handle`/title first, raw id second a bare id tells nobody
             # whose session they are looking at.
             _lab = _session_label(adapter, cid, disp, ctype)
             _lab_html = f"<b>{_esc(_lab)}</b>" if _lab else "\u2014"
@@ -4615,7 +4615,7 @@ async def _sessions_view(adapter: Any) -> str:
     return _sessions_body(adapter)
 
 
-# `!run` bounces the gateway through the run script — a constant so the
+# `!run` bounces the gateway through the run script a constant so the
 # tests can point it at /bin/true instead of actually restarting ATRA.
 # Derived, never a host path: this file is pushed to a public repo.
 _RUN_SCRIPT = str(_hermes_home() / "scripts" / "hermes_run.sh")
@@ -4631,7 +4631,7 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
     reply: Optional[str] = None
 
     if cmd in ("!stop", "!st"):
-        # Stop the turn ATRA is running for this chat — or for another chat,
+        # Stop the turn ATRA is running for this chat or for another chat,
         # when its id is given: !stop -100123 cancels that chat's session too.
         _target = arg.strip() or str(chat_id)
         _k = _session_key_for(adapter, _target)
@@ -4665,7 +4665,7 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
     elif cmd in ("!run", "!restart"):
         # Restart Hermes from the panel. The child is detached into its own
         # session and sleeps 3s first, so this reply is delivered before the
-        # gateway dies — and because it is detached, killing this process does
+        # gateway dies and because it is detached, killing this process does
         # not take the restart down with it. hermes_run.sh handles every state:
         # healthy, wedged, crash-looping or already dead.
         try:
@@ -4675,15 +4675,15 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
                 cwd=str(_hermes_home()), start_new_session=True,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL)
-            reply = ("🔄 restarting Hermes — this message lands first, then the "
+            reply = ("🔄 restarting Hermes this message lands first, then the "
                      "gateway bounces and comes back (≈10–30s).\n"
                      "If it does not return: "
                      f"<code>bash {_esc(_RUN_SCRIPT)} start</code> "
-                     "on the box, or type <code>!run</code> again — the script "
+                     "on the box, or type <code>!run</code> again the script "
                      "also starts it from a dead state.")
             await _log("🔁 Hermes restart",
                        f"Owner ran <code>{_esc(cmd)}</code> from "
-                       f"<code>{_esc(str(chat_id))}</code> — bouncing "
+                       f"<code>{_esc(str(chat_id))}</code> bouncing "
                        f"<code>gateway-default</code> via s6")
         except Exception as e:
             reply = (f"❌ could not start the restart: {_esc(type(e).__name__)}"
@@ -4694,7 +4694,7 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
             target, msg = bits[0], bits[1]
             try:
                 if _biz_chat_known(target):
-                    # A customer's chat has no bot member — the raw send is
+                    # A customer's chat has no bot member the raw send is
                     # 403. The business connection is also the only reply he
                     # can use without handing over a session, and once it
                     # lands the thread is HIS: the hold stands down and the
@@ -4716,7 +4716,7 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
                     await _log("📨 Bot DM sent",
                                f"<b>To:</b> <code>{_esc(target)}</code>\n<b>Text:</b> <i>{_esc(msg[:500])}</i>")
             except Exception as e:
-                # failure is already visible inline as this reply — no log-channel detour
+                # failure is already visible inline as this reply no log-channel detour
                 reply = f"❌ {type(e).__name__}: {_esc(str(e)[:300])}"
         else:
             reply = "Usage: <code>!send &lt;user_id&gt; &lt;text&gt;</code>"
@@ -4724,16 +4724,16 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
         val = arg.strip()
         low = val.lower()
         if low in ("here", "this", "now", "."):
-            # The point of `here`: send it inside the chat you want to log —
+            # The point of `here`: send it inside the chat you want to log 
             # no id to copy, no risk of typos. Works from any group/channel.
             if str(chat_id).startswith(GUEST_CHAT_PREFIX):
-                reply = ("This is a guest chat — Telegram hides who sent it. "
+                reply = ("This is a guest chat Telegram hides who sent it. "
                          "Send <code>!setlog here</code> inside the real channel or group instead.")
             else:
                 save_settings({"log_channel": str(chat_id)})
                 reply = f"Log channel → <code>{_esc(str(chat_id))}</code> <i>(this chat)</i>"
                 await _log("🧭 Log channel configured",
-                           "Log channel set — guest-mode activity will be posted here.")
+                           "Log channel set guest-mode activity will be posted here.")
         elif low in ("off", "none", "-"):
             save_settings({"log_channel": None})
             reply = "Log channel cleared."
@@ -4741,13 +4741,13 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
             save_settings({"log_channel": val})
             reply = f"Log channel → <code>{_esc(val)}</code>"
             await _log("🧭 Log channel configured",
-                       "Log channel set — guest-mode activity will be posted here.")
+                       "Log channel set guest-mode activity will be posted here.")
         else:
             reply = f"Log channel = <code>{_esc(st.get('log_channel'))}</code>"
     elif cmd == "!setowner":
         if arg.strip():
             save_settings({"owner_id": arg.strip()})
-            reply = f"owner_id → <code>{_esc(arg.strip())}</code> (hot — no restart)"
+            reply = f"owner_id → <code>{_esc(arg.strip())}</code> (hot no restart)"
         else:
             reply = f"owner_id = <code>{_esc(_owner_id(adapter))}</code> (resolved)"
     elif cmd == "!setunauthorized":
@@ -4775,7 +4775,7 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
         # Durations welcome: '10m' / '30s' / '1h' as well as raw seconds.
         secs = _dur_to_s(arg, "s")
         if secs is None:
-            reply = (f"cooldown = {st.get('unauthorized_cooldown_s')}s — "
+            reply = (f"cooldown = {st.get('unauthorized_cooldown_s')}s "
                      "send a duration, e.g. <code>!setcooldown 10m</code>")
         else:
             save_settings({"unauthorized_cooldown_s": secs})
@@ -4800,7 +4800,7 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
             cur = [str(c) for c in (settings().get("guest_owner_chats") or [])
                    if str(c) != chat_id]
             save_settings({"guest_owner_chats": cur})
-            reply = f"🔒 <b>Locked</b> <code>{_esc(chat_id)}</code> — back to guest rules."
+            reply = f"🔒 <b>Locked</b> <code>{_esc(chat_id)}</code> back to guest rules."
             await _log("🛡 Guest chat locked", f"Owner locked guest chat: {chat_id}")
         elif want == "toggle":
             cur = [str(c) for c in (settings().get("guest_owner_chats") or [])]
@@ -4818,20 +4818,20 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
     elif cmd == "!wipe":
         target = arg.strip()
         if not target:
-            reply = ("Usage: <code>!wipe &lt;chat_id&gt;</code> — deletes that chat's session "
+            reply = ("Usage: <code>!wipe &lt;chat_id&gt;</code> deletes that chat's session "
                      "and starts a fresh one <i>there</i>. This chat is never wiped implicitly.")
         else:
             res = _wipe_sessions(session_store, target)
             if res is None:
-                reply = ("⚠️ wipe could not complete — "
+                reply = ("⚠️ wipe could not complete "
                          "session store unavailable, nothing was changed")
             elif res == (0, 0):
-                reply = f"Nothing to wipe — no session found for <code>{_esc(target)}</code>"
+                reply = f"Nothing to wipe no session found for <code>{_esc(target)}</code>"
             else:
                 routes, rows = res
                 reply = (f"🧹 wiped <b>{rows}</b> stored session(s) "
                          f"(<b>{routes}</b> live route(s) reset) for "
-                         f"<code>{_esc(target)}</code> — fresh start there")
+                         f"<code>{_esc(target)}</code> fresh start there")
                 await _log("🧹 Session wiped",
                            f"<b>Chat:</b> <code>{_esc(target)}</code> · "
                            f"<b>Reset:</b> {routes} route(s) · <b>Deleted:</b> {rows} row(s)")
@@ -4844,7 +4844,7 @@ async def _bang_execute(adapter: Any, chat_id: str, text: str,
     elif cmd == "!gate":
         reply = await _gate_cmd(arg)
     else:
-        return (f"Unknown command <code>{_esc(cmd)}</code> — see <code>!help</code>.")
+        return (f"Unknown command <code>{_esc(cmd)}</code> see <code>!help</code>.")
     return reply
 
 
@@ -4872,7 +4872,7 @@ async def _run_bang_command(adapter: Any, event: Any, text: str,
 # One open wizard per chat: {"flow": name, "data": [typed answers]}.
 # The panel starts a flow with a button; the owner types the answers as normal
 # messages; the flow finishes by running the SAME bang command the panel
-# replaces — so button and command can never drift apart.
+# replaces so button and command can never drift apart.
 _WIZARD: Dict[str, Dict[str, Any]] = {}
 
 _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
@@ -4946,7 +4946,7 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
         "done": "window days updated."},
     "bizidledur": {
         "prompts": ["⏳ <b>Reply hold</b>\n\nSend how long every automation "
-                    "message is held before ATRA may answer — <code>10s</code>, "
+                    "message is held before ATRA may answer <code>10s</code>, "
                     "<code>2m</code>, <code>1h</code>, or <code>0</code> to "
                     "answer immediately. Replying in the chat during the "
                     "window cancels the hold.\n<i>Type cancel to abort.</i>"],
@@ -4972,7 +4972,7 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
         "build": lambda d: f"!wipe {d[0]}"},
     "cooldown": {
         "prompts": ["⏱ <b>Cooldown</b>\n\nSend how long a stranger waits before the "
-                    "canned reply may repeat — a duration like <code>10m</code>, "
+                    "canned reply may repeat a duration like <code>10m</code>, "
                     "<code>30s</code>, <code>1h</code> (or plain seconds).\n"
                     "<i>Type cancel to abort.</i>"],
         "validate": lambda d: ("" if _dur_to_s(d[0], "s") is not None
@@ -4983,32 +4983,32 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
                     "the canned reply.\n<i>Type cancel to abort.</i>"],
         "build": lambda d: f"!setunauthorized {d[0]}"},
     "send": {
-        "prompts": ["📨 <b>Send a DM as the bot</b>\n\nStep 1/2 — send the user id.\n"
+        "prompts": ["📨 <b>Send a DM as the bot</b>\n\nStep 1/2 send the user id.\n"
                     "<i>Type cancel to abort.</i>",
-                    "📨 <b>Send a DM as the bot</b>\n\nStep 2/2 — send the message text."],
+                    "📨 <b>Send a DM as the bot</b>\n\nStep 2/2 send the message text."],
         "build": lambda d: f"!send {d[0]} {d[1]}"},
     "wlperm": {
-        "prompts": ["🛡 <b>Friend permission level</b>\n\nStep 1/2 — send the whitelisted "
+        "prompts": ["🛡 <b>Friend permission level</b>\n\nStep 1/2 send the whitelisted "
                     "user id.\n<i>Type cancel to abort.</i>",
-                    "🛡 <b>Step 2/2</b> — send the level:\n"
-                    "  <b>talk</b> — safe tools only (web, vision, skills)\n"
-                    "  <b>free</b> — everything except destructive/credential tools\n"
-                    "  <b>full</b> — no tool gating at all\n"
+                    "🛡 <b>Step 2/2</b> send the level:\n"
+                    "  <b>talk</b> safe tools only (web, vision, skills)\n"
+                    "  <b>free</b> everything except destructive/credential tools\n"
+                    "  <b>full</b> no tool gating at all\n"
                     "<i>Type cancel to abort.</i>"],
         "build": lambda d: f"!whitelist perms {d[0]} {d[1]}"},
     "authdbg": {
-        "prompts": ["🩺 <b>Auth debug</b>\n\nSend the user id to check — config file vs "
+        "prompts": ["🩺 <b>Auth debug</b>\n\nSend the user id to check config file vs "
                     "the live prefilter snapshot vs the plugin's route.\n"
                     "<i>Type cancel to abort.</i>"],
         "build": lambda d: f"!auth {d[0]}"},
     "gsopen": {
         "prompts": ["🔐 <b>Open a guest session</b>\n\nSend the guest's user id (the id they "
-                    "carry on the guest link). The session will accept plain mentions — no "
+                    "carry on the guest link). The session will accept plain mentions no "
                     "reply-to-ATRA needed.\n<i>Type cancel to abort.</i>"],
         "build": lambda d: f"!gs open {d[0]}"},
     "gslock": {
         "prompts": ["🔐 <b>Lock a guest session</b>\n\nSend the user id whose session should "
-                    "be locked — works on auto-created sessions and on ones you opened.\n"
+                    "be locked works on auto-created sessions and on ones you opened.\n"
                     "<i>Type cancel to abort.</i>"],
         "build": lambda d: f"!gs lock {d[0]}"},
     "gateallow": {
@@ -5029,11 +5029,11 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
                     "<i>Type cancel to abort.</i>"],
         "build": lambda d: f"!setlog {d[0]}"},
     "err_en": {
-        "prompts": ["👾 <b>Guest error reply — English</b>\n\nSend the exact text a guest gets "
+        "prompts": ["👾 <b>Guest error reply English</b>\n\nSend the exact text a guest gets "
                     "when a run fails.\n<i>Type cancel to abort.</i>"],
         "build": lambda d: f"!seterror {d[0]}"},
     "err_fa": {
-        "prompts": ["👾 <b>Guest error reply — Persian</b>\n\nSend the exact text a guest gets "
+        "prompts": ["👾 <b>Guest error reply Persian</b>\n\nSend the exact text a guest gets "
                     "when a run fails in Persian.\n<i>Type cancel to abort.</i>"],
         "build": lambda d: f"!seterrorfa {d[0]}"},
     "lockreply": {
@@ -5043,19 +5043,19 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
         "validate": lambda d: "" if d[0].strip() else "send some text",
         "done": "✅ locked reply updated."},
     "emoji_recv": {
-        "prompts": ["🔁 <b>Reaction — message received</b>\n\nSend the emoji ATRA drops when "
+        "prompts": ["🔁 <b>Reaction message received</b>\n\nSend the emoji ATRA drops when "
                     "your message arrives.\n<i>Type cancel to abort.</i>"],
         "save": lambda d: {"react_emoji_receive": d[0][:32]},
         "validate": lambda d: "" if d[0].strip() else "send an emoji",
         "done": "✅ receive reaction updated."},
     "emoji_done": {
-        "prompts": ["✅ <b>Reaction — done</b>\n\nSend the emoji ATRA drops when a run "
+        "prompts": ["✅ <b>Reaction done</b>\n\nSend the emoji ATRA drops when a run "
                     "succeeds.\n<i>Type cancel to abort.</i>"],
         "save": lambda d: {"react_emoji_done": d[0][:32]},
         "validate": lambda d: "" if d[0].strip() else "send an emoji",
         "done": "✅ done reaction updated."},
     "emoji_err": {
-        "prompts": ["❌ <b>Reaction — error</b>\n\nSend the emoji ATRA drops when a run "
+        "prompts": ["❌ <b>Reaction error</b>\n\nSend the emoji ATRA drops when a run "
                     "fails.\n<i>Type cancel to abort.</i>"],
         "save": lambda d: {"react_emoji_error": d[0][:32]},
         "validate": lambda d: "" if d[0].strip() else "send an emoji",
@@ -5067,7 +5067,7 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
         "save": lambda d: {"persona_path": (None if d[0].strip().lower() in ("default", "reset", "auto")
                                             else d[0].strip()[:400])},
         "validate": lambda d: "" if d[0].strip() else "send a path, or 'default'",
-        "done": "✅ persona path updated — used on the next guest message."},
+        "done": "✅ persona path updated used on the next guest message."},
     "uprepo": {
         "prompts": ["📦 <b>Update source repository</b>\n\nSend <code>owner/repo</code> or a full "
                     "git URL, or <code>auto</code> to follow this plugin's own origin.\n"
@@ -5086,7 +5086,7 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
         "done": "✅ update branch updated."},
     "uptimeout": {
         "prompts": ["⌛ <b>Update timeout</b>\n\nSend how long git plus the test suite may "
-                    "take (10s–30m) — a duration like <code>30s</code>, "
+                    "take (10s–30m) a duration like <code>30s</code>, "
                     "<code>10m</code>, <code>1h</code>.\n<i>Type cancel to abort.</i>"],
         "save": lambda d: {"update_timeout_s": _dur_to_s(d[0], "s")},
         "validate": lambda d: ("" if (lambda s: s is not None and 10 <= s <= 1800)
@@ -5097,7 +5097,7 @@ _WIZ_FLOWS: Dict[str, Dict[str, Any]] = {
 
 
 # _WIZARD lives only in RAM, so a hot reload dropped a flow the owner was halfway
-# through answering — the next typed value then fell through to the agent as plain
+# through answering the next typed value then fell through to the agent as plain
 # text. Persist the open steps beside settings.json (tests redirect SETTINGS_PATH)
 # and restore on import, so a deploy that reloads this module eats nothing.
 _WIZARD_TTL_S = 1800  # an unanswered step older than this is abandoned
@@ -5197,14 +5197,14 @@ async def _wizard_feed(adapter: Any, chat_id: Any, text: str,
                                   session_store=session_store)
     except Exception:
         logger.exception("[TGAhermes] wizard command failed")
-        return "❌ the wizard failed — check the gateway log."
+        return "❌ the wizard failed check the gateway log."
     return out or "✅ done."
 
 
 # ---------------------------------------------------------------- pre_gateway_dispatch hook
 
 def _live_adapter(gateway: Any) -> Any:
-    """Live telegram adapter from the gateway runner — keeps hook-only reloads working."""
+    """Live telegram adapter from the gateway runner keeps hook-only reloads working."""
     if gateway is None:
         return None
     try:
@@ -5220,7 +5220,7 @@ def _maybe_rewire() -> None:
     A reload alone never swaps the PTB handlers (the gateway dedups factories
     by (plugin, qualname), and an unchanged file mtime keeps that key stable),
     so the previous load's closures keep serving the panel until something
-    forces a rewire. Only the dispatch hook used to do that — which meant a
+    forces a rewire. Only the dispatch hook used to do that which meant a
     button tap answered from the OLD code until the owner happened to send a
     plain message. Any tool call in this session reaches here too, so a reload
     takes effect on the very next turn instead of waiting for a text message.
@@ -5265,7 +5265,7 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
     try:
         if event is None:
             return None
-        # MessageEvent has no `platform` field — platform lives on event.source (Platform enum).
+        # MessageEvent has no `platform` field platform lives on event.source (Platform enum).
         _plat = getattr(getattr(event, "source", None), "platform", None)
         if getattr(_plat, "value", _plat) != "telegram":
             return None
@@ -5295,7 +5295,7 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
                 _UB_STATE["probe_ad"] = 1
                 logger.info("[TGAhermes] probe: dispatch early-return (no adapter)")
             return None
-        # Hot-reload rewire trigger: see _maybe_rewire — one check on the first
+        # Hot-reload rewire trigger: see _maybe_rewire one check on the first
         # dispatched message makes the adapter rewire, the factory's per-deploy
         # qualname key is then unknown to the wired set, so it runs, sweeps the
         # stale handlers and re-syncs allow_from. The sweep also runs on every
@@ -5304,7 +5304,7 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
         _maybe_rewire()
         _sweep_stale()
         # Full unlock: arm the owner-session listener on the first inbound
-        # after a (re)load — dispatch always runs inside the gateway loop.
+        # after a (re)load dispatch always runs inside the gateway loop.
         if not _UB_STATE.get("probe_kick_zone"):
             _UB_STATE["probe_kick_zone"] = 1
             logger.info("[TGAhermes] probe: reached kick zone (kicked=%r)",
@@ -5338,7 +5338,7 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
                 elif _gate_allow_raw() != _want:
                     # adapter already agrees; only the core gate's env tier is
                     # behind (e.g. .env edited at startup before this module
-                    # existed) — this is the tier that drops friends as
+                    # existed) this is the tier that drops friends as
                     # "unrecognized", so it is worth its own check.
                     _sync_gate_allowlists(_want)
         except Exception:
@@ -5350,7 +5350,7 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
         uid = str(src.user_id or "")
         owner = _owner_id(ad)
 
-        # Bang console: owner, in the log channel or their own DM — plus
+        # Bang console: owner, in the log channel or their own DM plus
         # `!setlog …` from ANY group/channel they are in, so `!setlog here`
         # works from inside the chat they want to log (its id is the message's).
         in_log = st.get("log_channel") and chat == str(st["log_channel"])
@@ -5412,7 +5412,7 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
         if text and uid and uid != owner and not mention_logged:
             # Chat Automation keeps business traffic out of the generic DM
             # mirror: an automation message must never show up as a plain
-            # "Whitelisted/Stranger DM to bot" entry — it gets its own title.
+            # "Whitelisted/Stranger DM to bot" entry it gets its own title.
             _braw = getattr(event, "raw_message", None)
             if getattr(_braw, "business_connection_id", None):
                 return None
@@ -5445,7 +5445,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
     q = getattr(update, "callback_query", None)
     if q is None:
         return
-    # Taps must rewire too — otherwise a reload's ghost handlers keep
+    # Taps must rewire too otherwise a reload's ghost handlers keep
     # answering panel taps with OLD code (wrong keyboard, empty sections).
     _maybe_rewire()
     _sweep_stale()
@@ -5469,7 +5469,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             _nav_push(_nk, key)   # v4.0.0: Back from a section returns to where you were
             res = await _panel_edit(q, _help_view(key, st), key, st)  # keyboard gets chat_id inside
             if res == "same":
-                await q.answer(f"{_VIEW_LABEL.get(key, '🧩')} — already showing", show_alert=False)
+                await q.answer(f"{_VIEW_LABEL.get(key, '🧩')} already showing", show_alert=False)
             elif res == "failed":
                 await q.answer("⚠️ couldn't update the panel", show_alert=True)
             else:
@@ -5498,7 +5498,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                                       _legacy_origin, bits[3]])
             if action == "toggle" and sub in toggles:
                 # v3.3: legacy callback name, kept so panels rendered before the
-                # reload keep working — but it routes through the confirm screen
+                # reload keep working but it routes through the confirm screen
                 # like every other flag, it does not flip anything itself.
                 view, arg = "cfm", f"settings:tg:{sub}"
                 body = _cfm_view("tg", f"{sub}:settings", st)
@@ -5530,7 +5530,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             elif action == "wlrm" and sub:
                 view, body, arg = "wlrm", _wlrm_view(sub, st), sub
             elif action == "wlrm2" and sub:
-                # v3.3: the second tap is the confirm — removal happens here.
+                # v3.3: the second tap is the confirm removal happens here.
                 view = "wl"
                 out = await _bang_execute(ad, _msg_chat_id(q.message) or "",
                                           f"!whitelist remove {sub}")
@@ -5555,7 +5555,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                 view, arg = _view, f"bizmode:{_view}"
                 body = _view_body(_view, st, note, arg=f"bizmode:{_view}")
             elif action == "tg" and sub:
-                # confirm screen: panel:tg:<sub-key>:<origin> — changes nothing yet
+                # confirm screen: panel:tg:<sub-key>:<origin> changes nothing yet
                 origin = bits[4] if len(bits) > 4 else "settings"
                 view, arg = "tg", f"{sub}:{origin}"
                 body = _tg_view(sub, origin, st)
@@ -5571,13 +5571,13 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     body = _cfm_view("cool", sub, st)
                 else:
                     view = "cool"
-                    body = (f"<b>⏱ Cooldown</b> — how long a stranger waits before the "
+                    body = (f"<b>⏱ Cooldown</b> how long a stranger waits before the "
                             f"canned reply may repeat\ncurrent: <b>{st.get('unauthorized_cooldown_s')}s</b>\n"
                             "Tap a preset, tap \u270f\ufe0f to type a duration like "
                             "<code>10m</code>, or use <code>!setcooldown 10m</code>")
             elif action == "gate":
                 # v3.3: `panel:gate` with no sub used to match no branch at all and
-                # land back on the home grid with no body — the reported bug. An
+                # land back on the home grid with no body the reported bug. An
                 # empty sub now opens the gate page itself (it is read-only).
                 if not sub:
                     view, body = "safeguard", _gate_view(st)
@@ -5589,7 +5589,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     body = _cfm_view("tg", f"{sub}:safeguard", st)
                 elif sub.startswith("grant:") or sub.startswith("revoke:"):
                     # v3.3: unlocking a chat for the owner's account grants real
-                    # access, so it confirms first — it is not a navigation tap.
+                    # access, so it confirms first it is not a navigation tap.
                     _w, chat_key = sub.split(":", 1)[0], sub.split(":", 1)[-1]
                     cur = [str(c) for c in (st.get("guest_owner_chats") or [])]
                     view, arg = "cfm", f"safeguard:gate:{_w}:{chat_key}"
@@ -5615,7 +5615,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                 view, arg = "cfm", f"{_o2}:{_k2}:{_p2}"
                 body = _cfm_view(_k2, _p2, st)
             elif action == "cfmok" and sub in _CFM_KINDS:
-                # THE writer — one place where Apply changes a setting. The
+                # THE writer one place where Apply changes a setting. The
                 # callback is `cfmok:<kind>:<origin>:<payload>`; the origin is
                 # stripped first so each kind parses only its own payload.
                 _kind = sub
@@ -5624,7 +5624,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                 if _kind == "tg":
                     _ts, _to = _pay, (_origin or "settings")
                     # Land back on the page the tap came from, not on the home
-                    # grid — otherwise a mode change from Safeguards dumps you
+                    # grid otherwise a mode change from Safeguards dumps you
                     # out of the section you were working in.
                     view = _to if _to in _VIEW_LABEL else "settings"
                     if _ts == "mode":
@@ -5679,9 +5679,9 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                                        "unlocked guest chats")
                         elif _ts == "userbridge":
                             await _ub_apply(on)
-                            await _log("🔓 Full unlock — act as you",
+                            await _log("🔓 Full unlock act as you",
                                        _BRIDGE_ON_LOG if on else
-                                       "<b>disabled</b> — owner session "
+                                       "<b>disabled</b> owner session "
                                        "connection dropped, listener stopped.")
                     else:
                         note = "❌ unknown setting."
@@ -5720,8 +5720,8 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     on = not bool(st.get("update_enabled", True))
                     save_settings({"update_enabled": on})
                     st = settings()
-                    note = ("🔓 updates unlocked — check/install re-enabled" if on
-                            else "🔒 updates locked — check, install and the "
+                    note = ("🔓 updates unlocked check/install re-enabled" if on
+                            else "🔒 updates locked check, install and the "
                                  "selfupdate tool now refuse")
                     view, body = "system", _view_body("system", st, note)
                     await _log("🔧 Updates",
@@ -5757,7 +5757,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                             save_settings({"log_channel": str(cid)})
                             st = settings()
                             await _log("🧭 Log channel configured",
-                                       "Log channel set — guest-mode activity will "
+                                       "Log channel set guest-mode activity will "
                                        "be posted here.")
                             body = _actions_view(
                                 st, f"✅ now logging into <code>{_esc(cid)}</code>")
@@ -5795,7 +5795,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                     else:
                         body = _wl_view(st)
                 else:
-                    # unknown kind — refuse, never guess a target page
+                    # unknown kind refuse, never guess a target page
                     note = "❌ unknown action."
                     view = "panel"
                     body = _panel_text(st, note)
@@ -5813,7 +5813,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             elif action == "actions":
                 view, body = "actions", _actions_view(st)
             elif action == "sethere":
-                # v3.3: same — the confirm states which chat will be logged.
+                # v3.3: same the confirm states which chat will be logged.
                 view, arg = "cfm", "actions:log:here"
                 body = _cfm_view("log", "here", st)
             elif action == "wizcancel":
@@ -5834,7 +5834,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
             if not body:
                 body = _panel_text(st, note)
             # v4.0.0: record the landing so ⬅️ Back returns one level, not home.
-            # The console resets the stack — it is the root of every path.
+            # The console resets the stack it is the root of every path.
             if view == "panel":
                 _NAV.pop(_nk, None)
             else:
@@ -5845,7 +5845,7 @@ async def _on_callback(update: Any, context: Any = None) -> None:
                 return
             await q.answer("" if view == "system"
                            else (_html_plain(note)
-                                 or (f"{_VIEW_LABEL.get(view, '🧩')} — already showing"
+                                 or (f"{_VIEW_LABEL.get(view, '🧩')} already showing"
                                      if res == "same" else "🧩")),
                            show_alert=False)
             return
@@ -5980,7 +5980,7 @@ async def _on_private_text(adapter: Any, update: Any, context: Any = None) -> No
     uid = str(getattr(user, "id", "") or "")
     owner = _owner_id(adapter)
     text = str(msg.text or "")
-    # Echo of the bot's own message (bot self-chat) — not a stranger DM, and a
+    # Echo of the bot's own message (bot self-chat) not a stranger DM, and a
     # canned reply there just fails with "reply target message not found".
     _bot_id = str(getattr(getattr(adapter, "_bot", None), "id", "") or "")
     if _bot_id and uid == _bot_id:
@@ -5999,7 +5999,7 @@ async def _on_private_text(adapter: Any, update: Any, context: Any = None) -> No
     allowed = _canned_allowed(user)
     _record_user(user, started=text.lstrip().lower().startswith("/start"), sample=text, canned=True)
     await _log(
-        "📩 Stranger DM" + (" — /start" if text.lstrip().lower().startswith("/start") else ""),
+        "📩 Stranger DM" + (" /start" if text.lstrip().lower().startswith("/start") else ""),
         f"{_user_block(user)}\n<b>Text:</b> <i>{_esc(text[:500])}</i>"
         f"\n<b>Action:</b> {'canned reply sent' if allowed else 'ignored (cooldown)'}",
         buttons=_profile_buttons(user))
@@ -6015,14 +6015,14 @@ async def _on_private_text(adapter: Any, update: Any, context: Any = None) -> No
 # ------------------------------------------- busy-path bang / wizard input
 # A message that arrives while this chat's session is running is routed by
 # base._handle_message_while_active to the busy handler, which never reaches
-# _hm_admit_event — so pre_gateway_dispatch, where bang commands and wizard
+# _hm_admit_event so pre_gateway_dispatch, where bang commands and wizard
 # answers are handled, is never called ("A steered or queued follow-up never
 # reaches _hm_admit_event"). PTB dispatches the FIRST matching handler per
 # group and this plugin's handlers are hoisted ahead of the core's, so this one
 # sees the message first: while the chat is busy, owner bang and wizard input
 # are executed here; everything else is delegated back exactly as
-# _on_private_text does, leaving the idle path — and its dispatch-hook side
-# effects — unchanged.
+# _on_private_text does, leaving the idle path and its dispatch-hook side
+# effects unchanged.
 
 def _chat_is_busy(adapter: Any, chat_id: str) -> bool:
     """True while a gateway session for this chat is running."""
@@ -6087,7 +6087,7 @@ async def _on_busy_path_text(adapter: Any, update: Any, context: Any = None) -> 
                                   if chat in _WIZARD else None)
             logger.info("[TGAhermes] busy-path wizard input accepted (hook bypassed)")
             return
-        # The wizard refused it — fall through so the answer is not lost.
+        # The wizard refused it fall through so the answer is not lost.
     except Exception:
         logger.exception("[TGAhermes] busy-path bang/wizard failed")
     await adapter._handle_text_message(update, context)
@@ -6096,11 +6096,11 @@ async def _on_busy_path_text(adapter: Any, update: Any, context: Any = None) -> 
 # ---------------------------------------------------------------- telegram_admin tool
 
 _TOOL_DESCRIPTION = (
-    "Telegram admin actions — owner's DM, the owner's log group, or a full-access "
+    "Telegram admin actions owner's DM, the owner's log group, or a full-access "
     "automation chat; the bot must be admin in the target chat. "
     "delete_message, ban_user, unban_user, mute_user, unmute_user, get_member, chat_info, "
     "react (set a reaction), send_dm (bot DMs a user), pin_message, unpin_message, "
-    "bang (run any !console command — setlog/setowner/whitelist/wipe/settings/...). "
+    "bang (run any !console command setlog/setowner/whitelist/wipe/settings/...). "
 )
 
 _TOOL_SCHEMA = {
@@ -6146,7 +6146,7 @@ def _tool_owner_ok(session_id: Any) -> bool:
     if bool(_owner_id()) and chat_id == _owner_id():
         return True
     if chat_id and chat_id == str(settings().get("log_channel") or ""):
-        return True  # his own log group — the inner circle he already trusts
+        return True  # his own log group the inner circle he already trusts
     return bool(settings().get("biz_full_access")) and _biz_chat_known(chat_id)
 
 
@@ -6158,7 +6158,7 @@ def _tool_owner_ok(session_id: Any) -> bool:
 # bounced back with "do it in your DM" instead of being executed.
 
 GUEST_BLOCKED_TOOLS = frozenset({
-    # shell / arbitrary code — anything a guest names runs as root on this box
+    # shell / arbitrary code anything a guest names runs as root on this box
     "terminal", "execute_code", "process_manage",
     # writes and deletions
     "write_file", "patch", "delete_file", "cronjob_manage", "todo_list",
@@ -6224,12 +6224,12 @@ _GUEST_DANGER_ARG_RE = re.compile(
 )
 
 # Path-level tripwire for the path-bearing file tools. Two classes:
-#   * secrets — reading them pastes credentials into a guest chat (the leak);
-#   * execution — writing hooks/, scripts/ or cron/ runs code with the
+#   * secrets reading them pastes credentials into a guest chat (the leak);
+#   * execution writing hooks/, scripts/ or cron/ runs code with the
 #     owner's rights, and those jobs fire every minute on their own.
 # SOUL/AGENTS/settings/state carry identity, config and the user registry.
 # Only the path ARGUMENTS of read_file/write_file/patch are matched, so
-# prose that happens to mention "config.yaml" is not collateral damage —
+# prose that happens to mention "config.yaml" is not collateral damage 
 # and owner sessions never reach this check (exempted above).
 _GUEST_PATH_TOOLS = frozenset({"read_file", "write_file", "patch"})
 _GUEST_FORBIDDEN_PATH_RE = re.compile(
@@ -6294,8 +6294,8 @@ def _current_guest_chat() -> Optional[str]:
 def _guest_session_info(session_id: Any) -> Optional[Dict[str, Any]]:
     """Identity + rights for a guest session, or None if it is not a guest chat.
 
-    Identity comes from :func:`_guest_identity` — the same source the log
-    channel reads — so the gate, the log and the session table always agree.
+    Identity comes from :func:`_guest_identity` the same source the log
+    channel reads so the gate, the log and the session table always agree.
     Nothing here is inferred from a forwarded message's sender.
     """
     row = _session_row(session_id)
@@ -6335,7 +6335,7 @@ def _guest_refusal(tool_name: str, info: Dict[str, Any], repeats: int = 0) -> st
         # Be blunt that retrying is pointless and it must answer now.
         tail = (
             "You have already been told this is not possible. Do not call any "
-            "other tool from a guest chat, and do not try again — answer the "
+            "other tool from a guest chat, and do not try again answer the "
             "person NOW using only what you already have. If you cannot help "
             "without these tools, say so in one sentence."
         )
@@ -6347,7 +6347,7 @@ def _guest_refusal(tool_name: str, info: Dict[str, Any], repeats: int = 0) -> st
     if info.get("is_owner"):
         return (
             f"BLOCKED in guest mode (final, not a transient error): `{tool_name}` would change "
-            f"or delete something on the machine, so it is never run from a guest chat — not even "
+            f"or delete something on the machine, so it is never run from a guest chat not even "
             f"for you. This IS your account, so open your own DM "
             f"(https://t.me/user?id={owner} or chat {owner}) and ask me there; I will do it "
             f"straight away. Answering questions, searching, and simple analysis all work fine "
@@ -6362,7 +6362,7 @@ def _guest_refusal(tool_name: str, info: Dict[str, Any], repeats: int = 0) -> st
     )
 
 def _tripwire_danger(name: str, args: Any) -> bool:
-    """Argument/path tripwires — shared by the guest gate and the friend gate."""
+    """Argument/path tripwires shared by the guest gate and the friend gate."""
     if name in _GUEST_PATH_TOOLS and isinstance(args, dict):
         blob = " ".join(str(args.get(k, "")) for k in ("path", "file_path", "file"))
         if blob.strip() and _GUEST_FORBIDDEN_PATH_RE.search(blob):
@@ -6397,10 +6397,10 @@ def _bump_block(session_id: Any) -> int:
 
 
 def _friend_refusal(tool_name: str, uid: str, level: str, repeats: int = 0) -> str:
-    """Refusal for a whitelisted friend's gated tool — final, with a next step."""
+    """Refusal for a whitelisted friend's gated tool final, with a next step."""
     if repeats:
         tail = ("You have already been told this is not possible. Do not call any other "
-                "blocked tool and do not try again — answer NOW with what you already have.")
+                "blocked tool and do not try again answer NOW with what you already have.")
     else:
         tail = ("Do not call this or any other blocked tool again; answer with what you "
                 "already have, or say in one sentence that you cannot.")
@@ -6429,15 +6429,15 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
     if _bchat and _biz_chat_known(_bchat):
         st_b = settings()
         # The customer must never receive an error/notification for a blocked
-        # tool: the refusal below is agent-facing ONLY — log it, and the agent
+        # tool: the refusal below is agent-facing ONLY log it, and the agent
         # answers without the tool. Nothing error-like goes out over the
         # automation connection.
         def _biz_quiet_refusal(_n: str) -> str:
             return (f"BLOCKED (policy, not a transient error): `{_n}` is not available "
                     f"in this chat. Do NOT relay this message, any error, or any "
-                    f"notification to the customer — answer now without the tool.")
+                    f"notification to the customer answer now without the tool.")
         if st_b.get("biz_full_access"):
-            # Full access: every tool except credentials — vault reads paste
+            # Full access: every tool except credentials vault reads paste
             # secrets straight into a customer conversation, those stay locked.
             if name.startswith("browser_vault"):
                 _cnt = _bump_block(session_id)
@@ -6452,7 +6452,7 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
     info = _guest_session_info(session_id)
     if info is None:
         # Whitelisted friend in their OWN DM session (source telegram, chat = their
-        # id, no guest_ prefix): their permission level decides — not the guest gate,
+        # id, no guest_ prefix): their permission level decides not the guest gate,
         # not nothing. Owner always passes.
         row = _session_row(session_id)
         if row and row[0] == "telegram" and not _is_guest_chat(row[1]):
@@ -6461,7 +6461,7 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: Any = N
             if uid and uid != owner and uid in _read_allow_from():
                 level = _friend_level(uid)
                 # A whitelisted friend in their OWN DM is trusted to get work
-                # done: everything runs EXCEPT the things that break the box —
+                # done: everything runs EXCEPT the things that break the box 
                 # the NEVER tools (credentials, acting-as-you, spawning work),
                 # the tripwires (destructive args/paths), and for talk-level
                 # friends anything that is not read/talk. The old gate wired
@@ -6559,7 +6559,7 @@ def _repo_display(repo: Any) -> str:
 
     A token-authenticated checkout stores a credential-bearing URL in
     `git config remote.origin.url`, and that origin is what `_plugin_origin()`
-    falls back to — so anything rendering cfg["repo"] would otherwise print a
+    falls back to so anything rendering cfg["repo"] would otherwise print a
     live personal access token into the panel, which is sent to Telegram.
     Everything from the scheme up to and including the last at-sign is
     replaced; only the host-and-path tail is kept.
@@ -6742,8 +6742,8 @@ async def _tool_handler(args: Dict[str, Any], session_id: Any = None, **_) -> Di
 def _drop_stale_handlers(native: Any) -> int:
     """Remove PTB handlers left in the bot by an EARLIER load of this plugin.
 
-    The gateway's rewire dedups factories by ``(plugin, qualname)`` — a key that
-    never changes between loads of the same source file — so a hot reload alone
+    The gateway's rewire dedups factories by ``(plugin, qualname)`` a key that
+    never changes between loads of the same source file so a hot reload alone
     never re-runs our factory and the previous module's closures keep serving
     the panel and the guest flow out of their dead module state (measured
     2026-10-02: reload 14:40:12 ran register() but no factory; the panel still
@@ -6757,7 +6757,7 @@ def _drop_stale_handlers(native: Any) -> int:
     gateway: (a) the module name, and (b) the callback's own ``^tgm:`` pattern,
     which no other plugin claims. A handler bound to a different module dict is
     stale by either signal. Removal failures used to log at DEBUG (filtered by
-    default), which is exactly how an orphan stayed invisible — they are
+    default), which is exactly how an orphan stayed invisible they are
     WARNING now, and the modules we saw are logged so a surviving orphan can be
     named instead of guessed at.
     """
@@ -6780,7 +6780,7 @@ def _drop_stale_handlers(native: Any) -> int:
                 # sweep would delete the plugin out from under itself.
                 cb_root = getattr(cb, "__wrapped__", cb)
                 if getattr(cb_root, "__globals__", None) is mine:
-                    continue  # registered by THIS very instance — keep it
+                    continue  # registered by THIS very instance keep it
                 mod = getattr(cb, "__module__", "") or ""
                 # ours by module name (current or pre-rename), OR ours by the
                 # callback prefix this plugin owns and no other plugin claims.
@@ -6844,7 +6844,7 @@ def _make_factory():
         # The adapter's config snapshot predates every config set made since it
         # first wired; push the file's current allow_from into it so a plugin
         # (re)load alone is enough for the core prefilter to agree with the file
-        # again — without this, a fresh whitelist write keeps getting blocked
+        # again without this, a fresh whitelist write keeps getting blocked
         # until a gateway restart.
         try:
             _ids = _read_allow_from()
@@ -6866,7 +6866,7 @@ def _make_factory():
 
             gfilter = getattr(filters.UpdateType, "GUEST_MESSAGE", None)
             if gfilter is None:
-                logger.warning("[%s] PTB lacks UpdateType.GUEST_MESSAGE — guest mode inactive",
+                logger.warning("[%s] PTB lacks UpdateType.GUEST_MESSAGE guest mode inactive",
                                getattr(adapter, "name", "telegram"))
             else:
                 async def _guest(update, context):
@@ -6906,7 +6906,7 @@ def _make_factory():
                                __name__, exc_info=True)
             # Busy-path console input: owner bang/wizard answers while this chat
             # has a live session. Must sit BEFORE _private and (via the adapter's
-            # hoist) ahead of the core text handler — PTB runs the first match in
+            # hoist) ahead of the core text handler PTB runs the first match in
             # the group. Commands are excluded so /start and friends keep going
             # to _private and the core command handler untouched.
             async def _busy_path(update, context):
@@ -6927,7 +6927,7 @@ def _make_factory():
 
     # Unique per deployed file mtime: base._wire_plugin_handlers dedups by
     # (plugin, qualname) only, so an unchanged qualname makes the rewire skip
-    # this factory on every hot reload — the exact failure that left stale
+    # this factory on every hot reload the exact failure that left stale
     # handlers and a stale allow_from live. Changing the file changes the key,
     # the rewire calls us, and the sweep above replaces the old handlers.
     try:
