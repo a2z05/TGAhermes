@@ -390,6 +390,18 @@ class BizStore:
         finally:
             c.close()
 
+    def clear_warned(self, chat_id: Any) -> None:
+        """Drop the first-contact stamp so a wiped/new session can open with
+        its own introduction instead of inheriting the old chat's."""
+        c = sqlite3.connect(str(self.path))
+        try:
+            c.execute(
+                "UPDATE biz_chats SET warned_at=NULL, warned_lang=NULL "
+                "WHERE chat_id=?", (str(chat_id),))
+            c.commit()
+        finally:
+            c.close()
+
     def chat_state(self, chat_id: Any) -> Optional[Dict[str, Any]]:
         c = sqlite3.connect(str(self.path))
         try:

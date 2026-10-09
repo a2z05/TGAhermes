@@ -1818,6 +1818,15 @@ async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -
             store.mark_replied(chat_id, "ok" if ok else "fail")
         except Exception:
             logger.debug("[TGAhermes] mark_replied failed", exc_info=True)
+        # The introduction is only spent once it was actually delivered.
+        # A dropped, failed, or owner-taken turn leaves the flag set so the
+        # next delivered reply still opens the chat properly.
+        pending = md.get("biz_warn_pending")
+        if ok and pending:
+            try:
+                store.mark_warned(chat_id, str(pending))
+            except Exception:
+                logger.debug("[TGAhermes] mark_warned failed", exc_info=True)
     return SendResult(success=ok, message_id=None), adapter
 
 
@@ -1826,7 +1835,7 @@ async def _biz_deliver(adapter: Any, event: Any, bcid: str, text_content: Any) -
 _BIZ_PERSONAS = {"mimic": "mimic.md", "assistant": "automation.md"}
 
 _BIZ_MIMIC_FALLBACK = (
-    "You are Ar(t)an's Telegram account answering a customer directly. "
+    "You are Artan's Telegram account answering a customer directly. "
     "Write AS him: first person, his voice concise, casual, practical, "
     "no corporate tone, no emoji spam. Only facts you actually have; if you "
     "don't know, say so in one line. Nothing private, nothing internal no "
@@ -1835,7 +1844,7 @@ _BIZ_MIMIC_FALLBACK = (
     "behalf, once, then move on. No jokes, no emoji."
 )
 _BIZ_ASSISTANT_FALLBACK = (
-    "You are ATRA, replying to messages that arrive in Ar(t)an's Telegram "
+    "You are ATRA, replying to messages that arrive in this Telegram "
     "account. Answer the question or do the task, in their language, in the "
     "fewest clear words. Only what you actually know if you don't know, "
     "one line saying so. Never invent facts or promises on his behalf. Never "
@@ -1922,6 +1931,60 @@ def _biz_persona(st: Dict[str, Any], mode: str) -> str:
     if mode == "mimic":
         return _load_biz_persona("mimic")
     return _load_biz_persona("assistant")
+
+
+def _biz_inline_text(event: Any, cached: Any) -> None:
+    """Inline a small text attachment into the turn, the way the adapter's own
+    document path does, so a receipt or note does not cost an extra read."""
+    try:
+        from gateway.platforms.base import _TEXT_INJECT_EXTENSIONS
+        if os.path.splitext(cached.path)[1].lower() not in _TEXT_INJECT_EXTENSIONS:
+            return
+        if os.path.getsize(cached.path) > 100 * 1024:
+            return
+        body = Path(cached.path).read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return  # binary or non-UTF-8: the agent keeps the cached path
+    except Exception:
+        logger.debug("[TGAhermes] business text inline failed", exc_info=True)
+        return
+    injection = f"[Content of {cached.display_name}]:\n{body}"
+    event.text = f"{injection}\n\n{event.text}" if event.text else injection
+    event.media_text_inlined = [True]
+
+
+async def _biz_attach_media(adapter: Any, msg: Any, event: Any) -> None:
+    """Cache a business message's attachment and attach it to ``event``.
+
+    Chat Automation builds its own event and hands it straight to
+    ``handle_message``, so the adapter's inbound media pipeline, which only runs
+    for ordinary private/group updates, never sees these messages. A customer's
+    photo or file therefore reached the agent as a bare ``[photo]``/``[document]``
+    placeholder and the bytes were dropped. This reuses the adapter's download
+    helper (no dispatch side effects) so the file lands on the event; a failed
+    download degrades to a note telling the agent to ask for a re-send instead
+    of silently delivering nothing.
+    """
+    try:
+        status, cached = await adapter._download_observed_media(msg, "business media")
+    except Exception:
+        logger.debug("[TGAhermes] business media download failed", exc_info=True)
+        return
+    if status == "ok" and cached is not None:
+        adapter._attach_cached(event, cached, cached.context_note(),
+                               "[TGAhermes] Cached business %s at %s")
+        event.media_text_inlined = [False]
+        if cached.kind == "document":
+            _biz_inline_text(event, cached)
+        return
+    if status == "oversized":
+        limit_mb = int(getattr(adapter, "_max_doc_bytes", 20 * 1024 * 1024) // (1024 * 1024))
+        note = f"[Attachment too large to cache ({limit_mb} MB maximum). Ask for a smaller file.]"
+    elif status in ("failed", "unreadable"):
+        note = "[Attachment could not be downloaded. Ask the sender to re-send it.]"
+    else:
+        return
+    event.text = adapter._append_observed_note(event.text, note)
 
 
 async def _handle_business_message(adapter: Any, update: Any, context: Any = None,
@@ -2085,12 +2148,12 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
                 except Exception:
                     logger.debug("[TGAhermes] mark_warned failed", exc_info=True)
         else:
+            # Do NOT stamp warned yet: the intro line only counts once it
+            # actually reaches the customer. Stamping here meant a dropped,
+            # failed, or owner-taken turn burned the only introduction this
+            # chat would ever get, so later sessions never opened with one.
+            # _biz_deliver stamps it on a successful send.
             warn_draft = True
-            if store is not None:
-                try:
-                    store.mark_warned(chat_id, lang)
-                except Exception:
-                    logger.debug("[TGAhermes] mark_warned failed", exc_info=True)
     # --- build the event the same way the guest path does -------------------
     try:
         from gateway.platforms.event import MessageType
@@ -2113,6 +2176,13 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
                          exc_info=True)
         return
     event.text = adapter._clean_bot_trigger_text(event.text or "") or ""
+    if msg_type is not MessageType.TEXT:
+        # A media failure must never cost the customer their message: the
+        # turn goes ahead with whatever text there was.
+        try:
+            await _biz_attach_media(adapter, msg, event)
+        except Exception:
+            logger.warning("[TGAhermes] business media attach failed", exc_info=True)
     if msg_type is not MessageType.TEXT and not event.text:
         _kind = str(getattr(msg_type, "name", "") or "media").lower()
         event.text = "[" + _kind + "]"
@@ -2143,8 +2213,10 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
     if warn_draft:
         identity += (
             "\nFirst reply to this chat: fold in ONE short line telling them "
-            "you wrote this on Ar(t)an's behalf and he'll come back to it "
-            "himself. Write it yourself, in their language and shaped around "
+            "an assistant is writing this on his behalf and he'll come back to "
+            "it himself. Never give his name or who he is; assistant on his "
+            "behalf is all they get. Write it yourself, in their language and "
+            "shaped around "
             "what they actually said never a stock sentence. One line, then "
             "the answer; if they didn't need telling, keep it to a clause."
         )
@@ -2166,6 +2238,16 @@ async def _handle_business_message(adapter: Any, update: Any, context: Any = Non
         md["business_chat_id"] = chat_id
         md["biz_lang"] = lang
         md["biz_mode"] = mode
+        if warn_draft:
+            md["biz_warn_pending"] = lang
+    elif warn_draft:
+        # No metadata dict to carry the pending flag through: fall back to
+        # the old stamp-now behaviour rather than never recording it.
+        if store is not None:
+            try:
+                store.mark_warned(chat_id, lang)
+            except Exception:
+                logger.debug("[TGAhermes] mark_warned failed", exc_info=True)
     _biz_mark(chat_id, "business")
     if bool(st.get("biz_sessions_split", True)):
         # Automation account-direct chats get their OWN session, separate from
@@ -3065,6 +3147,16 @@ def _wipe_sessions(store: Any, chat: Any) -> Optional[Tuple[int, int]]:
     except Exception:
         logger.exception("[TGAhermes] session wipe failed")
         return None
+    # The wipe held: this chat now starts a genuinely new conversation, so
+    # drop the first-contact stamp too. Otherwise the next session opens cold
+    # with no introduction even though biz_warn_first is still on. Skipped on
+    # every early return above, so a failed wipe keeps the old stamp.
+    bstore = _biz_store()
+    if bstore is not None:
+        try:
+            bstore.clear_warned(cid)
+        except Exception:
+            logger.debug("[TGAhermes] clear_warned failed", exc_info=True)
     if not routes and not rows:
         return (0, 0)
     return (routes, rows)

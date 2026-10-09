@@ -3011,11 +3011,18 @@ async def t33():
               "digits: this chat's own language beats the English guess")
         check(not ad1._bot.sent,
               "empty warning field: nothing canned goes out")
-        check(_s1.warned.get("998877") == "fa",
-              "empty warning field: still recorded as told, once per chat")
+        # The introduction is a one-shot: it may only be spent once the line
+        # actually reaches the customer, so at dispatch time it is pending,
+        # not recorded.
+        check("998877" not in _s1.warned,
+              "empty warning field: not recorded before the reply is sent")
+        check(_ev33.metadata.get("biz_warn_pending") == "fa",
+              "empty warning field: pending flag carries the language")
         _cp33 = str(getattr(_ev33, "channel_prompt", "") or "")
         check("First reply to this chat" in _cp33,
               "ATRA is told to write the line itself")
+        check("Ar(t)an" not in _cp33 and "Artan" not in _cp33,
+              "first-contact line never carries the owner's name")
         check("Whose question is that" in _cp33,
               "persona carries the question-routing section")
         check("Chat Automation turn" in _cp33, "identity block attached")
@@ -3508,6 +3515,103 @@ def _t38():
 
 
 _t38()
+
+
+def _t39():
+    """The first-contact line is spent only once it was actually delivered,
+    and a wiped chat gets to introduce itself again."""
+    print("\n[39] the introduction is spent on delivery, and wiped chats reopen")
+    ad = FakeAdapter()
+    mod._ADAPTER["adapter"] = ad
+
+    class _Store39:
+        def __init__(self):
+            self.warned = {}
+            self.replied = {}
+            self.wiped = []
+
+        def chat_state(self, chat_id):
+            return {} if str(chat_id) in self.warned else {}
+
+        def remember_chat(self, chat_id, lang):
+            pass
+
+        def mark_warned(self, chat_id, lang):
+            self.warned[str(chat_id)] = lang
+
+        def mark_replied(self, chat_id, outcome):
+            self.replied[str(chat_id)] = outcome
+
+        def clear_warned(self, chat_id):
+            self.wiped.append(str(chat_id))
+            self.warned.pop(str(chat_id), None)
+
+    st39 = _Store39()
+    _saved_store, _saved_try = mod._biz_store, mod._biz_try_send
+    _saved_turn = dict(mod._BIZ_TURN)
+    mod._biz_store = (lambda: st39)
+    sent39 = []
+
+    async def _ok_try(_ad, chat_id, text, preferred=""):
+        sent39.append(str(chat_id))
+        return True, NS(message_id=77)
+
+    async def _bad_try(_ad, chat_id, text, preferred=""):
+        return False, NS(message_id=None)
+
+    mod._biz_try_send = _ok_try
+    mod._BIZ_TURN.clear()
+    try:
+        ev39 = NS(metadata={"business_chat_id": "770011",
+                            "biz_warn_pending": "fa"},
+                  source=NS(chat_id="770011"))
+
+        # a dropped turn (he took the thread back) must not spend the line
+        mod._BIZ_TURN["770011"] = time.time() - 2.0
+        mod._BIZ_OWNER_SEEN["770011"] = time.time()
+        r39 = asyncio.run(mod._biz_deliver(ad, ev39, "bc", "draft line"))
+        check(not sent39, "he answered first: the reply is dropped")
+        check("770011" not in st39.warned,
+              "a dropped turn does not spend the introduction")
+        mod._BIZ_OWNER_SEEN["770011"] = time.time() - 600.0
+
+        # a failed send keeps it pending too
+        mod._biz_try_send = _bad_try
+        asyncio.run(mod._biz_deliver(ad, ev39, "bc", "draft line"))
+        check("770011" not in st39.warned,
+              "a failed send does not spend the introduction")
+
+        # a real delivery is what records it
+        mod._biz_try_send = _ok_try
+        asyncio.run(mod._biz_deliver(ad, ev39, "bc", "draft line"))
+        check(sent39 and st39.warned.get("770011") == "fa",
+              "a delivered reply records the introduction once")
+
+        # and a wiped chat starts cold again
+        _wipe_store = _N33()
+        _wipe_store._entries = {"bizauto:770011": object()}
+        _wipe_store.reset_session = lambda k: None
+        _sid0, _purge0 = mod._stored_session_ids, mod._purge_stored_sessions
+        mod._stored_session_ids = (lambda cid: ["bizauto:770011"])
+        mod._purge_stored_sessions = (lambda stored: 1)
+        try:
+            mod._wipe_sessions(_wipe_store, 770011)
+        finally:
+            mod._stored_session_ids, mod._purge_stored_sessions = _sid0, _purge0
+        check(st39.wiped == ["770011"],
+              "wiping the chat clears the first-contact stamp")
+        check("770011" not in st39.warned,
+              "a wiped chat can introduce itself again")
+        check(bool(r39), "the drop result stays reportable")
+    finally:
+        mod._biz_store, mod._biz_try_send = _saved_store, _saved_try
+        mod._BIZ_TURN.clear()
+        mod._BIZ_TURN.update(_saved_turn)
+        mod._BIZ_OWNER_SEEN.pop("770011", None)
+        mod._ADAPTER["adapter"] = None
+
+
+_t39()
 
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)
