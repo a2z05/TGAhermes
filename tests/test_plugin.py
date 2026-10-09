@@ -2383,6 +2383,112 @@ async def _t27b():
 asyncio.run(_t27b())
 
 
+# [27c] The automation path builds its OWN event and hands it straight to
+# handle_message, so the adapter's inbound media pipeline never saw these
+# updates: a customer's file arrived as a bare "[document]" placeholder and
+# the bytes were dropped. _biz_attach_media now caches them onto the event
+# before dispatch, and a failed download still costs no message.
+print("\n[27c] Chat Automation: a customer's attachment reaches the brain")
+
+
+async def _t27c():
+    from gateway.platforms.event import MessageType
+    _orig = dict(mod.settings())
+    _orig_log = mod._log
+
+    class _Cached:
+        path = os.path.join(TMP, "bill.txt")
+        media_type = "text/plain"
+        kind = "document"
+        display_name = "bill.txt"
+
+        def context_note(self):
+            return f"[document '{self.display_name}' saved at: {self.path}]"
+
+    Path(_Cached.path).write_text("mabad 700", encoding="utf-8")
+
+    class _Stub:
+        def __init__(self):
+            self._bot = None
+            self._message_handler = object()
+            self.handles = 0
+            self.events = []
+
+        def _clean_bot_trigger_text(self, t, *a, **k):
+            return t or ""
+
+        def _media_message_type(self, msg):
+            return MessageType.DOCUMENT if getattr(msg, "document", None) else MessageType.TEXT
+
+        def _build_message_event(self, msg, mtype, update_id=None):
+            ev = types.SimpleNamespace(
+                text=msg.text or "", metadata={}, media_urls=[], media_types=[],
+                source=types.SimpleNamespace(chat_id=msg.chat.id,
+                                             message_id=msg.message_id,
+                                             user_id=msg.from_user.id),
+                internal=False, channel_prompt="")
+            self.events.append(ev)
+            return ev
+
+        async def _download_observed_media(self, msg, what):
+            return "ok", _Cached()
+
+        def _attach_cached(self, event, cached, note, log_fmt):
+            event.media_urls.append(cached.path)
+            event.media_types.append(cached.media_type)
+            event.text = f"{event.text}\n\n{note}" if event.text else note
+
+        def _append_observed_note(self, existing, note):
+            return f"{existing}\n\n{note}" if existing else note
+
+        async def handle_message(self, event):
+            self.handles += 1
+
+    def _mk_update():
+        return types.SimpleNamespace(
+            update_id=1002,
+            business_message=types.SimpleNamespace(
+                message_id=502, business_connection_id="bc_test",
+                text=None, caption=None, date=None, document=object(),
+                from_user=types.SimpleNamespace(id=770022, is_bot=False,
+                                                first_name="Cust", last_name="",
+                                                username="custy"),
+                chat=types.SimpleNamespace(id=770022, type="private",
+                                           first_name="Cust")),
+            edited_business_message=None, message=None)
+
+    stub = _Stub()
+    mod._log = lambda *a, **k: asyncio.sleep(0)
+    try:
+        mod.save_settings({"biz_mode": "assistant", "biz_warn_first": False,
+                           "biz_media": True, "biz_idle_delay_min": 0})
+        await mod._handle_business_message(stub, _mk_update(), None)
+        check(stub.handles == 1, "attachment: the turn still reaches the brain")
+        ev = stub.events[0]
+        check(ev.media_urls == [_Cached.path],
+              f"attachment: bytes cached onto the event ({ev.media_urls})")
+        check("bill.txt" in (ev.text or ""),
+              "agent is pointed at the cached file")
+        check("700" in (ev.text or ""),
+              "small text attachment inlined, no extra read needed")
+
+        # A failed download must never swallow the message: the turn goes
+        # ahead and the agent is told to ask for a re-send.
+        async def _fail(msg, what):
+            return "failed", None
+        stub._download_observed_media = _fail
+        await mod._handle_business_message(stub, _mk_update(), None)
+        check(stub.handles == 2, "failed download: the turn is not lost")
+        check("re-send" in (stub.events[-1].text or ""),
+              "failed download: agent is told to ask for a re-send")
+    finally:
+        mod._log = _orig_log
+        mod.save_settings(_orig)
+
+
+asyncio.run(_t27c())
+
+
 # [28] Regression: the gateway loads the plugin AS A PACKAGE, so the loader's
 # relative-import branch must yield a real module. Initializing the package
 # attribute before the import used to shadow the submodule (fromlist saw the
