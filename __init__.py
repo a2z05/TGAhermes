@@ -42,6 +42,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -5185,6 +5187,119 @@ async def _run_bang_command(adapter: Any, event: Any, text: str,
         await _log(f"🖥 Bang command {cmd}", f"From <code>{_esc(chat_id)}</code> → executed")
 
 
+# ------------------------------------------------------------ recovery `?` console
+
+# Owner-only, model-free recovery commands: thin wrappers in <home>/bin that
+# exec the scripts under scripts/recovery (the `?` package: bare ?, ?run, ?doc,
+# ?cmd, ?dash, ?9r). The bin dir is derived from this file's location, never
+# spelled out: the pre-push audit blocks host paths in tracked files, and a
+# derived path survives a move.
+_QCMD_BIN = PLUGIN_DIR.parent.parent / "bin"
+_QCMDS = ("?", "?run", "?doc", "?cmd", "?dash", "?9r")
+# Hard wall per command, module-level so tests can shrink it.
+_QCMD_TIMEOUT = 150.0
+_QCMD_MAX_LINES = 45    # head + tail: cmd_list's header AND run.sh's final
+_QCMD_HEAD = 20         # result line (it lives at the END) must both survive
+_QCMD_TAIL = 20
+_QCMD_MAX_CHARS = 3600  # room for header + note inside the 4000-char send cap
+
+
+def _qcmd_argv(text: Any) -> Optional[List[str]]:
+    """argv for a known `?...` command, or None so the message reaches the model.
+
+    The first token must be one of _QCMDS; the rest is shlex-split, so
+    `?run -s -- 'ls | head'` passes its pipe through as ONE argument.
+    A first token that merely starts with `?` (?why, ??, a Persian question
+    whose first word happens to begin with ?) is not a command.
+    """
+    t = str(text or "").strip()
+    if not t.startswith("?"):
+        return None
+    bits = t.split(None, 1)
+    if bits[0] not in _QCMDS:
+        return None
+    argv = [str(_QCMD_BIN / bits[0])]
+    if len(bits) > 1 and bits[1].strip():
+        try:
+            argv += shlex.split(bits[1])
+        except ValueError:
+            # Unbalanced quotes: pass the tail through as typed instead of
+            # refusing -- ?run is documented to take arbitrary shell.
+            argv += bits[1].split()
+    return argv
+
+
+def _qcmd_clip(text: str) -> str:
+    """Keep the head AND the tail, marker in the middle when truncating."""
+    lines = text.splitlines()
+    if len(lines) > _QCMD_MAX_LINES:
+        omitted = len(lines) - _QCMD_HEAD - _QCMD_TAIL
+        lines = (lines[:_QCMD_HEAD]
+                 + [f"\u2026 ({omitted} lines omitted) \u2026"]
+                 + lines[-_QCMD_TAIL:])
+    body = "\n".join(lines)
+    if len(body) > _QCMD_MAX_CHARS:
+        half = (_QCMD_MAX_CHARS - 60) // 2
+        omitted = len(body) - 2 * half
+        body = f"{body[:half]}\n\u2026 ({omitted} chars omitted) \u2026\n{body[-half:]}"
+    return body
+
+
+async def _qcmd_run(argv: List[str]) -> str:
+    """Run one recovery wrapper. Never raises, never returns an empty string."""
+    cmd = os.path.basename(argv[0])
+    head = f"<b>\U0001f5a5 {_esc(cmd)}</b>"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+    except (OSError, ValueError) as e:
+        return f"{head}\n{_esc('could not run: ' + str(e))}"
+    timed_out = False
+    out = b""
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_QCMD_TIMEOUT)
+    except asyncio.TimeoutError:
+        timed_out = True
+        try:
+            # Own session => own process group: kill the whole tree, so a
+            # wrapper that spawned children does not linger.
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("[TGAhermes] recovery command %s survived killpg", cmd)
+    rc = proc.returncode
+    body = out.decode("utf-8", errors="replace").rstrip("\n")
+    if timed_out:
+        note = f"timeout after {_QCMD_TIMEOUT:g}s \u2014 process killed"
+    elif not body:
+        note = f"\u062e\u0631\u0648\u062c\u06cc \u0646\u062f\u0627\u0634\u062a (exit rc={rc})"
+    elif rc:
+        note = f"\u062e\u0631\u0648\u062c\u06cc \u0628\u0627 \u062e\u0637\u0627: rc={rc}"
+    else:
+        note = ""
+    parts = [head]
+    if body:
+        parts.append("<code>" + _esc(_qcmd_clip(body)) + "</code>")
+    if note:
+        parts.append(_esc(note))
+    return "\n".join(parts)
+
+
+async def _qcmd_execute(text: Any) -> Optional[str]:
+    """`?...` message -> rendered reply; None when it is not a known command."""
+    argv = _qcmd_argv(text)
+    if argv is None:
+        return None
+    return await _qcmd_run(argv)
+
+
 # ---------------------------------------------------------------- panel wizards (Actions)
 
 # One open wizard per chat: {"flow": name, "data": [typed answers]}.
@@ -5680,6 +5795,25 @@ async def _pre_gateway_dispatch(event=None, gateway=None, session_store=None, **
             _wizard_persist()
             await _run_bang_command(ad, event, text, session_store=session_store)
             return {"action": "skip", "reason": "TGAhermes bang command"}
+
+        # Recovery console: an owner `?...` wrapper runs the script directly
+        # and answers here -- no model round-trip, so it still works when the
+        # model/router is dead. Owner-only: any other sender's `?...` falls
+        # through untouched (no wizard pop, no reply), and an unknown `?`
+        # word from the owner falls through to the model like ordinary text.
+        if owner and uid == owner and text.strip().startswith("?"):
+            _qargv = _qcmd_argv(text)
+            if _qargv is not None:
+                _WIZARD.pop(chat, None)  # a real command abandons any open wizard step
+                _wizard_persist()
+                # One naming line only: ?run output can be large/sensitive
+                # and never goes to the log channel.
+                logger.info("[TGAhermes] recovery command %s (from %s)",
+                            os.path.basename(_qargv[0]), chat)
+                _qreply = await _qcmd_execute(text)
+                if _qreply:
+                    await _reply_to_event(ad, chat, _qreply)
+                return {"action": "skip", "reason": "TGAhermes recovery command"}
 
         # Panel wizard input: the owner answering a step the panel is waiting on.
         if owner and uid == owner and text and not text.startswith("!") and chat in _WIZARD:
@@ -6399,8 +6533,13 @@ async def _on_busy_path_text(adapter: Any, update: Any, context: Any = None) -> 
     in_group = ct in ("group", "supergroup", "forum", "channel")
     setlog_here = in_group and text.lower().startswith("!setlog")
     is_bang = text.startswith("!") and (in_log or in_owner_dm or setlog_here)
+    # Recovery `?` wrappers mirror the dispatch hook: a known token runs the
+    # script here too, so ?9r/?cmd still answer while a turn is mid-flight
+    # (the hook is bypassed on this path). Unknown `?` words fall through.
+    _qargv = _qcmd_argv(text) if text.strip().startswith("?") else None
+    is_q = _qargv is not None
     is_wiz = chat in _WIZARD and not text.startswith("!")
-    if not (is_bang or is_wiz) or not _chat_is_busy(adapter, chat):
+    if not (is_bang or is_q or is_wiz) or not _chat_is_busy(adapter, chat):
         # Idle (or not console input): the core handler and the dispatch hook
         # own it, exactly as before this handler existed.
         await adapter._handle_text_message(update, context)
@@ -6418,6 +6557,20 @@ async def _on_busy_path_text(adapter: Any, update: Any, context: Any = None) -> 
                                     session_store=_CTX.get("session_store"))
             logger.info("[TGAhermes] busy-path bang command %s (dispatch hook bypassed)",
                         text.split(maxsplit=1)[0])
+            return
+        if is_q:
+            _WIZARD.pop(chat, None)  # a real command abandons any open wizard step
+            _wizard_persist()
+            logger.info("[TGAhermes] busy-path recovery command %s (dispatch hook bypassed)",
+                        os.path.basename(_qargv[0]))
+            # Recovery scripts run up to 150s: never await them on the
+            # dispatcher. Answer from a background task so `?` always gets
+            # through without ever wedging other inbound updates behind it.
+            async def _qjob():
+                _qreply = await _qcmd_execute(text)
+                if _qreply:
+                    await _reply_to_event(adapter, chat, _qreply)
+            _spawn(_qjob())
             return
         out = await _wizard_feed(adapter, chat, text,
                                  session_store=_CTX.get("session_store"))
@@ -7229,13 +7382,19 @@ def _make_factory():
                                 getattr(update, "update_id", "?"),
                                 getattr(getattr(update, "business_message", None),
                                         "business_connection_id", "<no-field>"))
-                    await _handle_business_message(adapter, update, context)
+                    # The owner-reply hold below sleeps up to an hour. PTB
+                    # dispatches updates one at a time, so awaiting it here
+                    # froze the whole inbound queue (owner DMs and `?` went
+                    # deaf: the 102260 episodes at 15:17-17:53 / 20:33 / 21:33
+                    # line up with holds at 20:30 / 21:30). Off-dispatch: the
+                    # reply still arrives, dispatch never blocks.
+                    _spawn(_handle_business_message(adapter, update, context))
                 native.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE,
                                                   _bizmsg))
 
                 async def _bizmsg_edit(update, context):
-                    await _handle_business_message(adapter, update, context,
-                                                   edited=True)
+                    _spawn(_handle_business_message(adapter, update, context,
+                                                    edited=True))
                 native.add_handler(MessageHandler(
                     filters.UpdateType.EDITED_BUSINESS_MESSAGE, _bizmsg_edit))
             else:

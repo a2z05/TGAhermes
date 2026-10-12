@@ -475,6 +475,104 @@ async def t3():
 
 asyncio.run(t3())
 
+# ------------------------------------------------- recovery ? console (owner-only)
+print("\n[4b] recovery ? commands")
+adq = FakeAdapter()
+mod._ADAPTER["adapter"] = adq
+adq._guest_gqids = {}
+BIN_Q = mod.PLUGIN_DIR.parent.parent / "bin"
+
+
+def _qsent():
+    """Replies that landed in the OWNER's own chat (logs go elsewhere)."""
+    return [m for m in adq._bot.sent if str(m.get("chat_id", "")) == "900000001"]
+
+
+async def tq():
+    # --- argv builder: exact argv, no shell interpretation anywhere
+    a = mod._qcmd_argv("?run -s -- 'ls | head'")
+    check(a == [str(BIN_Q / "?run"), "-s", "--", "ls | head"], "?run argv exact")
+    check(mod._qcmd_argv("?") == [str(BIN_Q / "?")], "bare ? argv")
+    check(mod._qcmd_argv("?dash restart") == [str(BIN_Q / "?dash"), "restart"],
+          "?dash restart argv")
+    check(mod._qcmd_argv("?why now") is None, "?why unknown token -> None")
+    check(mod._qcmd_argv("??") is None, "?? unknown token -> None")
+    check(mod._qcmd_argv("hello") is None, "plain text -> None")
+
+    # --- real end-to-end: owner ?cmd runs the real cmd_list.sh
+    ev = FakeEvent(text="?cmd", source=FakeSource("900000001"))
+    res = await mod._pre_gateway_dispatch(event=ev)
+    check(res == {"action": "skip", "reason": "TGAhermes recovery command"},
+          "?cmd returns recovery skip")
+    osent = _qsent()
+    check(bool(osent), "?cmd reply sent to owner chat")
+    check(all(m.get("parse_mode") == "HTML" for m in osent), "?cmd reply sent as HTML")
+    body = str(osent[-1].get("text", "")) if osent else ""
+    check(body.startswith("<b>"), "reply carries the bold header")
+    check("Recovery command inventory" in body, "reply carries the inventory")
+
+    # --- real end-to-end: owner ?9r status (read-only localhost health check)
+    n = len(_qsent())
+    ev = FakeEvent(text="?9r status", source=FakeSource("900000001"))
+    res = await mod._pre_gateway_dispatch(event=ev)
+    check(res == {"action": "skip", "reason": "TGAhermes recovery command"},
+          "?9r status returns recovery skip")
+    body = str(_qsent()[-1].get("text", "")) if len(_qsent()) > n else ""
+    check("9router" in body, "?9r status mentions 9router")
+
+    # --- unknown ? token from the owner: the model still sees it
+    n = len(_qsent())
+    ev = FakeEvent(text="?frobnicate", source=FakeSource("900000001"))
+    res = await mod._pre_gateway_dispatch(event=ev)
+    check(res is None, "?frobnicate falls through to model")
+    check(len(_qsent()) == n, "?frobnicate sent no reply")
+    n = len(_qsent())
+    ev = FakeEvent(text="?why now", source=FakeSource("900000001"))
+    res = await mod._pre_gateway_dispatch(event=ev)
+    check(res is None, "?why falls through to model")
+    check(len(_qsent()) == n, "?why sent no reply")
+
+    # --- non-owner ?cmd: zero side effects, wizard untouched
+    mod._WIZARD["555"] = {"flow": list(mod._WIZ_FLOWS)[0], "data": []}
+    mod._wizard_persist()
+    n = len(adq._bot.sent)
+    ev = FakeEvent(text="?cmd", source=FakeSource("555", user_id="555"))
+    res = await mod._pre_gateway_dispatch(event=ev)
+    check(res is None, "non-owner ?cmd falls through")
+    check("555" in mod._WIZARD, "non-owner ?cmd leaves wizard untouched")
+    check(not any(str(m.get("chat_id", "")) == "555" for m in adq._bot.sent[n:]),
+          "non-owner ?cmd got no reply")
+    mod._WIZARD.pop("555", None)
+    mod._wizard_persist()
+
+    # --- wizard interplay: an open wizard is abandoned, command still runs
+    flow = list(mod._WIZ_FLOWS)[0]
+    check(mod._wizard_start("900000001", flow) is not None, "wizard opened")
+    n = len(_qsent())
+    ev = FakeEvent(text="?cmd", source=FakeSource("900000001"))
+    res = await mod._pre_gateway_dispatch(event=ev)
+    check(res == {"action": "skip", "reason": "TGAhermes recovery command"},
+          "wizard + ?cmd still skips")
+    check("900000001" not in mod._WIZARD, "wizard abandoned by ?cmd")
+    check(len(_qsent()) > n and "Recovery command inventory" in
+          str(_qsent()[-1].get("text", "")), "command ran with wizard open")
+
+    # --- render notes on real subprocesses: empty output, rc != 0, timeout
+    r = await mod._qcmd_run(["/bin/sh", "-c", "exit 3"])
+    check("\u062e\u0631\u0648\u062c\u06cc \u0646\u062f\u0627\u0634\u062a" in r and "rc=3" in r, "empty output -> Persian note + rc")
+    r = await mod._qcmd_run(["/bin/sh", "-c", "echo boom; exit 2"])
+    check("\u062e\u0631\u0648\u062c\u06cc \u0628\u0627 \u062e\u0637\u0627" in r and "rc=2" in r, "rc!=0 -> Persian error note")
+    real_to = mod._QCMD_TIMEOUT
+    mod._QCMD_TIMEOUT = 0.5
+    try:
+        r = await mod._qcmd_run(["/bin/sh", "-c", "sleep 30"])
+    finally:
+        mod._QCMD_TIMEOUT = real_to
+    check("timeout" in r, "timeout reported honestly")
+
+
+asyncio.run(tq())
+
 # ---------------------------------------------------------------- stranger DM handler
 print("\n[5] stranger DM handler")
 mod.save_settings({"unauthorized_reply": "I only serve to my owner"})  # section 4's !setunauthorized overwrote it
@@ -2843,9 +2941,11 @@ async def t_busy():
 
     _bang = []
     _wiz = []
+    _qcmd = []
     _orig_bang, _orig_feed, _orig_reply = (mod._run_bang_command,
                                            mod._wizard_feed,
                                            mod._reply_to_event)
+    _orig_qcmd = mod._qcmd_execute
 
     async def _fake_bang(adapter, event, text, session_store=None):
         _bang.append((str(event.source.chat_id), text))
@@ -2857,8 +2957,13 @@ async def t_busy():
     async def _fake_reply(adapter, chat_id, text, buttons=None):
         _wiz.append(("reply", str(chat_id)))
 
+    async def _fake_qcmd(text):
+        _qcmd.append(str(text))
+        return "<b>q</b>out"
+
     mod._run_bang_command, mod._wizard_feed, mod._reply_to_event = (
         _fake_bang, _fake_feed, _fake_reply)
+    mod._qcmd_execute = _fake_qcmd
 
     def _mk(chat, uid, text, ct="supergroup"):
         m = NS(message_id=505, text=text,
@@ -2900,15 +3005,39 @@ async def t_busy():
               "busy: the wizard receives the typed answer")
         mod._WIZARD.pop(_chat, None)
 
+        # BUSY + known `?` wrapper: run here, never queued as a user turn
+        # (this is the gap the hook-only implementation left open).
+        _ad.delegated.clear(); _qcmd.clear(); _wiz.clear()
+        await mod._on_busy_path_text(_ad, _mk(_chat, _owner, "?cmd"), None)
+        check(not _ad.delegated,
+              "busy: ?cmd is not queued as a user turn")
+        check(_qcmd == ["?cmd"], "busy: ?cmd executes exactly once")
+        check(any(x == ("reply", _chat) for x in _wiz),
+              "busy: ?cmd replies to the chat")
+
+        # BUSY + unknown `?word`: falls through to the model like plain text.
+        _ad.delegated.clear(); _qcmd.clear()
+        await mod._on_busy_path_text(_ad, _mk(_chat, _owner, "?why"), None)
+        check(_ad.delegated == ["text"],
+              "busy: an unknown ? word still reaches the core handler")
+        check(not _qcmd, "busy: an unknown ? word never runs a wrapper")
+
         # A non-owner never reaches the console branch.
         _ad.delegated.clear(); _bang.clear()
         await mod._on_busy_path_text(_ad, _mk(_chat, "12345", "!panel"), None)
         check(_ad.delegated == ["text"],
               "busy: a stranger's bang is not executed")
         check(not _bang, "busy: a stranger never runs a console command")
+        # ...and a stranger's `?cmd` is equally untouched.
+        _ad.delegated.clear(); _qcmd.clear()
+        await mod._on_busy_path_text(_ad, _mk(_chat, "12345", "?cmd"), None)
+        check(_ad.delegated == ["text"],
+              "busy: a stranger's ?cmd is not executed")
+        check(not _qcmd, "busy: a stranger never runs a recovery wrapper")
     finally:
         mod._run_bang_command, mod._wizard_feed, mod._reply_to_event = (
             _orig_bang, _orig_feed, _orig_reply)
+        mod._qcmd_execute = _orig_qcmd
         mod._ADAPTER["adapter"] = _prev_ad
         mod.save_settings(_st0)
         mod._WIZARD.clear()
